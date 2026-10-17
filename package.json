@@ -1,0 +1,76 @@
+{
+  "name": "dsh-multi-agent-gateway",
+  "version": "0.1.0",
+  "description": "多 Agent 通用 API 反代网关 Provider 插件：统一账号管理 / 自动签到 / 额度拉取 / 活动任务 / 多账号智能路由 / 模型分组与积分倍率，对 DSH 暴露 OpenAI 兼容流式 Completion 接口。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "docs",
+    "cordis.patch.yml",
+    "plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "llm-provider",
+    "gateway",
+    "opencode",
+    "qoder",
+    "trae",
+    "workbuddy",
+    "multi-account"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "node scripts/build.mjs --check",
+    "test": "node --test test/unit.test.mjs && node test/client.test.mjs && node test/smoke.mjs",
+    "test:unit": "node --test test/unit.test.mjs",
+    "test:client": "node test/client.test.mjs",
+    "test:smoke": "node test/smoke.mjs",
+    "test:live": "node test/live-opencode.mjs",
+    "test:free": "node test/live-freetier.mjs",
+    "test:demo": "node test/demo-pipeline.mjs"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-store"
+      ],
+      "platform": "web"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.1.5-rc.1"
+  }
+}

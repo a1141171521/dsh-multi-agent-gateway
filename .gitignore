@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.scratch/
+*.bak
+*.safety
+*.tmp

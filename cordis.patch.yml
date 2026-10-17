@@ -1,0 +1,27 @@
+# dsh-multi-agent-gateway bundle patch
+#
+# 这个文件是 **bundle 层**：`dsh plugin add` 装完之后，profile 会把它整层叠进
+# 组合树。规矩与其它 DSH 插件相同：
+#
+#   - 这里**只注册、不配置**。默认值只留一份 —— `src/config.ts` 的 DEFAULT_CONFIG。
+#     想改配置，在 **profile 自己的 `cordis.patch.yml`** 里用顶层 id 覆盖：
+#
+#         - id: dsh-multi-agent-gateway
+#           config:
+#             agents:
+#               opencode:
+#                 enabled: true
+#                 checkIn:
+#                   enabled: true
+#                   cron: '0 30 8 * * *'
+#
+#   - 插件的异常导致 DSH 起不来时，临时停用（不用卸载）：
+#
+#         - id: dsh-multi-agent-gateway
+#           disabled: true
+#
+#   - 安装：`dsh plugin --profile <profile> add <path-or-git-url>`
+#     不要手工再往 profile patch 里 insert 同名 id（重复 id 会让加载器直接报错）。
+- insert:
+    - id: dsh-multi-agent-gateway
+      name: 'dsh-multi-agent-gateway'

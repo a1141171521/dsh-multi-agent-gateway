@@ -1,0 +1,77 @@
+{
+  "id": "dsh-multi-agent-gateway",
+  "name": "多 Agent 通用 API 反代网关",
+  "version": "0.1.0",
+  "main": "./lib/index.js",
+  "type": "provider",
+  "description": "统一多 Agent 账号管理、自动签到、额度拉取、活动任务与多账号智能路由；对 DSH 模型选择器按 Agent 分组上报模型并标注积分倍率。",
+  "engines": {
+    "dsh": ">=0.1.5-rc.1",
+    "node": ">=20"
+  },
+  "client": {
+    "main": "./lib/client.js",
+    "platform": "web"
+  },
+  "settings": {
+    "namespace": "dsh-multi-agent-gateway",
+    "rowKey": "dsh-multi-agent-gateway#dsh-multi-agent-gateway"
+  },
+  "contributes": {
+    "llmProviders": [
+      {
+        "provider": "multiagent-opencode",
+        "displayName": "OpenCode",
+        "agentId": "opencode",
+        "implemented": true
+      },
+      {
+        "provider": "multiagent-qoder",
+        "displayName": "Qoder",
+        "agentId": "qoder",
+        "implemented": false
+      },
+      {
+        "provider": "multiagent-qoder-cn",
+        "displayName": "Qoder CN",
+        "agentId": "qoder-cn",
+        "implemented": false
+      },
+      {
+        "provider": "multiagent-trae",
+        "displayName": "Trae",
+        "agentId": "trae",
+        "implemented": false
+      },
+      {
+        "provider": "multiagent-workbuddy",
+        "displayName": "WorkBuddy",
+        "agentId": "workbuddy",
+        "implemented": false
+      },
+      {
+        "provider": "multiagent-workbuddy-intl",
+        "displayName": "WorkBuddy International",
+        "agentId": "workbuddy-intl",
+        "implemented": false
+      }
+    ],
+    "tools": [
+      "multiagent_accounts",
+      "multiagent_quota",
+      "multiagent_checkin",
+      "multiagent_tasks",
+      "multiagent_routing"
+    ],
+    "skills": []
+  },
+  "storage": {
+    "root": "<DSH_HOME>/multi-agent-gateway",
+    "files": {
+      "state": "state.json",
+      "accounts": "accounts.enc.json",
+      "key": ".master-key",
+      "tasks": "task-log.jsonl"
+    }
+  }
+}
