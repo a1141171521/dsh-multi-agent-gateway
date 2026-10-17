@@ -538,6 +538,247 @@ test('工具调用：finish 必须是 tool-calls，id 每帧稳定，多个调�
   assert.equal(first?.block.arguments, '{"command":"dir"}')
 })
 
+// ───────────────── block-end 必须带上完整正文（「输出被覆盖」那条 bug） ─────────────────
+
+/**
+ * 造一个「事件流写死」的适配器，只关心 chunk 映射。
+ *
+ * @param {Array<Record<string, unknown>>} events - 上游归一化事件。
+ * @returns {Promise<Array<Record<string, unknown>>>} 插件吐出的全部 chunk。
+ */
+async function chunksOf(events) {
+  const backend = {
+    id: 'opencode',
+    name: 'OpenCode',
+    async *requestChatStream() {
+      for (const event of events) yield event
+    },
+  }
+  const log = { child: () => log, debug() {}, info() {}, warn() {}, error() {} }
+  const adapter = createLlmAdapter({
+    agentId: 'opencode',
+    displayName: 'OpenCode',
+    labelWithAgent: true,
+    accounts: new Proxy({}, { get: () => () => undefined }),
+    router: {
+      async execute(agentId, run) {
+        const account = {
+          id: 'opencode:anonymous',
+          agentId,
+          label: 'x',
+          credentials: {},
+          enabled: true,
+          createdAt: 0,
+          updatedAt: 0,
+        }
+        const outcome = await run(account)
+        if (outcome.ok === true) return { ok: true, accountId: account.id, attempts: [], value: outcome.value }
+        return {
+          ok: false,
+          accountId: account.id,
+          attempts: [],
+          failure: { kind: outcome.kind ?? 'unknown', message: outcome.message ?? '' },
+        }
+      },
+    },
+    adapterOf: () => backend,
+    contextOf: () => ({
+      config: { upstream: {}, requestTimeoutMs: 1000 },
+      log,
+      http: async () => ({ ok: true }),
+      cache: new MemoryCache(),
+      now: () => 0,
+    }),
+    modelsOf: async () => [],
+    exposedModelsOf: async () => [],
+    log,
+  })
+  const chunks = []
+  for await (const chunk of adapter.stream({
+    provider: 'multiagent-opencode',
+    model: 'opencode/m',
+    messages: [],
+    system: 's',
+  })) {
+    chunks.push(chunk)
+  }
+  return chunks
+}
+
+test('block-end 必须带上累积的正文：宿主是覆盖式赋值，给空串就等于把输出抹掉', async () => {
+  // 宿主 `BlockAssembler.push()` 的分支是 `partial.block = chunk.block`，
+  // 之后 `blocks()` 直接返回这个 block —— 也就是说 block-end 里带什么，
+  // 用户最终就看到什么，前面发过的 text-delta 全被丢掉。
+  // 症状：流式期间文字正常显示，一调工具/一收尾整段文字变空。
+  const chunks = await chunksOf([
+    { type: 'text', text: '我先看看' },
+    { type: 'text', text: '这个目录' },
+    { type: 'text', text: '里有什么。' },
+    { type: 'tool_call', index: 0, id: 'call_1', name: 'pwsh', argumentsDelta: '{"command":"dir"}' },
+    { type: 'finish', reason: 'tool_calls' },
+  ])
+
+  const textEnd = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'text')
+  assert.ok(textEnd, '应当有一个 text 块的 block-end')
+  assert.equal(
+    textEnd.block.text,
+    '我先看看这个目录里有什么。',
+    `block-end 没带累积正文，用户看到的会变成 ${JSON.stringify(textEnd.block.text)}`,
+  )
+
+  // 而且必须与 delta 累加结果一致 —— 流式显示的和收尾后留下的不能是两个东西。
+  const streamed = chunks
+    .filter((chunk) => chunk.type === 'text-delta')
+    .map((chunk) => chunk.text)
+    .join('')
+  assert.equal(textEnd.block.text, streamed, 'block-end 正文必须等于所有 text-delta 的拼接')
+
+  // 工具调用的收尾不受影响（本来就是对的那一半）。
+  const toolEnd = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'tool-call')
+  assert.equal(toolEnd?.block.arguments, '{"command":"dir"}')
+  assert.equal(chunks.find((chunk) => chunk.type === 'finish')?.reason.kind, 'tool-calls')
+})
+
+test('思维链同样不能被 block-end 冲掉，报错路径也要保留已流出的正文', async () => {
+  const reasoning = await chunksOf([
+    { type: 'reasoning', text: '先想' },
+    { type: 'reasoning', text: '一下' },
+    { type: 'text', text: '答案' },
+    { type: 'finish', reason: 'stop' },
+  ])
+  const reasoningEnd = reasoning.find((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'reasoning')
+  assert.equal(reasoningEnd?.block.text, '先想一下')
+
+  // 上游中途报错：用户已经看到的正文不该被吞。
+  const failed = await chunksOf([
+    { type: 'text', text: '已经说了一半' },
+    { type: 'error', failure: { kind: 'server', message: '上游炸了', at: 0 } },
+  ])
+  const textEnd = failed.find((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'text')
+  assert.equal(textEnd?.block.text, '已经说了一半', '报错也要带上已流出的正文')
+  assert.equal(failed.find((chunk) => chunk.type === 'finish')?.reason.kind, 'error')
+})
+
+/**
+ * 宿主 `BlockAssembler` 的**忠实复刻**（只保留决定「用户看到什么」的那几条分支）。
+ *
+ * 抄自 `@deepseek-ai/dsh-llm/lib/types/assembler.js`：
+ *   - `block-start` 只在该 index 没出现过时建 partial；
+ *   - `text-delta` / `reasoning-delta` 往 `partial.text` 上**累加**；
+ *   - `block-end` 是 **`partial.block = chunk.block`** —— 覆盖，不是合并；
+ *   - 最终 `blocks()` 里，**`partial.block` 存在就直接返回它**，累加的 text 被丢弃。
+ *
+ * 最后一条就是 bug 的全部：block-end 带空串 ⇒ 流式期间的正文归零。
+ * 这段复刻让回归测试不依赖宿主安装路径，任何机器上都能跑。
+ */
+function hostAssemble(chunks) {
+  const partials = new Map()
+  const order = []
+  const ensure = (index, blockType) => {
+    if (!partials.has(index)) {
+      partials.set(index, { blockType, text: '', toolCallId: undefined, toolCallName: undefined, toolCallArguments: '', block: undefined })
+      order.push(index)
+    }
+    return partials.get(index)
+  }
+  for (const chunk of chunks) {
+    switch (chunk.type) {
+      case 'block-start':
+        if (!partials.has(chunk.index)) {
+          order.push(chunk.index)
+          partials.set(chunk.index, {
+            blockType: chunk.blockType,
+            text: '',
+            toolCallId: undefined,
+            toolCallName: undefined,
+            toolCallArguments: '',
+            block: undefined,
+          })
+        }
+        break
+      case 'text-delta':
+      case 'reasoning-delta': {
+        const partial = ensure(chunk.index, chunk.type === 'text-delta' ? 'text' : 'reasoning')
+        if (partial.block) break
+        partial.text += chunk.text
+        break
+      }
+      case 'tool-call-delta': {
+        const partial = ensure(chunk.index, 'tool-call')
+        if (partial.block) break
+        partial.toolCallId = chunk.id
+        if (chunk.name) partial.toolCallName = chunk.name
+        partial.toolCallArguments += chunk.argumentsDelta
+        break
+      }
+      case 'block-end': {
+        const partial = ensure(chunk.index, chunk.block.type)
+        if (partial.block) break // 首次关闭生效
+        partial.block = chunk.block
+        break
+      }
+      default:
+        break
+    }
+  }
+  return order.map((index) => {
+    const partial = partials.get(index)
+    if (partial.block) return partial.block // ← 覆盖物优先，累加的 text 被丢掉
+    if (partial.blockType === 'text') return { type: 'text', text: partial.text }
+    if (partial.blockType === 'reasoning') return { type: 'reasoning', text: partial.text }
+    return {
+      type: 'tool-call',
+      id: partial.toolCallId ?? `call-${index}`,
+      name: partial.toolCallName ?? '',
+      arguments: partial.toolCallArguments,
+    }
+  })
+}
+
+test('端到端：把适配器的 chunk 喂进宿主装配逻辑，流式正文必须一字不少地留下', async () => {
+  // 这是用户报的原始症状：流式期间有字，一调工具/一收尾整段变空。
+  // 上面那个 `hostAssemble` 就是宿主的行为，终局正文以它为准。
+  const chunks = await chunksOf([
+    { type: 'reasoning', text: '用户要读文件，先说明一下。' },
+    { type: 'text', text: '我来读取' },
+    { type: 'text', text: '这个文件。' },
+    { type: 'tool_call', index: 0, id: 'call_a', name: 'read', argumentsDelta: '{"filePath":' },
+    { type: 'tool_call', index: 0, argumentsDelta: '"C:/tmp/a.txt"}' },
+    { type: 'finish', reason: 'tool_calls' },
+  ])
+
+  const streamedText = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  const streamedReasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join('')
+
+  const blocks = hostAssemble(chunks)
+  const settledText = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('')
+  const settledReasoning = blocks.filter((b) => b.type === 'reasoning').map((b) => b.text).join('')
+
+  assert.equal(
+    settledText,
+    streamedText,
+    `正文被覆盖：流式 "${streamedText}" → 装配后 "${settledText}"（空串就是老 bug）`,
+  )
+  assert.equal(
+    settledReasoning,
+    streamedReasoning,
+    `思维链被覆盖：流式 ${streamedReasoning.length} 字 → 装配后 ${settledReasoning.length} 字`,
+  )
+  assert.ok(settledText.trim() !== '', '正文不该是空串')
+
+  // 工具调用仍然完整可执行 —— 修复不能弄坏另一半。
+  const call = blocks.find((b) => b.type === 'tool-call')
+  assert.equal(call?.name, 'read')
+  assert.equal(call?.arguments, '{"filePath":"C:/tmp/a.txt"}')
+  assert.equal(chunks.find((c) => c.type === 'finish')?.reason.kind, 'tool-calls')
+
+  // 顺带钉住：任何块的文本都不该是「存在但空白」——那正是老 bug 的指纹。
+  const emptyBlocks = blocks.filter(
+    (b) => (b.type === 'text' || b.type === 'reasoning') && (b.text ?? '').trim() === '',
+  )
+  assert.equal(emptyBlocks.length, 0, `出现了 ${emptyBlocks.length} 个空文本块，老 bug 回归了`)
+})
+
 // ───────────────────────── 适配器 ─────────────────────────
 
 test('注册表：内置清单包含 OpenCode 与五个骨架，且接口完整', () => {
