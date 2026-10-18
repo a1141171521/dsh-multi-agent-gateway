@@ -37,6 +37,12 @@ import { registerTools } from './tools.js'
 import { validateAdapter } from './core/registry.js'
 import { DEFAULT_DATA_DIR_NAME, defaultDataDir } from './paths.js'
 import { selectExposedModels } from './core/types.js'
+import {
+  sortForPicker,
+  vendorOf,
+  effectiveSelectedIds,
+  defaultSelectedIds,
+} from './core/model-order.js'
 import type { AgentAdapter, ModelMeta, ModelPolicy } from './core/types.js'
 
 /** 插件名（Cordis loader 读这个）。 */
@@ -204,6 +210,14 @@ export function apply(ctx: ApplyContext, config: PluginConfig = {}): PluginHandl
         contextOf: (id) => runtime.contextOf(id),
         modelsOf: (id, force) => runtime.modelsOf(id, force),
         exposedModelsOf: (id, force) => runtime.exposedModelsOf(id, force),
+        // 采样 → 请求日志（日志页与总览 KPI 的唯一数据源）
+        onRequest: (sample) => {
+          try {
+            runtime.requestLog.record(sample)
+          } catch (error) {
+            runtime.logger.warn('请求采样写入失败', error instanceof Error ? error.message : String(error))
+          }
+        },
         log: runtime.logger.child(`llm:${agentId}`),
       })
       try {
@@ -264,21 +278,38 @@ export function apply(ctx: ApplyContext, config: PluginConfig = {}): PluginHandl
     models: async (input) => {
       const agentId = typeof input?.agentId === 'string' ? input.agentId : undefined
       const force = input?.force === true
-      const list = agentId === undefined ? await runtime.allModels(force) : await runtime.modelsOf(agentId, force)
+      const raw = agentId === undefined ? await runtime.allModels(force) : await runtime.modelsOf(agentId, force)
       const policy: ModelPolicy =
         agentId === undefined ? { mode: 'all', selected: [] } : runtime.agentConfig(agentId).models
+      // 排序在宿主侧做一次：免费最前 → 厂商聚簇 → 倍率升序。
+      // 客户端只负责渲染，避免两侧各写一份排序规则然后慢慢漂移。
+      const list = sortForPicker(raw)
       const exposed = agentId === undefined ? list : selectExposedModels(list, policy)
-      const shape = (meta: (typeof list)[number]) => ({
-        id: meta.id,
-        name: meta.name,
-        agentId: meta.agentId,
-        agentName: meta.agentName,
-        multiplier: meta.multiplier ?? null,
-        multiplierSource: meta.multiplierSource ?? null,
-        free: meta.free === true,
-        description: meta.description ?? null,
-        contextWindow: meta.contextWindow ?? null,
-      })
+      const shape = (meta: (typeof list)[number]) => {
+        const vendor = vendorOf(meta.id)
+        const probe = runtime.probeOf(meta.id)
+        return {
+          id: meta.id,
+          name: meta.name,
+          agentId: meta.agentId,
+          agentName: meta.agentName,
+          multiplier: meta.multiplier ?? null,
+          multiplierSource: meta.multiplierSource ?? null,
+          free: meta.free === true || meta.multiplier === 0,
+          description: meta.description ?? null,
+          contextWindow: meta.contextWindow ?? null,
+          maxTokens: meta.maxTokens ?? null,
+          reasoning: meta.reasoning === true,
+          vision: Array.isArray(meta.inputModalities) && meta.inputModalities.includes('image'),
+          vendor: vendor.label,
+          vendorKey: vendor.key,
+          // 探测结论：没探测过就是 unknown（不是「不可用」）
+          availability: probe?.status ?? 'unknown',
+          probedAt: probe?.at ?? null,
+          probeDetail: probe?.detail ?? null,
+          ttftMs: probe?.ttftMs ?? null,
+        }
+      }
       // 返回**全量 + 策略 + 实际上报的 id**：
       //   - 勾选列表要知道上游一共有哪些（`models`）；
       //   - 界面要标出「哪些现在真的进了选择器」（`exposedIds`）。
@@ -287,6 +318,10 @@ export function apply(ctx: ApplyContext, config: PluginConfig = {}): PluginHandl
         models: list.map(shape),
         exposedIds: exposed.map((meta) => meta.id),
         policy,
+        // 勾选框显示「实际会上报的那几个」，否则 mode=free 时勾选框全空、
+        // 下拉里却有 9 个，用户会以为坏了。
+        selectedIds: agentId === undefined ? list.map((meta) => meta.id) : effectiveSelectedIds(list, policy),
+        defaultSelectedIds: defaultSelectedIds(list),
       }
     },
     addAccount: (input) =>
@@ -347,6 +382,20 @@ export function apply(ctx: ApplyContext, config: PluginConfig = {}): PluginHandl
       ),
     loginPoll: (input) => runtime.loginPoll(String(input?.loginId ?? '')),
     loginCancel: (input) => ({ ok: runtime.loginCancel(String(input?.loginId ?? '')) }),
+    probeModels: (input) =>
+      runtime.probeModels(String(input?.agentId ?? 'opencode'), {
+        ...(input?.force === true ? { force: true } : {}),
+        ...(Array.isArray(input?.ids) ? { ids: input.ids.map((id) => String(id)) } : {}),
+      }),
+    requestLog: (input) =>
+      runtime.requestLogPage({
+        ...(typeof input?.limit === 'number' ? { limit: input.limit } : {}),
+        ...(typeof input?.offset === 'number' ? { offset: input.offset } : {}),
+      }),
+    requestSummary: () => runtime.requestSummary(),
+    clearRequestLog: () => runtime.clearRequestLog(),
+    updateStatus: () => runtime.updateStatus(),
+    updateApply: () => runtime.updateApply(),
   }
   const installed = installRemoteHost(ctx, remoteImpl, {
     info: (message, ...rest) => runtime.logger.info(message, ...rest),

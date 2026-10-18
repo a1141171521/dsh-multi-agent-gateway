@@ -1,0 +1,119 @@
+# 下一期实现清单
+
+本文件记录**本期刻意没做**的东西，以及做它们需要的具体条件。写清楚是为了下一次
+不用重新调研一遍。
+
+> **有 bug 先看 [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md)**。那里是「要修的」，
+> 本文件是「没做的」「做了一半的」。别把待修问题记到这里。
+
+---
+
+## 1. Qoder / Qoder CN（**已完成**，见下）
+
+Qoder 的对话走加密端点，必须带 WASM 生成的签名：
+
+```
+Authorization: Bearer COSY.<载荷>.<签名>
+```
+
+用普通 `Bearer <access_token>` 会直接 `403 Signature invalid (101)`；模型目录也是
+加密的。实现方式：把参考实现（`dsh-our-free-model`，MIT）的
+`qoder-wasm.ts` / `qoder-machine.ts` / `qoder-product.ts` / `qoder-envelope.ts` /
+`qoder.ts` 与 `qoder-auth-wasm.wasm`（298 KB）**原样**搬进 `src/vendor/qoder/`，
+本插件只写一层薄适配器（`src/adapters/qoder.ts`）。
+
+搬运时改了两处（都写进了文件注释）：
+
+| 改动 | 原因 |
+|---|---|
+| `QoderEncryptedInfer` 的**参数属性**改成显式字段赋值 | 参数属性是**不可擦除**语法，本插件用 `stripTypeScriptTypes` 剥类型构建，会直接报错 |
+| 去掉 `import { LlmError } from '@deepseek-ai/dsh-llm'` | 那是**宿主**的包，本插件不依赖它；全文件只用它抛一条错误，换成普通 `Error` 语义不变 |
+
+`scripts/build.mjs` 增加了 `.wasm` 资产复制（WASM 桥按 `import.meta.url` 找同目录的
+wasm 文件，所以必须跟到 `lib/`）。
+
+**验收**：`QoderEncryptedInfer.create()` + `prepareInfer()` 能产出
+`https://api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?...`
+与 `Bearer COSY.<载荷>.<签名>`，并带 20 个 `Cosy-*` 身份头（已固化为单测）。
+
+**边界**：模型目录用产品兜底表（加密目录解密未接）；签到/额度未接；
+凭证需要 `security_oauth_token`（JWT，内含 `user_id`），缺 uid 时在发请求前就报错，
+不让用户对着 403 猜。
+
+---
+
+## 2. Trae（本期仍是骨架，界面上已隐藏）
+
+没有实现，`visible: false`。实现后把 `trae` 加进 `src/config.ts` 的
+`DEFAULT_VISIBLE_AGENTS` 即可，别处不用改。
+
+---
+
+## 2. 本地 OpenAI 兼容转发端口（用户明确说本期不做）
+
+参考实现有 `POST /v1/chat/completions` + `/v1/models` + 局域网中继 + 密钥轮换。
+本插件本期**不做**，等明确指示。
+
+---
+
+## 3. WorkBuddy / CodeBuddy 的签到与额度
+
+本期 WorkBuddy 适配器只做了**对话 + 模型目录**，这两项明确回报「上游不支持」：
+
+- **每日签到**：上游没有公开签到接口；
+- **额度查询**：参考实现里有 `credits.ts`（`checkinHeaders` / 积分接口），
+  本期未接。要做的话按 `src/adapters/buddy.ts` 的 `capabilities.notes` 补上即可。
+
+---
+
+## 4. 界面
+
+本期已完成五页（总览 / 账号 / 任务 / 日志 / 设置）。还没做的：
+
+- **页面切换的记忆**：现在刷新回到「总览」，可以像参考实现那样存 localStorage；
+- **热力图 / 趋势曲线**：日志页已有明细表，图表是锦上添花；
+- **请求日志的自动刷新开关**：现在只能手动刷新。
+
+---
+
+## 5. 版本更新
+
+已实现：设置页「版本更新」卡片 → `git fetch` 比对 → 一键 `git pull --ff-only`。
+
+边界（刻意如此）：
+
+- **只支持 git 检出**。npm 安装或 `link:` 但没有 `.git` 的目录会明确回报
+  `supported: false`，并提示用 `dsh plugin add` 重装 —— 不假装能更新；
+- **`--ff-only`**：本地有未提交改动或历史分叉时**拒绝**更新，不覆盖用户的东西；
+- 更新完**必须重启 DSH**：宿主在启动时加载 `lib/`，换磁盘文件不会让已加载的
+  模块重新执行。卡片上会显示这句提示。
+
+---
+
+## 5. 界面改版后剩下的尾巴（2026-10-18）
+
+这一轮把 client 半边整体重写成「投影 → HTML 字符串 + 事件委托」，界面对齐原型
+（[`docs/prototype/app.html`](prototype/app.html)），并删掉了用不上的东西。仍待办：
+
+### 5.1 宿主端的 ddAccount / setCredentials 端点还留着
+
+界面已经**没有**「手动填 token / cookie」的入口 —— 所有账号都走登录流程。
+但这两个 Remote 端点仍在（src/index.ts），保留的原因是程序化使用（脚本 / 工具）
+仍可能需要。要不要彻底删掉，等有人确认「只用登录」之后再定。
+
+### 5.2 外链登录的自动轮询只在代码层面改过，没有真机验证
+
+startLogin 现在对设备码与外链两种形态**都**排自动轮询（原型要求）。代价是
+WorkBuddy / Qoder 的 /auth/token?state= 会被每 5 秒问一次，最长问到过期。
+需要一次真人登录确认：
+1. 授权完成后 3～5 秒内界面自己变绿；
+2. 过期后停在 expired 而不是无限轮询。
+
+### 5.3 Trae 仍未实现
+
+isible:false，界面上看不到；适配器只有骨架。
+
+### 5.4 模板预览只有浅色
+
+scripts/preview.mjs 用固定的 14 个 token 浅色值渲染。深色主题下是否协调，
+只能靠真机看 —— 真机检查清单：边框、次要文字、「浅色底 + 状态色」的徽章。

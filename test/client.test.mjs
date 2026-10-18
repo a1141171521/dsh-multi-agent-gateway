@@ -25,8 +25,14 @@ import { runInNewContext } from 'node:vm'
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
 
-/** 把 client.js 装进一个假浏览器环境，返回它的 exports。 */
-function loadClientBundle() {
+/**
+ * 把 client.js 装进一个假浏览器环境，返回它的 exports。
+ *
+ * `sandbox` 可以注入额外的全局量（例如伪造的 `document`）——
+ * 用来验证**样式注入**那条路径：没有 document 时它会被静默跳过，
+ * 而「CSS 根本没注入」正是「界面没原型好看」的一种可能原因。
+ */
+function loadClientBundle(sandbox = {}) {
   const source = readFileSync(join(root, 'client', 'client.js'), 'utf8')
   let definition = null
   const window = {
@@ -36,7 +42,7 @@ function loadClientBundle() {
       },
     },
   }
-  runInNewContext(source, { window, console, JSON, Object, Array, Number, String, Boolean, Math, Error, Symbol })
+  runInNewContext(source, { window, console, JSON, Object, Array, Number, String, Boolean, Math, Error, Symbol, ...sandbox })
   assert.ok(definition !== null, 'client.js 没有调用 window.__ModuleLoader__.load')
   assert.equal(definition.id, 'dsh-multi-agent-gateway')
 
@@ -91,6 +97,39 @@ function volatilePaths(serialized, out = new Set()) {
 const client = loadClientBundle()
 const server = await import('../lib/index.js')
 const serverRemote = await import('../lib/remote.js')
+
+/**
+ * 把 vm realm 里的对象摊平成本 realm 的普通对象。
+ *
+ * 存在的理由：`deepStrictEqual` 会比对原型链，跨 realm 的 `{}` 与 `{}`
+ * 结构相同但「not reference-equal」，直接比会假失败。
+ */
+const plain = (value) => JSON.parse(JSON.stringify(value))
+
+/**
+ * 把整棵 jsx 树里的字符串收集起来。
+ *
+ * ⚠️ 假的 `jsx()` **不会真的调用函数组件** —— `jsx(FieldRow, props)` 只是
+ * `{type: FieldRow, props}`。所以这里遇到函数组件要手动调用一次，否则只能
+ * 收集到分组标题，字段本身一个都看不见（第一版就是这么假通过的）。
+ */
+function collectText(node, out = []) {
+  if (typeof node === 'string') {
+    out.push(node)
+    return out
+  }
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  if (Array.isArray(node)) {
+    for (const child of node) collectText(child, out)
+    return out
+  }
+  if (typeof node.type === 'function') {
+    collectText(node.type(node.props), out)
+    return out
+  }
+  collectText(node.props?.children, out)
+  return out
+}
 
 /**
  * 造一个**贴近真实形状**的浏览器 ctx。
@@ -273,38 +312,358 @@ test('客户端字段路径都是宿主 schema 里真实的 volatile 路径', ()
   }
 })
 
-test('ModelList 真的能渲染（jsx 结构错误只会在渲染时炸）', () => {
-  const t = (key) => String(key)
-  const actions = { setModelMode() {}, toggleModel() {}, setModelFilter() {} }
-  const items = [
-    { id: 'free-a', name: 'Free A', agentId: 'opencode', free: true, multiplier: 0 },
-    { id: 'paid-b', name: 'Paid B', agentId: 'opencode', multiplier: 2 },
-  ]
-  const base = { agentName: 'OpenCode', t, actions, disabled: false }
+/**
+ * 用真实的 `GatewayPanel` 造一份投影，再交给 `DashboardHTML` 渲染成字符串。
+ *
+ * 视图层现在是「投影 → HTML 字符串」（见 client.js 的视图段注释），所以契约
+ * 测试也断言字符串，而不是去遍历 jsx 树 —— 后者在新架构里只能看到空壳。
+ */
+function dashboardWith({ page = 'overview', items = [], policy = {}, agents = [], models = null } = {}) {
+  const ctx = fakeBrowserContext()
+  client.apply(ctx)
+  const panel = new client.GatewayPanel(ctx.configForms.get('dsh-multi-agent-gateway'), ctx)
+  panel.snapshot = {
+    status: 'ready',
+    error: null,
+    value: {
+      enabled: true,
+      totals: { accounts: 1, enabledAccounts: 1, degraded: 0 },
+      agents: agents.length > 0 ? agents : [{
+        agentId: 'opencode',
+        name: 'OpenCode',
+        visible: true,
+        implemented: true,
+        enabled: true,
+        accounts: [],
+        modelCount: items.length,
+      }],
+      jobs: [],
+      taskLog: [],
+    },
+  }
+  panel.selectedAgent = 'opencode'
+  panel.page = page
+  if (models !== null) {
+    panel.models = models
+  } else if (items.length > 0) {
+    panel.models = {
+      status: 'ready',
+      agentId: 'opencode',
+      items,
+      exposedIds: [],
+      defaultSelectedIds: [],
+      selectedIds: policy.selectedIds ?? [],
+      policy: { mode: policy.mode ?? 'free', selected: policy.selected ?? [] },
+      error: null,
+    }
+  }
+  // 勾选状态在真实链路里走「配置草稿」：照着面板自己的方法写，
+  // 别直接塞 `models.policy` —— 投影读的是草稿，塞那边等于没写。
+  if (policy.mode !== undefined) panel.edit(panel.modelPath('mode'), policy.mode)
+  if (Array.isArray(policy.selected)) panel.edit(panel.modelPath('selected'), policy.selected.join(','))
+  return { panel, html: client.DashboardHTML(panel.projection()) }
+}
 
-  // 三种模式 + 带勾选 + 带搜索，都要能渲染
-  for (const mode of ['free', 'selected', 'all']) {
-    const view = client.ModelList({
-      ...base,
-      models: { status: 'ready', items, exposedIds: ['free-a'], error: null },
-      modelPolicy: { mode, selected: ['free-a'], exposedIds: ['free-a'], filter: '' },
-    })
-    assert.ok(view !== null && view !== undefined, `mode=${mode} 渲染成了空`)
-  }
-  // 搜索过滤后没有命中：要给出提示而不是崩
-  client.ModelList({
-    ...base,
-    models: { status: 'ready', items, exposedIds: [], error: null },
-    modelPolicy: { mode: 'selected', selected: [], exposedIds: [], filter: 'zzz' },
-  })
-  // 三种非就绪态
+test('模型表：勾选计数、免费优先排序、每行都有上下文长度输入框', () => {
+  const items = [
+    { id: 'paid-b', name: 'Paid B', agentId: 'opencode', free: false, multiplier: 2, contextWindow: 200000 },
+    { id: 'free-a', name: 'Free A', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 131072 },
+  ]
+  const { panel, html } = dashboardWith({ page: 'accounts', items })
+
+  // ① 计数用「已勾选 N / 共 M」，N 来自宿主给的 selectedIds
+  assert.ok(html.includes('已勾选 <b>0</b>'), '没有勾选时计数应为 0')
+  assert.ok(html.includes('共 <b>2</b>'), '总数应为 2')
+
+  // ② 免费优先：Free A 必须排在 Paid B 前面
+  const freeAt = html.indexOf('Free A')
+  const paidAt = html.indexOf('Paid B')
+  assert.ok(freeAt > 0 && paidAt > 0, '两个模型都要在表里')
+  assert.ok(freeAt < paidAt, '免费模型要排在付费模型前面')
+
+  // ③ 每个模型行一个上下文长度输入框，占位符是上游报的窗口
+  const inputs = html.match(/class="mag-input mag-input-ctx"/g) ?? []
+  assert.equal(inputs.length, 2, '每个模型行都该有一个上下文长度输入框')
+  assert.ok(html.includes('placeholder="131072"'), '占位符显示上游报的窗口')
+  assert.ok(html.includes('placeholder="200000"'))
+
+  // ④ 保存条：没有改动时保存按钮是禁用的
+  assert.ok(html.includes('保存并生效'), '保存条必须在标题与列表之间')
+  assert.ok(/data-dirty="false"/.test(html), '没有改动时保存条不是脏状态')
+  panel.dispose()
+})
+
+test('模型表：三种非就绪态与空列表都要给出可读状态，而不是白板', () => {
   for (const status of ['idle', 'loading', 'error']) {
-    client.ModelList({
-      ...base,
-      models: { status, items: [], exposedIds: [], error: 'boom' },
-      modelPolicy: { mode: 'free', selected: [], exposedIds: [], filter: '' },
+    const { panel, html } = dashboardWith({
+      page: 'accounts',
+      models: { status, agentId: 'opencode', items: [], exposedIds: [], selectedIds: [], policy: { mode: 'free', selected: [] }, error: 'boom' },
     })
+    assert.ok(html.includes('模型'), `status=${status} 时模型卡片没渲染`)
+    if (status === 'loading') assert.ok(html.includes('正在向上游拉取模型'), 'loading 要说明在拉取')
+    if (status === 'error') assert.ok(html.includes('拉取失败'), 'error 要把原因显示出来')
+    if (status === 'idle') assert.ok(html.includes('还没有拉取过模型'), 'idle 要引导去拉取')
+    panel.dispose()
   }
+})
+
+test('模型表：勾选过的模型带 checked，取消勾选的不带', () => {
+  const items = [
+    { id: 'free-a', name: 'Free A', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 131072 },
+    { id: 'free-b', name: 'Free B', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 131072 },
+  ]
+  const { panel, html } = dashboardWith({ page: 'accounts', items, policy: { mode: 'selected', selected: ['free-a'] } })
+  assert.ok(/data-id="free-a" checked/.test(html), '勾选的模型复选框要是 checked')
+  assert.ok(!/data-id="free-b" checked/.test(html), '没勾的模型复选框不该 checked')
+  assert.ok(html.includes('已勾选 <b>1</b>'), '计数要跟着勾选走')
+  panel.dispose()
+})
+
+test('冷启动：快照还没回来时给「正在读取」，而不是一帧 0 个平台', () => {
+  const cold = client.DashboardHTML({
+    shell: { page: 'overview', writable: true, dirty: false, dirtyCount: 0, saving: false, saved: false, saveError: null, status: 'ready', advancedOpen: false },
+    snapshot: { status: 'loading', value: null, error: null },
+    summary: { status: 'idle', data: null, error: null },
+    log: { status: 'idle', entries: [], total: 0, page: 1, pageSize: 20, error: null },
+    update: { status: 'idle', data: null, error: null, applying: false },
+    global: [], agentFields: [], selectedAgent: 'opencode',
+    models: { status: 'idle', agentId: null, items: [], error: null },
+    modelPolicy: { mode: 'free', selected: [], selectedIds: [], exposedIds: [], filter: '', windowOverrides: {} },
+    busy: null, actionMessage: null, login: { status: 'idle' }, remoteError: null,
+  })
+  assert.ok(cold.includes('正在读取宿主状态'), '冷启动要说明在读')
+  assert.ok(!cold.includes('0 个平台'), '不能先画一帧空页面')
+})
+
+test('登录弹框挂在 body 上的独立层里（不被设置面板的 overflow/transform 裁剪）', () => {
+  const source = readFileSync(join(root, 'client', 'client.js'), 'utf8')
+  assert.ok(source.includes('document.body.appendChild(PORTAL)'), '弹框层要挂到 document.body')
+  assert.ok(source.includes('PORTAL.parentNode.removeChild(PORTAL)'), '面板卸载时要收掉弹框层')
+  // 面板本体不再输出遮罩层 —— 一旦有人把它塞回 inline，就会重新被裁剪
+  const { html } = dashboardWith({ page: 'accounts', items: [] })
+  assert.ok(!html.includes('mag-overlay'), '面板 HTML 里不该再有 mag-overlay')
+})
+
+test('连续取消两个模型不会互相覆盖（草稿必须优先于宿主 selectedIds）', () => {
+  const items = [
+    { id: 'free-a', name: 'A', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000 },
+    { id: 'free-b', name: 'B', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000 },
+    { id: 'free-c', name: 'C', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000 },
+  ]
+  const { panel } = dashboardWith({ page: 'accounts', items, policy: { mode: 'selected', selected: ['free-a', 'free-b', 'free-c'] } })
+  panel.toggleModel('free-a', false)
+  panel.toggleModel('free-b', false)
+  const policy = panel.projection().modelPolicy
+  assert.deepEqual([...policy.selected], ['free-c'], '两次取消都要保留，只有最后一次生效就是老 bug')
+  assert.equal(policy.mode, 'selected')
+  panel.dispose()
+})
+
+test('按推荐预选：只写草稿，保存前不上报', () => {
+  const items = [
+    { id: 'free-a', name: 'A', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000 },
+    { id: 'paid-b', name: 'B', agentId: 'opencode', free: false, multiplier: 2, contextWindow: 1000 },
+  ]
+  const { panel, html } = dashboardWith({ page: 'accounts', items, policy: { mode: 'selected', selected: [] } })
+  assert.ok(html.includes('按推荐预选'), '没勾任何模型时要给推荐预选按钮')
+  panel.preselectModels(['free-a'])
+  const policy = panel.projection().modelPolicy
+  assert.deepEqual([...policy.selected], ['free-a'])
+  assert.equal(policy.mode, 'selected')
+  assert.equal(panel.projection().shell.dirty, true, '预选只进草稿，仍然要保存')
+  panel.dispose()
+})
+
+test('模型上报默认关：没勾过就不该冒出来（曾经默认 free，导致没配过的平台也在下拉里）', () => {
+  // 直接问宿主 schema：空配置下每个 Agent 的 models.mode 必须是 selected
+  // volatile 字段的值会被包成引用对象，取默认值时先拆一层
+  const plain = (raw) => (raw && typeof raw === 'object'
+    ? (typeof raw.get === 'function' ? raw.get() : raw.value)
+    : raw)
+  const config = server.default.Config({})
+  const agents = config.agents ?? {}
+  assert.ok(Object.keys(agents).length > 0, 'schema 里应当有内置 Agent')
+  for (const [agentId, agent] of Object.entries(agents)) {
+    const mode = plain(agent?.models?.mode)
+    assert.equal(mode, 'selected', `${agentId} 的 models.mode 默认值必须是 selected，实际是 ${mode}`)
+    assert.equal(plain(agent?.models?.selected) ?? '', '', `${agentId} 的默认勾选必须为空`)
+  }
+})
+
+test('设置页字段：开关读 fieldState.checked、输入框读 fieldState.text（曾读 .value → 开关点不动）', () => {
+  const { panel } = dashboardWith({ page: 'settings' })
+  const projection = panel.projection()
+  const state = {
+    ...projection,
+    shell: { ...projection.shell, page: 'settings', dirty: true, dirtyCount: 1 },
+    global: [],
+    agentFields: [
+      { field: { section: 'basic', key: 'enabled', kind: 'bool', label: '启用这个 Agent', path: ['enabled'] }, state: { checked: true, changed: false } },
+      { field: { section: 'basic', key: 'exposeModels', kind: 'bool', label: '上报模型', path: ['exposeModels'] }, state: { checked: false, changed: false } },
+      { field: { section: 'models', key: 'contextWindowDefault', kind: 'number', label: '默认上下文长度（token）', path: ['contextWindow', 'default'] }, state: { text: '131072', changed: true } },
+    ],
+  }
+  const html = client.DashboardHTML(state)
+  assert.ok(
+    html.includes('aria-checked="true" data-act="field-toggle" data-scope="agent" data-key="enabled"'),
+    '开着的开关必须渲染成 aria-checked=true',
+  )
+  assert.ok(
+    html.includes('aria-checked="false" data-act="field-toggle" data-scope="agent" data-key="exposeModels"'),
+    '关着的开关必须渲染成 aria-checked=false',
+  )
+  assert.ok(html.includes('value="131072"'), '输入框的值要来自 fieldState.text')
+  assert.ok(html.includes('已改'), '草稿改过的字段要有「已改」标记')
+  panel.dispose()
+})
+
+test('登录弹框：五个状态各画各的，过期绝不能画成成功', () => {
+  const agent = { agentId: 'workbuddy', name: 'WorkBuddy' }
+  const base = { status: 'idle', message: null, loginId: null, userCode: null, verificationUrl: null, authUrl: null, intervalSec: 5, expiresInSec: 600 }
+
+  const starting = client.LoginModalHTML({ login: { ...base, status: 'starting' } }, agent)
+  assert.ok(starting.includes('正在获取授权链接'), 'starting 要说明在取链接')
+
+  const waiting = client.LoginModalHTML(
+    { login: { ...base, status: 'waiting', authUrl: 'https://example.test/login?state=1', loginId: 'x' } },
+    agent,
+  )
+  assert.ok(waiting.includes('在浏览器打开'), 'waiting 要有「在浏览器打开」')
+  assert.ok(waiting.includes('手动刷新状态'), 'waiting 要有「手动刷新状态」')
+  assert.ok(waiting.includes('https://example.test/login?state=1'), 'waiting 要显示授权链接')
+
+  const failed = client.LoginModalHTML({ login: { ...base, status: 'failed', message: 'HTTP 500' } }, agent)
+  assert.ok(failed.includes('获取授权链接失败'), 'failed 要报失败')
+  assert.ok(failed.includes('HTTP 500'), 'failed 要显示上游原话')
+
+  // ⚠️ 回归点：宿主会把 `expired` 原样传上来，早先的 else 分支把它画成了绿勾。
+  const expired = client.LoginModalHTML({ login: { ...base, status: 'expired' } }, agent)
+  assert.ok(expired.includes('授权链接已过期'), 'expired 要说过期')
+  assert.ok(!expired.includes('已添加账号'), 'expired 绝不能画成成功')
+  assert.ok(expired.includes('重新获取链接'), 'expired 要能重新取链接')
+
+  const ready = client.LoginModalHTML({ login: { ...base, status: 'ready' } }, agent)
+  assert.ok(ready.includes('已添加账号'), 'ready 才是成功态')
+
+  // 未知状态：说不知道，也不许冒充成功
+  const weird = client.LoginModalHTML({ login: { ...base, status: 'something-new' } }, agent)
+  assert.ok(!weird.includes('已添加账号'), '未知状态不能画成成功')
+  assert.ok(weird.includes('登录状态未知'), '未知状态要给出明确文案')
+})
+
+test('逐模型上下文长度：写成 `id=长度` 串，清空即删除', () => {
+  const ctx = fakeBrowserContext()
+  client.apply(ctx)
+  const panel = new client.GatewayPanel(ctx.configForms.get('dsh-multi-agent-gateway'), ctx)
+  const path = 'agents.opencode.contextWindow.overrides'
+
+  panel.setModelWindow('paid-b', '262144')
+  panel.setModelWindow('free-a', '131072')
+  assert.deepEqual(plain(panel.windowOverrides()), { 'free-a': 131072, 'paid-b': 262144 })
+  let op = panel.ops().find((item) => item.path.join('.') === path)
+  assert.equal(op.value, 'free-a=131072,paid-b=262144', '按 id 排序，保存结果稳定可 diff')
+
+  // 清空到与配置相同的值就不该产生 op（否则每次保存都多一个空改动）
+  panel.setModelWindow('free-a', '')
+  panel.setModelWindow('paid-b', 'abc')
+  assert.deepEqual(plain(panel.windowOverrides()), {})
+  op = panel.ops().find((item) => item.path.join('.') === path)
+  assert.equal(op, undefined, '全清空后不该再有 op')
+  panel.dispose()
+})
+
+test('0 / 负数不写进上下文长度覆盖（会让 DSH 立刻压缩）', () => {
+  const ctx = fakeBrowserContext()
+  client.apply(ctx)
+  const panel = new client.GatewayPanel(ctx.configForms.get('dsh-multi-agent-gateway'), ctx)
+  for (const bad of ['0', '-5', 'abc', '']) panel.setModelWindow('free-a', bad)
+  assert.deepEqual(plain(panel.windowOverrides()), {})
+  panel.setModelWindow('free-a', '131072')
+  assert.deepEqual(plain(panel.windowOverrides()), { 'free-a': 131072 })
+  panel.dispose()
+})
+
+test('接口路径不再出现在设置页（用户根本填不出来）', () => {
+  const paths = client.AGENT_FIELDS.map((field) => field.path.join('.'))
+  for (const path of [
+    'upstream.checkInPath',
+    'upstream.quotaPath',
+    'upstream.tasksPath',
+    'upstream.taskClaimPath',
+    'upstream.taskStatusPath',
+  ]) {
+    assert.ok(!paths.includes(path), `${path} 不该出现在设置页 —— 它是适配器的内置知识`)
+  }
+  // 每个字段都必须落在某个分组里，否则 renderGroup 会把它**静默丢掉**
+  for (const field of client.AGENT_FIELDS) {
+    assert.ok(
+      ['basic', 'schedule', 'models', 'advanced'].includes(field.section),
+      `字段 ${field.key} 的 section 非法：${field.section}`,
+    )
+  }
+})
+
+test('设置页：常用项默认可见、上游地址折叠在「高级」里、接口路径永不出现', () => {
+  const { panel, html } = dashboardWith({ page: 'settings' })
+
+  for (const label of ['启用这个 Agent', '上报模型到 DSH 选择器', '自动签到（基础每日任务）', '任务轮询间隔（分钟）']) {
+    assert.ok(html.includes(label), `设置页少了「${label}」`)
+  }
+  for (const label of ['签到接口路径', '额度接口路径', '任务列表路径', '领取奖励路径', '对话 base url']) {
+    assert.ok(!html.includes(label), `「${label}」不该默认显示`)
+  }
+
+  panel.toggleAdvanced()
+  const expanded = client.DashboardHTML(panel.projection())
+  assert.ok(expanded.includes('对话 base url'), '展开「高级」后应看到上游地址')
+  assert.ok(!expanded.includes('签到接口路径'), '接口路径任何时候都不该出现在界面里')
+  panel.dispose()
+})
+
+test('五页导航：五个页签都在，切页后只渲染这一页', () => {
+  const agents = [
+    { agentId: 'opencode', name: 'OpenCode', visible: true, implemented: true, enabled: true, accounts: [], modelCount: 0 },
+    { agentId: 'qoder', name: 'Qoder', visible: false, implemented: false, enabled: false, accounts: [], modelCount: 0 },
+  ]
+  const { panel, html } = dashboardWith({ page: 'accounts', agents })
+
+  for (const label of ['总览', '账号', '任务', '日志', '设置']) {
+    assert.ok(html.includes(label), `导航少了「${label}」`)
+  }
+  assert.ok(html.includes('OpenCode'), '可见平台要在列表里')
+  assert.ok(!html.includes('Qoder'), 'visible=false 的平台不该出现')
+
+  // 切到日志页：应该出现日志表头，且不再出现总览的 KPI
+  panel.setPage('logs')
+  const logs = client.DashboardHTML(panel.projection())
+  assert.ok(logs.includes('请求日志'), '日志页没渲染')
+  assert.ok(!logs.includes('平台健康'), '日志页不该出现总览的内容')
+  panel.dispose()
+})
+
+test('设置页入口：apply 会注册 settings.section（设置页一级导航）', () => {
+  const registered = []
+  const ctx = fakeBrowserContext()
+  ctx.slots = {
+    ...ctx.slots,
+    register: (options, component) => {
+      registered.push({ options, component })
+      return () => {}
+    },
+  }
+  client.apply(ctx)
+
+  const section = registered.find((item) => item.options.name === 'settings.section')
+  assert.ok(section, 'settings.section 没注册 —— 设置页不会出现这一页')
+  assert.equal(section.options.id, client.CONFIG_NS, 'id 必须用自己的，重名会顶掉别人的格子')
+  assert.equal(typeof section.options.label, 'function', 'label 要是 thunk，切语言才不用重新注册')
+  assert.equal(typeof section.options.inject, 'function', 'inject 负责把 useGatewayPanel 与动作交给组件')
+  assert.ok(Number.isFinite(section.options.order), 'order 决定它在导航里的位置')
+
+  // 三处入口必须渲染同一个组件，否则会出现「插件页能用、设置页空白」这种半坏状态
+  const pluginsPage = registered.find((item) => item.options.name === 'plugins.bundle.config')
+  assert.ok(pluginsPage, 'plugins.bundle.config 仍然要注册（老入口不能丢）')
+  assert.equal(section.component, pluginsPage.component, '三处入口必须复用 GatewayPanelView')
 })
 
 test('无参端点必须零参数调用（曾因多传一个 {} 让整个面板打不开）', async () => {
@@ -325,9 +684,12 @@ test('无参端点必须零参数调用（曾因多传一个 {} 让整个面板�
   const panel = new client.GatewayPanel(ctx.configForms.get('dsh-multi-agent-gateway'), ctx)
 
   await panel.refresh()
-  assert.equal(calls.at(-1).name, 'state')
+  // 注意：refresh 之后还会顺手拉 KPI 与请求日志（fire-and-forget），
+  // 所以不能断言「最后一次调用」，要按方法名找。
+  const stateCall = calls.find((item) => item.name === 'state')
+  assert.ok(stateCall !== undefined, 'refresh 没有调用 state')
   assert.equal(
-    calls.at(-1).argc,
+    stateCall.argc,
     0,
     'state 的描述符声明 0 个参数；多传一个 {} 会被网关直接拒（expected 0 argument(s), got 1）',
   )
@@ -395,4 +757,46 @@ test('plugin.json 的 contributes 与真实注册保持一致', async () => {
   assert.deepEqual(providers, expected)
   assert.equal(manifest.id, 'dsh-multi-agent-gateway')
   assert.equal(manifest.client.main, './lib/client.js')
+})
+
+test('样式真的会被注入到页面（没注入 = 界面退化成白板）', () => {
+  const appended = []
+  const makeDocument = (existing) => ({
+    querySelector: () => existing,
+    createElement: (tag) => ({ tagName: tag, dataset: {}, textContent: '' }),
+    head: { appendChild: (node) => appended.push(node) },
+  })
+
+  // ① 页面上还没有这份样式 → 应当追加一个 style
+  const fresh = loadClientBundle({ document: makeDocument(null) })
+  assert.equal(appended.length, 1, '样式没被注入 —— 界面会完全没有本插件的样式')
+  const tag = appended[0]
+  assert.equal(tag.tagName, 'style')
+  assert.equal(tag.dataset.pluginCss, 'dsh-multi-agent-gateway/client.css')
+  assert.equal(tag.dataset.plugin, 'dsh-multi-agent-gateway')
+  // 关键类名必须在里面（抽查几个渲染时依赖的）
+  for (const sel of ['.mag-root', '.mag-card', '.mag-kpi', '.mag-pill', '.mag-tbl', '.mag-save', '.mag-mrow', '.mag-modal']) {
+    assert.ok(tag.textContent.includes(sel), `样式里缺 ${sel}`)
+  }
+  // ⚠️ 只能用**真实存在**的 token。DSH 主题只提供 14 个（bg-base / bg-layer-1/2 /
+  // bg-overlay / border-l1/l2 / brand-primary / label-primary/secondary /
+  // state-{error,idle,success,warn}-primary / sidebar-fill）。用了不存在的名字，
+  // 对应样式会静默失效 —— 这正是「界面没原型好看」的一个可能来源。
+  for (const bad of [
+    'label-tertiary',
+    'state-business-primary',
+    'settings-card-',
+    'border-l3',
+    'border-l4',
+    'interactive-bg-hover',
+    'dsw-radius',
+  ]) {
+    assert.ok(!tag.textContent.includes(bad), `样式里用了 DSH 不存在的 token：${bad}`)
+  }
+
+  // ② 页面上已经有这份样式 → 不重复追加（插件页会被反复挂载）
+  appended.length = 0
+  loadClientBundle({ document: makeDocument({ tagName: 'style' }) })
+  assert.equal(appended.length, 0, '重复挂载时不该再追加一份样式')
+  assert.ok(fresh.CSS.length > 500, 'CSS 导出为空')
 })

@@ -85,6 +85,31 @@ if (!checkOnly) {
   console.log(`✓ 构建完成：${tsFiles.length} 个 TypeScript 文件 → lib/`)
 }
 
+// ── 二进制资产：src 下的 .wasm 要跟到 lib 的同名位置 ──
+//
+// Qoder 的 WASM 桥用 `resolve(dirname(import.meta.url), 'qoder-auth-wasm.wasm')`
+// 读文件 —— 它找的是**编译产物旁边**，所以只放在 src 里不够，必须复制。
+function copyWasmAssets(from, to) {
+  if (statSync(from, { throwIfNoEntry: false }) === undefined) return 0
+  let count = 0
+  for (const entry of readdirSync(from, { withFileTypes: true })) {
+    const source = join(from, entry.name)
+    const target = join(to, entry.name)
+    if (entry.isDirectory()) {
+      count += copyWasmAssets(source, target)
+    } else if (entry.isFile() && entry.name.endsWith('.wasm')) {
+      if (!checkOnly) {
+        mkdirSync(dirname(target), { recursive: true })
+        writeFileSync(target, readFileSync(source))
+      }
+      count += 1
+    }
+  }
+  return count
+}
+const wasmCount = copyWasmAssets(srcDir, libDir)
+if (wasmCount > 0) console.log(`✓ ${wasmCount} 个 .wasm 资产 → lib/`)
+
 // ── 客户端半边：手写的浏览器 bundle，直接复制到 lib/client.js ──
 const clientSource = join(root, 'client', 'client.js')
 if (statSync(clientSource, { throwIfNoEntry: false }) !== undefined) {

@@ -7,7 +7,8 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -19,6 +20,25 @@ import { parseSchedule, matches, isDue } from '../lib/core/scheduler.js'
 import { AccountManager } from '../lib/core/accounts.js'
 import { AccountRouter } from '../lib/core/router.js'
 import { formatMultiplier, shouldSwitchAccount, isRetryable, selectExposedModels } from '../lib/core/types.js'
+import {
+  vendorOf,
+  isFreeModel,
+  sortForPicker,
+  effectiveSelectedIds,
+  defaultSelectedIds,
+} from '../lib/core/model-order.js'
+import {
+  classifyProbeOutcome,
+  runProbeBatch,
+  mergeProbeCache,
+  isStale,
+  availabilityLabel,
+  PROBE_DEFAULTS,
+} from '../lib/core/probe.js'
+import { RequestLog, computeTps } from '../lib/core/request-log.js'
+import { checkUpdate, applyUpdate, compareVersions, semverParts, readVersion, describeUpdate } from '../lib/core/updater.js'
+import { parseModelsFromConfig, buddyHeaders, userAgentFor, BUDDY_CN, BUDDY_INTL, BuddyAdapter } from '../lib/adapters/buddy.js'
+import { uidFromToken, machineIdOf, QoderAdapter, QODER_CN } from '../lib/adapters/qoder.js'
 import {
   microCentsToUsd,
   multiplierOf,
@@ -1500,4 +1520,609 @@ test('ensureFreshCredentials：续期失败不抛错，先用旧 token 让上游
   }
   const out = await adapter.ensureFreshCredentials(record, ctx)
   assert.equal(out.token, 'AT')
+})
+
+// ─────────────────────────── 模型排序 / 厂商 / 默认勾选 ───────────────────────────
+
+/** 造一条最小 ModelMeta（只带排序用得到的字段）。 */
+const meta = (id, name, multiplier, free) => ({
+  id,
+  name: name ?? id,
+  agentId: 'opencode',
+  agentName: 'OpenCode',
+  ...(multiplier === undefined ? {} : { multiplier }),
+  ...(free === undefined ? {} : { free }),
+})
+
+test('vendorOf：认得出的走厂商表，认不出的退化成 id 第一段', () => {
+  assert.equal(vendorOf('deepseek-v4.1-flash-free').key, 'deepseek')
+  assert.equal(vendorOf('glm-5.3-flash-free').key, 'zhipu')
+  assert.equal(vendorOf('claude-sonnet-4.5').key, 'anthropic')
+  assert.equal(vendorOf('gpt-5').key, 'openai')
+  assert.equal(vendorOf('gemini-2.5-pro').key, 'google')
+  assert.equal(vendorOf('qwen3.8-flash').key, 'alibaba')
+  assert.equal(vendorOf('nemotron-3.5-lightning-free').key, 'nvidia')
+  // 认不出的：用第一段，保证「同一家的排在一起」仍然成立
+  assert.equal(vendorOf('big-pickle').key, 'big')
+  assert.equal(vendorOf('space-bunny-free').key, 'space')
+})
+
+test('isFreeModel：free 标记或倍率 0 都算免费', () => {
+  assert.equal(isFreeModel(meta('a', 'A', 0)), true)
+  assert.equal(isFreeModel(meta('a', 'A', undefined, true)), true)
+  assert.equal(isFreeModel(meta('a', 'A', 2)), false)
+  assert.equal(isFreeModel(meta('a', 'A', undefined)), false)
+})
+
+test('sortForPicker：免费最前 → 厂商聚簇 → 倍率升序 → 名称', () => {
+  const list = [
+    meta('gpt-5', 'GPT-5', 2.4),
+    meta('deepseek-v3.2', 'DeepSeek V3.2', 0.4),
+    meta('big-pickle', 'Big Pickle', 0, true),
+    meta('glm-5.3-flash-free', 'GLM Free', 0, true),
+    meta('claude-sonnet-4.5', 'Claude', 1.8),
+    meta('deepseek-r1', 'DeepSeek R1', 1.2),
+    meta('space-bunny-free', 'Space Bunny', 0, true),
+    meta('deepseek-v4.1-flash-free', 'DeepSeek Free', 0, true),
+  ]
+  const sorted = sortForPicker(list).map((item) => item.id)
+
+  // ① 四个免费的全在最前
+  assert.deepEqual(sorted.slice(0, 4).sort(), [
+    'big-pickle',
+    'deepseek-v4.1-flash-free',
+    'glm-5.3-flash-free',
+    'space-bunny-free',
+  ])
+  // ② 付费区里同一厂商连在一起：两个 deepseek 相邻
+  const paid = sorted.slice(4)
+  assert.equal(paid.length, 4)
+  const deepseekAt = paid.indexOf('deepseek-v3.2')
+  const deepseekR1At = paid.indexOf('deepseek-r1')
+  assert.ok(deepseekAt >= 0 && deepseekR1At >= 0)
+  assert.equal(Math.abs(deepseekAt - deepseekR1At), 1, 'deepseek 的两个模型必须相邻')
+  // ③ 同厂商内按倍率升序
+  assert.ok(deepseekAt < deepseekR1At, '×0.4 应排在 ×1.2 前面')
+  // ④ 原数组不被修改
+  assert.equal(list[0].id, 'gpt-5')
+})
+
+test('sortForPicker：未知倍率排在同厂商的最后', () => {
+  const sorted = sortForPicker([
+    meta('deepseek-x', 'X', undefined),
+    meta('deepseek-y', 'Y', 0.5),
+  ]).map((item) => item.id)
+  assert.deepEqual(sorted, ['deepseek-y', 'deepseek-x'])
+})
+
+test('effectiveSelectedIds：mode 感知，界面勾选与实际上报同源', () => {
+  const list = [meta('free-a', 'A', 0, true), meta('paid-b', 'B', 2), meta('paid-c', 'C', 3)]
+  assert.deepEqual(effectiveSelectedIds(list, { mode: 'free', selected: [] }), ['free-a'])
+  assert.deepEqual(effectiveSelectedIds(list, { mode: 'all', selected: [] }), ['free-a', 'paid-b', 'paid-c'])
+  assert.deepEqual(effectiveSelectedIds(list, { mode: 'selected', selected: ['paid-b'] }), ['paid-b'])
+  // selected 里写了不存在的 id：忽略，不报错
+  assert.deepEqual(effectiveSelectedIds(list, { mode: 'selected', selected: ['nope'] }), [])
+})
+
+test('defaultSelectedIds：有免费就全勾免费，没有就一个都不勾', () => {
+  assert.deepEqual(
+    defaultSelectedIds([meta('free-a', 'A', 0, true), meta('free-b', 'B', undefined, true), meta('paid', 'P', 2)]),
+    ['free-a', 'free-b'],
+  )
+  assert.deepEqual(defaultSelectedIds([meta('paid', 'P', 2)]), [])
+  assert.deepEqual(defaultSelectedIds([]), [])
+})
+
+// ─────────────────────────── 模型可用性探测 ───────────────────────────
+
+test('classifyProbeOutcome：只有针对该模型的明确答复才算判定', () => {
+  // 200 = 真的能出字
+  assert.equal(classifyProbeOutcome({ status: 200, text: 'data: {}' }), 'available')
+
+  // 地区限制：三种常见措辞都要认出来
+  assert.equal(
+    classifyProbeOutcome({ status: 403, text: '{"error":"This model is not available in your country"}' }),
+    'region-blocked',
+  )
+  assert.equal(classifyProbeOutcome({ status: 403, text: '{"error":"not available in your region"}' }), 'region-blocked')
+
+  // 404 / 模型已下线
+  assert.equal(classifyProbeOutcome({ status: 404, text: '{"error":"Model is unavailable"}' }), 'unavailable')
+  assert.equal(classifyProbeOutcome({ status: 404, text: 'not found' }), 'unavailable')
+
+  // 400 只有明确指向模型时才归到模型头上
+  assert.equal(classifyProbeOutcome({ status: 400, text: '{"error":"invalid model: foo"}' }), 'unavailable')
+  assert.equal(classifyProbeOutcome({ status: 400, text: '{"error":"messages must not be empty"}' }), 'unknown')
+})
+
+test('classifyProbeOutcome：不是对模型的判定 → 一律 unknown（绝不能标灰）', () => {
+  // 网络层失败：没拿到任何答复
+  assert.equal(classifyProbeOutcome({ error: 'fetch failed: ECONNRESET' }), 'unknown')
+  // 免费层门禁：针对机器而不是模型
+  assert.equal(
+    classifyProbeOutcome({ status: 403, text: '{"error":{"type":"FreeTierError","message":"can only be used from within OpenCode"}}' }),
+    'unknown',
+  )
+  assert.equal(classifyProbeOutcome({ status: 401, text: '{"error":"missing api key"}' }), 'unknown')
+  assert.equal(classifyProbeOutcome({ status: 429, text: 'rate limited' }), 'unknown')
+  assert.equal(classifyProbeOutcome({ status: 503, text: 'upstream down' }), 'unknown')
+  assert.equal(classifyProbeOutcome({ status: 500, text: 'boom' }), 'unknown')
+})
+
+test('runProbeBatch：并发受控、单条失败不断批、结果按入参顺序', async () => {
+  const ids = ['a', 'b', 'c', 'd', 'e']
+  let inFlight = 0
+  let peak = 0
+  const results = await runProbeBatch(
+    ids,
+    async (id) => {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      inFlight -= 1
+      if (id === 'c') throw new Error('boom')
+      if (id === 'd') return { status: 404, text: 'model not found' }
+      return { status: 200, text: 'ok', ttftMs: 123.6 }
+    },
+    { concurrency: 2 },
+  )
+
+  assert.ok(peak <= 2, `并发不该超过 2，实际峰值 ${peak}`)
+  assert.deepEqual(results.map((r) => r.modelId), ids, '结果必须按入参顺序')
+  assert.equal(results[0].status, 'available')
+  assert.equal(results[0].ttftMs, 124, '首字延迟四舍五入')
+  assert.equal(results[2].status, 'unknown', '抛错按 unknown 记，不能中断整批')
+  assert.equal(results[3].status, 'unavailable')
+})
+
+test('mergeProbeCache：合并返回新对象，不改入参', () => {
+  const before = { a: { modelId: 'a', status: 'available', at: 1 } }
+  const after = mergeProbeCache(before, [{ modelId: 'b', status: 'unknown', at: 2 }])
+  assert.equal(Object.keys(before).length, 1, '入参不能被改')
+  assert.deepEqual(Object.keys(after).sort(), ['a', 'b'])
+})
+
+test('isStale：超过阈值才算过期', () => {
+  const at = 1_000_000
+  assert.equal(isStale({ at }, at + PROBE_DEFAULTS.staleAfterMs - 1), false)
+  assert.equal(isStale({ at }, at + PROBE_DEFAULTS.staleAfterMs + 1), true)
+})
+
+test('availabilityLabel：四态文案固定', () => {
+  assert.equal(availabilityLabel('available'), '可用')
+  assert.equal(availabilityLabel('region-blocked'), '地区受限')
+  assert.equal(availabilityLabel('unavailable'), '不可用')
+  assert.equal(availabilityLabel('unknown'), '未探测')
+})
+
+// ─────────────────────────── 请求日志 ───────────────────────────
+
+test('computeTps：解码耗时算速度，窗口太短不给结论', () => {
+  // 2000ms 总耗时，首字 1000ms → 解码 1000ms，输出 50 token → 50 tok/s
+  assert.equal(computeTps({ durationMs: 2000, ttftMs: 1000, outputTokens: 50 }), 50)
+  // 窗口只有 20ms：算出来会是几万 tok/s，宁可没有
+  assert.equal(computeTps({ durationMs: 1020, ttftMs: 1000, outputTokens: 50 }), undefined)
+  // 缺 token / 缺首字：都不给结论
+  assert.equal(computeTps({ durationMs: 2000, ttftMs: 1000 }), undefined)
+  assert.equal(computeTps({ durationMs: 2000, outputTokens: 50 }), undefined)
+})
+
+test('RequestLog：新的在前、分页、容量上限、清空', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mag-req-'))
+  try {
+    const log = new RequestLog(join(dir, 'requests.jsonl'), { maxEntries: 50 })
+    for (let index = 0; index < 5; index += 1) {
+      log.record({
+        agentId: 'opencode',
+        agentName: 'OpenCode',
+        model: 'free-a',
+        accountId: null,
+        ok: true,
+        durationMs: 1000,
+        ts: 1_000 + index,
+      })
+    }
+    const page = log.list({ limit: 2, offset: 0 })
+    assert.equal(page.total, 5)
+    assert.deepEqual(page.entries.map((entry) => entry.ts), [1_004, 1_003], '新的在前')
+
+    const second = log.list({ limit: 2, offset: 2 })
+    assert.deepEqual(second.entries.map((entry) => entry.ts), [1_002, 1_001])
+
+    log.clear()
+    assert.equal(log.list().total, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('RequestLog：重启后从磁盘恢复', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mag-req2-'))
+  try {
+    const path = join(dir, 'requests.jsonl')
+    const first = new RequestLog(path)
+    first.record({
+      agentId: 'workbuddy',
+      agentName: 'WorkBuddy',
+      model: 'claude-sonnet-4.5',
+      accountId: 'workbuddy:a',
+      ok: false,
+      durationMs: 120_000,
+      error: 'no first byte',
+    })
+    const second = new RequestLog(path)
+    const page = second.list()
+    assert.equal(page.total, 1)
+    assert.equal(page.entries[0].model, 'claude-sonnet-4.5')
+    assert.equal(page.entries[0].ok, false)
+    assert.equal(page.entries[0].error, 'no first byte')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('RequestLog.summary：按模型/平台汇总，均值各算各的', () => {  const dir = mkdtempSync(join(tmpdir(), 'mag-req3-'))
+  try {
+    const log = new RequestLog(join(dir, 'requests.jsonl'))
+    const now = Date.now()
+    log.record({ agentId: 'opencode', agentName: 'OpenCode', model: 'a', accountId: null, ok: true, durationMs: 2000, ttftMs: 400, tps: 40, inputTokens: 100, outputTokens: 20, ts: now })
+    log.record({ agentId: 'opencode', agentName: 'OpenCode', model: 'a', accountId: null, ok: true, durationMs: 3000, ttftMs: 600, tps: 60, inputTokens: 200, outputTokens: 30, ts: now })
+    log.record({ agentId: 'workbuddy', agentName: 'WorkBuddy', model: 'b', accountId: 'x', ok: false, durationMs: 500, error: 'boom', ts: now })
+    // 一条「昨天」的记录：不该进 today
+    log.record({ agentId: 'opencode', agentName: 'OpenCode', model: 'a', accountId: null, ok: true, durationMs: 1000, ts: now - 86_400_000 * 2 })
+
+    const summary = log.summary(now)
+    assert.equal(summary.total, 4)
+    assert.equal(summary.today, 3)
+    assert.equal(summary.ok, 3)
+    assert.equal(summary.failed, 1)
+    assert.equal(summary.inputTokens, 300)
+    assert.equal(summary.outputTokens, 50)
+    assert.equal(summary.avgTtftMs, 500)
+    assert.equal(summary.avgTps, 50)
+
+    const modelA = summary.byModel.find((row) => row.model === 'a')
+    assert.equal(modelA.calls, 3)
+    assert.equal(modelA.ttftMs, 500)
+    assert.equal(modelA.tps, 50)
+
+    const agentRow = summary.byAgent.find((row) => row.agentId === 'workbuddy')
+    assert.equal(agentRow.calls, 1)
+    assert.equal(agentRow.failed, 1)
+
+    // 最近一回合 = 最后记的那条（昨天那条）
+    assert.equal(summary.last.model, 'a')
+    assert.equal(summary.last.ok, true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ─────────────────────────── WorkBuddy 适配器 ───────────────────────────
+
+test('parseModelsFromConfig：合并 agent 引用 / data.models / 试用横幅', () => {
+  const body = {
+    data: {
+      agents: [{ name: 'craft', models: ['hy3', 'auto', 'nes-completion'] }],
+      models: [
+        { id: 'hy3', name: 'Hy3', maxInputTokens: 192000, supportsImages: true },
+        { id: 'glm-5.3', name: 'GLM-5.3', maxInputTokens: 1000000, supportsImages: true },
+        { id: 'completion-x' },
+      ],
+      productFeaturesConfig: { ModelTrialBanner: { banners: [{ targetModelId: 'hy4-preview' }] } },
+    },
+  }
+  const list = parseModelsFromConfig(body)
+  const ids = list.map((item) => item.id)
+  assert.ok(!ids.includes('auto'))
+  assert.ok(!ids.includes('nes-completion'))
+  assert.ok(!ids.includes('completion-x'))
+  assert.deepEqual(ids, ['hy3', 'glm-5.3', 'hy4-preview'])
+  const hy3 = list.find((item) => item.id === 'hy3')
+  assert.equal(hy3.name, 'Hy3')
+  assert.equal(hy3.contextWindow, 192000)
+  assert.deepEqual(hy3.inputModalities, ['text', 'image'])
+  const trial = list.find((item) => item.id === 'hy4-preview')
+  assert.equal(trial.name, 'hy4-preview')
+  assert.equal(trial.contextWindow, undefined)
+})
+
+test('parseModelsFromConfig：结构不对就返回空数组（调用方回退内置表）', () => {
+  assert.deepEqual(parseModelsFromConfig(null), [])
+  assert.deepEqual(parseModelsFromConfig({}), [])
+  assert.deepEqual(parseModelsFromConfig({ data: null }), [])
+})
+
+test('userAgentFor：国际版按模型族分档，国内版不分档', () => {
+  assert.equal(userAgentFor(BUDDY_INTL, 'gpt-5'), 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2')
+  assert.equal(userAgentFor(BUDDY_INTL, 'claude-sonnet-4.5'), 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2')
+  assert.equal(userAgentFor(BUDDY_INTL, 'glm-5.3'), 'WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
+  assert.equal(userAgentFor(BUDDY_INTL, 'kimi-k3-1'), 'WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
+  assert.equal(userAgentFor(BUDDY_CN, 'gpt-5'), 'CodeBuddyIDE/1.106.1')
+})
+
+test('buddyHeaders：五个身份头 + Bearer 一个都不能少', () => {
+  const headers = buddyHeaders(BUDDY_INTL, 'tok123', 'gpt-5')
+  assert.equal(headers.authorization, 'Bearer tok123')
+  assert.equal(headers['x-domain'], 'www.workbuddy.ai')
+  assert.equal(headers['x-product-code'], 'workbuddy')
+  assert.equal(headers['x-product'], 'WorkBuddy')
+  assert.equal(headers['x-agent-purpose'], 'conversation')
+  assert.equal(headers['x-ide-name'], 'WorkBuddy')
+  assert.equal(headers['x-ide-type'], 'WorkBuddy')
+  assert.equal(headers['x-ide-version'], '5.5.2')
+  assert.equal(headers['user-agent'], 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2')
+
+  const cn = buddyHeaders(BUDDY_CN, 't', 'hy3')
+  assert.equal(cn['x-domain'], 'copilot.tencent.com')
+  assert.equal(cn['x-product-code'], 'codebuddy')
+  assert.equal(cn['x-product'], 'CodeBuddy')
+})
+
+test('内置适配器：五个平台已真实现，Trae 仍是骨架', async () => {
+  const { builtinAdapters } = await import('../lib/adapters/index.js')
+  const adapters = builtinAdapters()
+  const byId = new Map(adapters.map((item) => [item.id, item]))
+  for (const id of ['opencode', 'qoder', 'qoder-cn', 'workbuddy', 'workbuddy-intl']) {
+    assert.equal(byId.get(id)?.implemented, true, `${id} 应当已实现`)
+    assert.equal(byId.get(id)?.capabilities.chat, true, `${id} 应当声明支持对话`)
+  }
+  assert.equal(byId.get('trae')?.implemented, false, 'Trae 本期仍是骨架')
+  assert.deepEqual(
+    adapters.map((item) => item.id),
+    ['opencode', 'qoder', 'qoder-cn', 'trae', 'workbuddy', 'workbuddy-intl'],
+  )
+})
+
+// ─────────────────────────── 版本更新（真实 git 仓库） ───────────────────────────
+
+/** 在临时目录里跑 git（测试自用）。 */
+function gitRun(cwd, args) {
+  execFileSync('git', args, { cwd, stdio: 'pipe', windowsHide: true })
+}
+
+test('compareVersions / semverParts：数值段比较，预发布标记不影响', () => {
+  assert.deepEqual(semverParts('v1.2.3'), [1, 2, 3])
+  assert.deepEqual(semverParts('1.2.3-beta.1'), [1, 2, 3])
+  assert.ok(compareVersions('1.2.3', '1.2.2') > 0)
+  assert.ok(compareVersions('1.2.3', '1.10.0') < 0)
+  assert.equal(compareVersions('1.2.3', 'v1.2.3'), 0)
+  assert.equal(compareVersions('1.2.3', '1.2.3-beta'), 0)
+  assert.ok(compareVersions('2.0', '1.9.9') > 0)
+})
+
+test('checkUpdate：不是 git 检出时明确说不支持，而不是假装能更新', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mag-nogit-'))
+  try {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '0.1.0' }), 'utf8')
+    const status = await checkUpdate(dir)
+    assert.equal(status.supported, false)
+    assert.equal(status.current, '0.1.0')
+    assert.ok(typeof status.error === 'string' && status.error.length > 0)
+    assert.ok(describeUpdate(status).length > 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('checkUpdate + applyUpdate：落后提交数与版本号都对，快进后版本更新', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'mag-upd-'))
+  const remote = join(base, 'remote.git')
+  const seed = join(base, 'seed')
+  const work = join(base, 'work')
+  try {
+    // 造一个本地「远端」仓库 + 两个克隆
+    mkdirSync(remote, { recursive: true })
+    gitRun(remote, ['init', '--bare', '-b', 'main'])
+    mkdirSync(seed, { recursive: true })
+    gitRun(seed, ['init', '-b', 'main'])
+    writeFileSync(join(seed, 'package.json'), JSON.stringify({ name: 'x', version: '0.1.0' }), 'utf8')
+    gitRun(seed, ['add', '-A'])
+    gitRun(seed, ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-m', 'v0.1.0'])
+    gitRun(seed, ['remote', 'add', 'origin', remote])
+    gitRun(seed, ['push', 'origin', 'main'])
+    gitRun(base, ['clone', remote, work])
+
+    // 刚克隆：没有落后
+    const fresh = await checkUpdate(work)
+    assert.equal(fresh.supported, true)
+    assert.equal(fresh.behind, 0)
+    assert.equal(fresh.current, '0.1.0')
+    assert.equal(fresh.latest, '0.1.0')
+
+    // 远端发一个新版本
+    writeFileSync(join(seed, 'package.json'), JSON.stringify({ name: 'x', version: '0.2.0' }), 'utf8')
+    gitRun(seed, ['add', '-A'])
+    gitRun(seed, ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-m', 'v0.2.0'])
+    gitRun(seed, ['push', 'origin', 'main'])
+
+    const behind = await checkUpdate(work)
+    assert.equal(behind.behind, 1, '应当落后 1 个提交')
+    assert.equal(behind.latest, '0.2.0', '远端版本号要读出来')
+    assert.equal(behind.current, '0.1.0', '本地版本号不动')
+    assert.ok(describeUpdate(behind).includes('0.2.0'))
+
+    // 一键更新
+    const result = await applyUpdate(work)
+    assert.equal(result.ok, true, result.error ?? '')
+    assert.equal(result.from, '0.1.0')
+    assert.equal(result.to, '0.2.0')
+    assert.equal(readVersion(work), '0.2.0')
+
+    // 更新后再查：已经是最新
+    const after = await checkUpdate(work)
+    assert.equal(after.behind, 0)
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('applyUpdate：本地有未提交改动时拒绝快进，不覆盖用户的东西', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'mag-upd2-'))
+  const remote = join(base, 'remote.git')
+  const seed = join(base, 'seed')
+  const work = join(base, 'work')
+  try {
+    mkdirSync(remote, { recursive: true })
+    gitRun(remote, ['init', '--bare', '-b', 'main'])
+    mkdirSync(seed, { recursive: true })
+    gitRun(seed, ['init', '-b', 'main'])
+    writeFileSync(join(seed, 'package.json'), JSON.stringify({ name: 'x', version: '0.1.0' }), 'utf8')
+    gitRun(seed, ['add', '-A'])
+    gitRun(seed, ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-m', 'v0.1.0'])
+    gitRun(seed, ['remote', 'add', 'origin', remote])
+    gitRun(seed, ['push', 'origin', 'main'])
+    gitRun(base, ['clone', remote, work])
+
+    // 远端前进
+    writeFileSync(join(seed, 'package.json'), JSON.stringify({ name: 'x', version: '0.2.0' }), 'utf8')
+    gitRun(seed, ['add', '-A'])
+    gitRun(seed, ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-m', 'v0.2.0'])
+    gitRun(seed, ['push', 'origin', 'main'])
+
+    // 本地改一个文件（未提交）
+    writeFileSync(join(work, 'package.json'), JSON.stringify({ name: 'x', version: '0.1.0-local' }), 'utf8')
+
+    const result = await applyUpdate(work)
+    assert.equal(result.ok, false, '有本地改动时必须拒绝')
+    assert.equal(readVersion(work), '0.1.0-local', '用户的改动不能被覆盖')
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+// ─────────────────────────── Qoder（WASM 签名） ───────────────────────────
+
+test('Qoder：WASM 桥能签出合法请求（Bearer COSY.*）', async () => {
+  const { QoderEncryptedInfer } = await import('../lib/vendor/qoder/qoder-wasm.js')
+  const { QODER } = await import('../lib/vendor/qoder/qoder-product.js')
+  const client = await QoderEncryptedInfer.create({
+    user: { uid: 'u_test_123', securityOauthToken: 'tok_test' },
+    machineId: '11111111-2222-3333-4444-555555555555',
+    metadata: QODER.clientMetadata,
+    host: QODER.encryptedInferBase,
+  })
+  const prepared = client.prepareInfer({ modelKey: 'qfmodel', userText: 'ping' })
+
+  // 加密端点，而不是公开的 api2-v2（混用会 404）
+  assert.match(prepared.url, /agent_chat_generation/)
+  assert.ok(prepared.url.startsWith(QODER.encryptedInferBase), '必须打到加密端点')
+  assert.ok(prepared.body.length > 0, '请求体必须由 WASM 加密产出')
+
+  // 签名格式：普通 Bearer 会 403 Signature invalid
+  const auth = prepared.headers.Authorization ?? prepared.headers.authorization ?? ''
+  assert.match(auth, /^Bearer COSY\.[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+$/)
+
+  // 机器头族（少一个上游就认不出客户端）
+  const names = Object.keys(prepared.headers).map((name) => name.toLowerCase())
+  for (const required of ['cosy-machineid', 'cosy-version', 'cosy-scene', 'x-model-key']) {
+    assert.ok(names.includes(required), `缺少身份头 ${required}`)
+  }
+})
+
+test('Qoder：uidFromToken 从 JWT 解出 user_id，解不出时返回空串', () => {
+  const payload = Buffer.from(JSON.stringify({ user_id: 'u_abc', exp: 1 }), 'utf8').toString('base64url')
+  assert.equal(uidFromToken(`h.${payload}.s`), 'u_abc')
+  // 也认 uid / userId / sub
+  const alt = Buffer.from(JSON.stringify({ sub: 'sub_1' }), 'utf8').toString('base64url')
+  assert.equal(uidFromToken(`h.${alt}.s`), 'sub_1')
+  // 不是 JWT / 载荷不是 JSON
+  assert.equal(uidFromToken('plain-token'), '')
+  assert.equal(uidFromToken('a.b.c'), '')
+})
+
+test('Qoder：缺 uid 的 token 在发请求前就被拒（否则上游只会回 403 签名无效）', async () => {
+  const { QoderAdapter, QODER_CN } = await import('../lib/adapters/qoder.js')
+  const adapter = new QoderAdapter(QODER_CN)
+  assert.equal(adapter.id, 'qoder-cn')
+  assert.equal(adapter.implemented, true)
+
+  const record = { id: 'qoder-cn:a', agentId: 'qoder-cn', label: 'a', credentials: { token: 'plain-token' }, enabled: true, createdAt: 0, updatedAt: 0 }
+  const verdict = await adapter.validateCredentials(record, {})
+  assert.equal(verdict.ok, false)
+  assert.equal(verdict.kind, 'auth')
+  assert.ok(String(verdict.message).includes('user_id'))
+
+  // 有 uid 的 JWT 就通过本地校验
+  const payload = Buffer.from(JSON.stringify({ user_id: 'u_ok' }), 'utf8').toString('base64url')
+  const okRecord = { ...record, credentials: { token: `h.${payload}.s` } }
+  const okVerdict = await adapter.validateCredentials(okRecord, {})
+  assert.equal(okVerdict.ok, true)
+})
+
+// ─────────────────────────── 登录流程（各平台） ───────────────────────────
+
+/** 造一个假 ctx：fetch 由调用方给定。 */
+function loginCtx(fetchImpl) {
+  return {
+    config: { id: 'x', name: 'X', upstream: { chatBaseUrl: '', apiBaseUrl: '', modelsUrl: '', freeTierMode: 'auto' }, credits: { unit: 'usd', baselineUsdPerMTok: 1.2 }, requestTimeoutMs: 30_000 },
+    log: { debug() {}, info() {}, warn() {}, error() {}, child() { return this } },
+    fetch: fetchImpl,
+    cache: { get() { return undefined }, set() {}, delete() {} },
+    now: () => Date.now(),
+  }
+}
+
+test('WorkBuddy 登录：auth/state 带 4 个免鉴权头，token 未就绪(11217)算 pending', async () => {
+  const calls = []
+  const ctx = loginCtx(async (url, init) => {
+    calls.push({ url: String(url), method: init?.method, headers: init?.headers ?? {} })
+    if (String(url).includes('/v2/plugin/auth/state')) {
+      return { ok: true, status: 200, json: async () => ({ code: 0, data: { state: 'st_1', authUrl: 'https://login.example/auth?x=1' } }) }
+    }
+    // 第一次 poll：token 未就绪
+    if (calls.filter((c) => c.url.includes('/auth/token')).length === 1) {
+      return { ok: false, status: 200, json: async () => ({ code: 11217, message: 'not ready' }) }
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ code: 0, data: { access_token: 'at_1', refresh_token: 'rt_1', expires_in: 3600, domain: 'copilot.tencent.com' } }),
+    }
+  })
+  const adapter = new BuddyAdapter(BUDDY_CN)
+  const start = await adapter.beginLogin(ctx)
+  assert.equal(start.authUrl, 'https://login.example/auth?x=1')
+  assert.equal(start.expiresInSec, 300)
+
+  const stateCall = calls[0]
+  assert.ok(stateCall.url.includes('/v2/plugin/auth/state?platform=ide'), '平台参数要传给上游')
+  for (const header of ['x-no-authorization', 'x-no-user-id', 'x-no-enterprise-id', 'x-no-department-info']) {
+    assert.equal(stateCall.headers[header], 'true', `缺少免鉴权头 ${header}`)
+  }
+  assert.equal(stateCall.headers['x-domain'], 'copilot.tencent.com')
+
+  // 第一次问：还没登录
+  const pending = await adapter.pollLogin(start.state, ctx)
+  assert.equal(pending.status, 'pending')
+
+  // 第二次问：拿到 token
+  const ready = await adapter.pollLogin(start.state, ctx)
+  assert.equal(ready.status, 'ready')
+  assert.equal(ready.credentials.token, 'at_1')
+  assert.equal(ready.credentials.refreshToken, 'rt_1')
+  assert.ok(typeof ready.credentials.expiresAt === 'number')
+})
+
+test('Qoder 登录：beginLogin 给出带 PKCE 的授权链接，poll 空 data 算 pending', async () => {
+  const seen = []
+  const ctx = loginCtx(async (url) => {
+    seen.push(String(url))
+    if (seen.length === 1) return { ok: true, status: 200, json: async () => ({ data: {} }) }
+    return { ok: true, status: 200, json: async () => ({ data: { token: 'qd_at', refresh_token: 'qd_rt' } }) }
+  })
+  const adapter = new QoderAdapter(QODER_CN)
+  const start = await adapter.beginLogin(ctx)
+  assert.ok(start.authUrl.startsWith(QODER_CN.authBase), '授权链接要落在产品的 authBase 上')
+  assert.ok(start.authUrl.includes('challenge='), '必须带 PKCE challenge')
+  assert.ok(start.authUrl.includes('challenge_method=S256'))
+  assert.equal(start.expiresInSec, 300)
+
+  const pending = await adapter.pollLogin(start.state, ctx)
+  assert.equal(pending.status, 'pending')
+
+  const ready = await adapter.pollLogin(start.state, ctx)
+  assert.equal(ready.status, 'ready')
+  assert.equal(ready.credentials.token, 'qd_at')
+  assert.ok(seen[0].startsWith(QODER_CN.openApiBase), '轮询要打 openApiBase')
 })

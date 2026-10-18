@@ -56,6 +56,20 @@ export const AGENT_DISPLAY_NAMES: Record<string, string> = {
   'workbuddy-intl': 'WorkBuddy International',
 }
 
+/**
+ * 这一期**对外露出**的平台。
+ *
+ * Trae 仍未实现，`visible: false`：不注册 provider、不占模型选择器、
+ * 设置页也不显示。实现后把它加进这个数组即可，别处不用改。
+ */
+export const DEFAULT_VISIBLE_AGENTS: readonly string[] = [
+  'opencode',
+  'qoder',
+  'qoder-cn',
+  'workbuddy',
+  'workbuddy-intl',
+]
+
 /** 一段定时计划的 schema（签到 / 额度共用）。 */
 const ScheduleSchema = Schema.object({
   enabled: Schema.boolean()
@@ -110,39 +124,44 @@ const TasksSchema = Schema.object({
     .description('只跑这些类型的任务；留空 = 全部类型都跑。'),
 })
 
-/** 上游地址的 schema。 */
+/**
+ * 上游地址的 schema。
+ *
+ * ⚠️ 这里的 `*Path` 字段**不出现在设置页**（`client/client.js` 的 `AGENT_FIELDS`
+ * 里没有它们）。原因：每个 Agent 的接口形状是**适配器的内置知识**，让用户手填
+ * 只会填错 —— 实机反馈原话是「这些路径用户根本不知道怎么填」。
+ *
+ * 字段保留在这里是为了两类用法：
+ *   1. 适配器把它们当「覆盖值」用（留空 = 用内置默认 / 自动探测）；
+ *   2. 高级用户可以在 `cordis.patch.yml` 里写（YAML 不走设置页的 volatile 校验）。
+ */
 const UpstreamSchema = Schema.object({
   chatBaseUrl: Schema.string()
     .default('')
     .volatile()
-    .description('对话请求的 base url（OpenAI 兼容）。留空 = 用该 Agent 的官方默认值。'),
+    .description('对话请求的 base url（OpenAI 兼容）。留空 = 用该 Agent 的内置官方地址；接自有反代时才需要填。'),
   apiBaseUrl: Schema.string()
     .default('')
     .volatile()
-    .description('业务 / 控制台 API 的 base url。留空 = 用该 Agent 的官方默认值。'),
-  modelsUrl: Schema.string().default('').description('模型目录 url。留空 = 用官方默认值。'),
+    .description('业务 / 控制台 API 的 base url。留空 = 用该 Agent 的内置官方地址。'),
+  modelsUrl: Schema.string().default('').description('模型目录 url。留空 = 用内置官方地址。'),
   pricingUrl: Schema.string().default('').description('价格 / 元数据源 url（倍率从这算）。'),
   pricingProvider: Schema.string().default('').description('价格源里代表本 Agent 的 provider key。'),
   checkInPath: Schema.string()
     .default('')
-    .volatile()
-    .description('签到接口路径（相对 apiBaseUrl，例如 `/api/user/checkin`）。留空 = 自动探测；探测不到就报「上游无签到接口」。'),
+    .description('【内置，通常不用填】签到接口路径（相对 apiBaseUrl）。留空 = 用适配器内置的默认值 / 自动探测。'),
   quotaPath: Schema.string()
     .default('')
-    .volatile()
-    .description('额度接口路径（相对 apiBaseUrl）。留空 = 用官方额度接口。'),
+    .description('【内置，通常不用填】额度接口路径（相对 apiBaseUrl）。留空 = 用适配器内置的额度接口。'),
   tasksPath: Schema.string()
     .default('')
-    .volatile()
-    .description('活动任务列表接口路径。留空 = 自动探测。'),
+    .description('【内置，通常不用填】活动任务列表接口路径。留空 = 用适配器内置的默认值 / 自动探测。'),
   taskClaimPath: Schema.string()
     .default('')
-    .volatile()
-    .description('领取任务奖励的接口路径，用 `{taskId}` 占位（例如 `/api/user/tasks/{taskId}/claim`）。'),
+    .description('【内置，通常不用填】领取任务奖励的接口路径，用 `{taskId}` 占位。'),
   taskStatusPath: Schema.string()
     .default('')
-    .volatile()
-    .description('任务状态查询路径，用 `{taskId}` 占位。留空 = 用「任务还在不在列表里」判断。'),
+    .description('【内置，通常不用填】任务状态查询路径，用 `{taskId}` 占位。留空 = 用「任务还在不在列表里」判断。'),
   freeTierMode: Schema.union(['auto', 'always', 'never'])
     .default('auto')
     .volatile()
@@ -183,12 +202,12 @@ const RetrySchema = Schema.object({
  */
 const ModelPolicySchema = Schema.object({
   mode: Schema.union(['free', 'selected', 'all'])
-    .default('free')
+    .default('selected')
     .volatile()
     .description(
       '上报哪些模型给 DSH 模型选择器：' +
-        '`free` = 只报免费模型（默认 —— 免费层就是这么用的，选择器不会被几十个模型塞满）；' +
-        '`selected` = 只报下面勾选的；`all` = 全部上报。',
+        '`selected` = 只报下面勾选的（默认 —— 不勾就不出现，避免选择器被整站模型塞满）；' +
+        '`free` = 只报免费模型；`all` = 全部上报。',
     ),
   selected: Schema.string()
     .default('')
@@ -221,6 +240,13 @@ const AgentSchema = Schema.object({
     .default(true)
     .volatile()
     .description('是否启用这个 Agent。关掉后：不再路由请求，也不再往模型选择器上报模型。'),
+  visible: Schema.boolean()
+    .default(true)
+    .volatile()
+    .description(
+      '是否在设置页露出这个平台。与「启用」是两件事：隐藏的平台既不注册 provider，也不进模型选择器。' +
+        '这一期只露出 OpenCode / WorkBuddy / WorkBuddy International。',
+    ),
   exposeModels: Schema.boolean()
     .default(true)
     .volatile()
@@ -348,6 +374,7 @@ export function parseWindowOverrides(text: string): Record<string, number> {
 
 export interface AgentConfigInput {
   enabled?: boolean
+  visible?: boolean
   exposeModels?: boolean
   labelWithAgent?: boolean
   models?: { mode?: string; selected?: string }
@@ -445,9 +472,10 @@ export function resolveAgentConfig(
   return {
     id: agentId,
     name: AGENT_DISPLAY_NAMES[agentId] ?? agentId,
-    // 配置里没写过的 Agent：只有注册表里有实现时才默认可用（骨架默认关，
-    // 免得用户看到一个永远报「未实现」的分组）。
-    enabled: boolOf(input?.enabled, registryHas && agentId === 'opencode'),
+    // 配置里没写过的 Agent：只有注册表里有实现、且属于这一期露出的平台时才默认可用
+    // （骨架默认关，免得用户看到一个永远报「未实现」的分组）。
+    enabled: boolOf(input?.enabled, registryHas && DEFAULT_VISIBLE_AGENTS.includes(agentId)),
+    visible: boolOf(input?.visible, DEFAULT_VISIBLE_AGENTS.includes(agentId)),
     exposeModels: boolOf(input?.exposeModels, true),
     labelWithAgent: boolOf(input?.labelWithAgent, true),
     models: {

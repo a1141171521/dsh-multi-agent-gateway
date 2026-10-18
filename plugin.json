@@ -29,13 +29,13 @@
         "provider": "multiagent-qoder",
         "displayName": "Qoder",
         "agentId": "qoder",
-        "implemented": false
+        "implemented": true
       },
       {
         "provider": "multiagent-qoder-cn",
         "displayName": "Qoder CN",
         "agentId": "qoder-cn",
-        "implemented": false
+        "implemented": true
       },
       {
         "provider": "multiagent-trae",
@@ -47,13 +47,13 @@
         "provider": "multiagent-workbuddy",
         "displayName": "WorkBuddy",
         "agentId": "workbuddy",
-        "implemented": false
+        "implemented": true
       },
       {
         "provider": "multiagent-workbuddy-intl",
         "displayName": "WorkBuddy International",
         "agentId": "workbuddy-intl",
-        "implemented": false
+        "implemented": true
       }
     ],
     "tools": [

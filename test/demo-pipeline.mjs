@@ -21,6 +21,8 @@ const UPSTREAM_SSE = [
   'data: {"choices":[{"delta":{"content":"我来执行这条命令。"}}]}',
   'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"pwsh","arguments":"{\\"command\\":"}}]}}]}',
   'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"echo hi\\"}"}}]}}]}',
+  // 真实上游在收尾前会给一条 usage（这是「日志」页 token 列的来源）
+  'data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":18,"total_tokens":138,"completion_tokens_details":{"reasoning_tokens":7}}}',
   'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
   'data: [DONE]',
   '',
@@ -58,6 +60,9 @@ const account = {
   updatedAt: 0,
 }
 
+/** 采样回调收到的记录（应当恰好一条）。 */
+const samples = []
+
 const adapter = createLlmAdapter({
   agentId: 'opencode',
   displayName: 'OpenCode',
@@ -74,6 +79,8 @@ const adapter = createLlmAdapter({
   contextOf: () => ctx,
   modelsOf: async () => [],
   exposedModelsOf: async () => [],
+  // 采样回调：整轮跑完必须**恰好**调一次，且带上耗时/首字/usage
+  onRequest: (sample) => samples.push(sample),
   log,
 })
 
@@ -130,10 +137,31 @@ else problems.push(`结尾 kind 不对：${finish?.reason?.kind}`)
 if (text.length > 0) console.log(`  附：正文 ✅ ${JSON.stringify(text)}`)
 else problems.push('正文没有输出')
 
+// ④ 采样：整轮恰好一条，且字段齐全（这是日志页与总览 KPI 的唯一数据源）
+if (samples.length !== 1) {
+  problems.push(`采样回调应恰好调用 1 次，实际 ${samples.length} 次`)
+} else {
+  const sample = samples[0]
+  const missing = []
+  if (sample.agentId !== 'opencode') missing.push('agentId')
+  if (sample.model !== 'deepseek-v4.1-flash-free') missing.push('model')
+  if (sample.ok !== true) missing.push('ok=true')
+  if (typeof sample.durationMs !== 'number') missing.push('durationMs')
+  if (typeof sample.ttftMs !== 'number') missing.push('ttftMs')
+  if (typeof sample.outputTokens !== 'number') missing.push('outputTokens')
+  if (missing.length > 0) {
+    problems.push(`采样缺字段：${missing.join(' / ')}`)
+  } else {
+    console.log(
+      `  ④ 采样：✅ 1 条 · ${sample.model} · ok=${sample.ok} · 耗时 ${sample.durationMs}ms · 首字 ${sample.ttftMs}ms · 输出 ${sample.outputTokens} tok`,
+    )
+  }
+}
+
 console.log()
 if (problems.length > 0) {
   console.error('✗ 有问题：')
   for (const problem of problems) console.error('  - ' + problem)
   process.exit(1)
 }
-console.log('✓ 三项全部正常（思考链 / 工具调用 / 结尾）')
+console.log('✓ 四项全部正常（思考链 / 工具调用 / 结尾 / 采样）')

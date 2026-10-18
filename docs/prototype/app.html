@@ -1,0 +1,1565 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>多 Agent 网关 · 交互原型 v3</title>
+<style>
+  /* ── 真实 DSH 主题只有这 14 个 token ───────────────────────────── */
+  :root{
+    --bg-base:#f5f6f8; --bg-layer-1:#fff; --bg-layer-2:#f7f8fa; --bg-overlay:rgba(17,20,26,.46);
+    --border-l1:#e3e5ea; --border-l2:#eef0f3;
+    --brand-primary:#1668dc;
+    --label-primary:#1d2129; --label-secondary:#86909c;
+    --state-error-primary:#d93026; --state-idle-primary:#a9aeb8;
+    --state-success-primary:#00a05a; --state-warn-primary:#d25f00;
+    --specific-sidebar-fill:#eef2f7;
+    --r:8px; --r-sm:5px;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg-base);color:var(--label-primary);
+    font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  button{font:inherit;color:inherit}
+  .mono{font-family:var(--mono);font-size:11.5px}
+  .hint{margin:0;color:var(--label-secondary);font-size:12px;line-height:1.5}
+  .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .spacer{margin-left:auto}
+  .nowrap{white-space:nowrap}
+
+  /* ── 原型外壳（不属于插件） ── */
+  .proto-bar{position:sticky;top:0;z-index:90;display:flex;align-items:center;gap:10px;
+    padding:7px 16px;background:#111827;color:#cdd2db;font-size:12px}
+  .proto-bar b{color:#fff;font-weight:600}
+  .proto-bar .spacer{margin-left:auto}
+  .proto-bar button{background:#232b38;border:1px solid #38414f;color:#dfe3ea;border-radius:5px;
+    padding:2px 9px;cursor:pointer;font-size:11.5px}
+  .proto-bar button:hover{background:#2d3644}
+  .proto-bar button[aria-pressed=true]{background:#3b4757;border-color:#5b6a7e;color:#fff}
+
+  .app{max-width:1180px;margin:16px auto 70px;padding:0 16px}
+
+  /* ── 页头 ── */
+  .head{display:flex;align-items:center;gap:14px;padding:9px 13px;background:var(--bg-layer-1);
+    border:1px solid var(--border-l1);border-radius:var(--r)}
+  .brand{display:flex;align-items:center;gap:8px;font-weight:600;font-size:13.5px;white-space:nowrap}
+  .brand .dot{width:8px;height:8px;border-radius:50%;background:var(--state-success-primary)}
+  .tabs{display:flex;gap:2px;flex-wrap:wrap}
+  .tab{border:0;background:0 0;padding:5px 11px;border-radius:6px;cursor:pointer;
+    color:var(--label-secondary);display:flex;align-items:center;gap:6px;font-size:12.5px}
+  .tab:hover{background:var(--bg-layer-2);color:var(--label-primary)}
+  .tab[aria-selected=true]{background:color-mix(in srgb,var(--brand-primary) 8%,transparent);
+    color:var(--brand-primary);font-weight:600}
+  .tab .n{font-size:10.5px;min-width:16px;height:16px;line-height:16px;text-align:center;
+    border-radius:8px;background:var(--bg-layer-2);color:var(--label-secondary);padding:0 4px}
+  .tab[aria-selected=true] .n{background:var(--bg-layer-1);color:var(--brand-primary)}
+
+  /* ── 卡片 / 布局 ── */
+  .card{background:var(--bg-layer-1);border:1px solid var(--border-l1);border-radius:var(--r);padding:13px}
+  .card + .card{margin-top:11px}
+  .card>h3{margin:0;font-size:13px;font-weight:600}
+  .card-hd{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+  .two>*{min-width:0}
+  .two>.card+.card{margin-top:0}
+  .sec-title{display:flex;align-items:center;gap:8px;margin:16px 0 8px;font-size:12px;
+    color:var(--label-secondary);font-weight:600}
+
+  /* ── 按钮 ── */
+  .btn{border:1px solid var(--border-l1);background:var(--bg-layer-1);border-radius:6px;
+    padding:4px 11px;cursor:pointer;font-size:12.5px;white-space:nowrap}
+  .btn:hover{background:var(--bg-layer-2)}
+  .btn.sm{padding:2px 9px;font-size:12px}
+  .btn.xs{padding:1px 8px;font-size:11.5px;border-radius:var(--r-sm)}
+  .btn.primary{background:var(--brand-primary);border-color:var(--brand-primary);color:#fff}
+  .btn.primary:hover{filter:brightness(1.07)}
+  .btn.brand{border-color:color-mix(in srgb,var(--brand-primary) 50%,var(--border-l1));
+    color:var(--brand-primary)}
+  .btn.brand:hover{background:color-mix(in srgb,var(--brand-primary) 7%,transparent)}
+  .btn.ghost{border-color:transparent;color:var(--label-secondary);padding:4px 7px}
+  .btn.ghost:hover{background:var(--bg-layer-2);color:var(--label-primary)}
+  .btn.danger{color:var(--state-error-primary);
+    border-color:color-mix(in srgb,var(--state-error-primary) 30%,var(--border-l1))}
+  .btn[disabled]{opacity:.45;cursor:default;filter:none}
+  .seg2{display:inline-flex;border:1px solid var(--border-l1);border-radius:6px;overflow:hidden}
+  .seg2 button{border:0;background:var(--bg-layer-1);padding:3px 9px;font-size:12px;cursor:pointer;
+    color:var(--label-secondary);border-left:1px solid var(--border-l1)}
+  .seg2 button:first-child{border-left:0}
+  .seg2 button:hover{background:var(--bg-layer-2)}
+  .seg2 button[aria-pressed=true]{background:color-mix(in srgb,var(--brand-primary) 9%,transparent);
+    color:var(--brand-primary);font-weight:600}
+
+  /* ── 输入 ── */
+  .input{border:1px solid var(--border-l1);border-radius:6px;padding:3px 8px;font:inherit;
+    font-size:12.5px;background:var(--bg-layer-1);color:var(--label-primary)}
+  .input:focus{outline:0;border-color:var(--brand-primary)}
+  .input.sm{width:96px}
+  .input.ctx{width:104px;font-family:var(--mono);font-size:11.5px;text-align:right;
+    font-variant-numeric:tabular-nums}
+  .input.search{width:210px}
+  select.input{padding:3px 6px}
+  .switch{position:relative;width:30px;height:17px;border-radius:9px;background:var(--state-idle-primary);
+    border:0;cursor:pointer;flex:0 0 auto;transition:background .15s}
+  .switch::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;
+    background:#fff;transition:left .15s}
+  .switch[aria-checked=true]{background:var(--brand-primary)}
+  .switch[aria-checked=true]::after{left:15px}
+  .check{width:14px;height:14px;accent-color:var(--brand-primary);cursor:pointer;margin:0}
+
+  /* ── 标签 / 徽章 ── */
+  .tag{display:inline-block;border:1px solid var(--border-l1);border-radius:var(--r-sm);padding:0 6px;
+    font-size:11px;line-height:17px;color:var(--label-secondary);white-space:nowrap}
+  .tag.strong{color:var(--label-primary);border-color:color-mix(in srgb,var(--brand-primary) 30%,var(--border-l1))}
+  .badge{display:inline-block;border-radius:var(--r-sm);padding:0 6px;font-size:11px;line-height:17px;white-space:nowrap}
+  .badge.ok{background:color-mix(in srgb,var(--state-success-primary) 13%,transparent);color:var(--state-success-primary)}
+  .badge.warn{background:color-mix(in srgb,var(--state-warn-primary) 14%,transparent);color:var(--state-warn-primary)}
+  .badge.err{background:color-mix(in srgb,var(--state-error-primary) 12%,transparent);color:var(--state-error-primary)}
+  .badge.idle{background:var(--bg-layer-2);color:var(--label-secondary)}
+  .dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:var(--state-idle-primary)}
+  .dot.ok{background:var(--state-success-primary)}
+  .dot.warn{background:var(--state-warn-primary)}
+  .dot.err{background:var(--state-error-primary)}
+
+  /* ── 总览 ── */
+  .hero{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap}
+  .hero h2{margin:0;font-size:16px;font-weight:600}
+  .hero p{margin:2px 0 0;color:var(--label-secondary);font-size:12.5px}
+  .kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:9px;margin-top:11px}
+  .kpi{border:1px solid var(--border-l1);border-radius:var(--r);padding:9px 11px;background:var(--bg-layer-2)}
+  .kpi b{display:block;font-size:18px;font-weight:600;letter-spacing:-.3px;font-variant-numeric:tabular-nums}
+  .kpi span{color:var(--label-secondary);font-size:11px}
+  .kpi.bad b{color:var(--state-error-primary)}
+  .last-turn{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;margin-top:11px;padding:8px 11px;
+    border:1px solid var(--border-l1);border-left:3px solid var(--brand-primary);border-radius:var(--r);
+    background:var(--bg-layer-1);font-size:12.5px}
+  .banner{display:flex;align-items:center;gap:10px;padding:8px 12px;margin-bottom:11px;
+    border:1px solid color-mix(in srgb,var(--brand-primary) 32%,var(--border-l1));
+    background:color-mix(in srgb,var(--brand-primary) 6%,transparent);border-radius:var(--r);font-size:12.5px}
+
+  /* ── 表格 ── */
+  .tbl-wrap{overflow:auto}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border-l2);vertical-align:middle}
+  th{color:var(--label-secondary);font-weight:400;font-size:11px;white-space:nowrap;
+    text-transform:none;letter-spacing:.2px}
+  tr:last-child td{border-bottom:0}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tbody tr:hover td{background:color-mix(in srgb,var(--brand-primary) 3.5%,transparent)}
+  tr.failed td{background:color-mix(in srgb,var(--state-error-primary) 5%,transparent)}
+  tr.failed:hover td{background:color-mix(in srgb,var(--state-error-primary) 8%,transparent)}
+
+  /* ── 平台 pills ── */
+  .platforms{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:11px}
+  .plat{border:1px solid var(--border-l1);background:var(--bg-layer-1);border-radius:20px;
+    padding:3px 11px;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12.5px;
+    color:var(--label-secondary)}
+  .plat:hover{background:var(--bg-layer-2)}
+  .plat[aria-selected=true]{border-color:var(--brand-primary);background:color-mix(in srgb,var(--brand-primary) 7%,transparent);
+    color:var(--brand-primary);font-weight:600}
+  .plat .st{width:6px;height:6px;border-radius:50%;background:var(--state-idle-primary)}
+  .plat .st.ok{background:var(--state-success-primary)}
+  .plat .st.warn{background:var(--state-warn-primary)}
+
+  /* ── 账号卡 ── */
+  .acct-list{display:flex;flex-direction:column;gap:8px}
+  .acct{display:flex;align-items:center;gap:11px;padding:10px 12px;border:1px solid var(--border-l1);
+    border-radius:var(--r);background:var(--bg-layer-1)}
+  .acct.warn{border-left:3px solid var(--state-warn-primary)}
+  .acct .avatar{width:30px;height:30px;border-radius:7px;flex:0 0 auto;display:grid;place-items:center;
+    font-weight:700;font-size:11.5px;background:color-mix(in srgb,var(--brand-primary) 12%,transparent);
+    color:var(--brand-primary)}
+  .acct .who{display:flex;flex-direction:column;gap:2px;min-width:0}
+  .acct .who b{font-size:12.5px;font-weight:600}
+  .acct .meta{display:flex;gap:11px;color:var(--label-secondary);font-size:11.5px;flex-wrap:wrap}
+  .acct .togs{display:flex;gap:11px;flex-wrap:wrap}
+  .acct .tog{display:flex;align-items:center;gap:5px;font-size:11.5px;color:var(--label-secondary)}
+  .acct.empty{flex-direction:column;align-items:center;text-align:center;gap:7px;padding:20px 12px;
+    border-style:dashed;background:var(--bg-layer-2)}
+
+  /* ── 模型区 ── */
+  .mtoolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:11px 0 0}
+  .mcount{font-size:12px;color:var(--label-secondary)}
+  .mcount b{color:var(--label-primary);font-weight:600}
+  .savedat{font-size:11px;color:var(--state-success-primary);font-variant-numeric:tabular-nums}
+  .msave{position:sticky;top:8px;z-index:6;display:flex;align-items:center;gap:9px;
+    margin-top:8px;padding:7px 11px;border:1px solid var(--border-l1);border-radius:var(--r);
+    background:var(--bg-layer-1);font-size:12.5px;box-shadow:0 1px 0 rgba(9,12,18,.03)}
+  .msave .ok{color:var(--state-success-primary);font-weight:600}
+  .msave b{font-weight:600}
+  .msave.dirty{border-color:color-mix(in srgb,var(--state-warn-primary) 45%,var(--border-l1));
+    background:color-mix(in srgb,var(--state-warn-primary) 6%,var(--bg-layer-1))}
+  .msave.dirty b{color:var(--state-warn-primary)}
+  .mgroups{margin-top:10px;border:1px solid var(--border-l1);border-radius:var(--r);overflow:hidden}
+  .mrow{display:grid;grid-template-columns:22px minmax(200px,1fr) 72px 152px 96px 76px;
+    align-items:center;gap:8px;padding:5px 10px;border-top:1px solid var(--border-l2);font-size:12.5px}
+  .mrow:hover{background:color-mix(in srgb,var(--brand-primary) 3%,transparent)}
+  .mrow.off .mname{color:var(--label-secondary)}
+  .mrow>.tag,.mrow>.stcell{justify-self:start}
+  .mname{min-width:0}
+  .mname .nm{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .mname .id{display:block;font-family:var(--mono);font-size:10.5px;color:var(--label-secondary);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .mthead{display:grid;grid-template-columns:22px minmax(200px,1fr) 72px 152px 96px 76px;
+    gap:8px;padding:5px 10px;font-size:10.5px;color:var(--label-secondary);background:var(--bg-layer-2)}
+  .mempty{padding:22px 12px;text-align:center;color:var(--label-secondary);font-size:12.5px}
+  .ctxcell{display:flex;align-items:center;gap:5px}
+  .ctxcell .up{font-size:10px;color:var(--label-secondary);white-space:nowrap}
+  .spin{width:11px;height:11px;border-radius:50%;border:2px solid color-mix(in srgb,var(--brand-primary) 25%,transparent);
+    border-top-color:var(--brand-primary);animation:spin .8s linear infinite;display:inline-block;vertical-align:-1px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* ── 任务 ── */
+  .modules{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+  .modules>.card+.card{margin-top:0}
+  .module .hd{display:flex;align-items:center;gap:8px;margin-bottom:3px}
+  .module .hd b{font-size:13px}
+  .kv{display:grid;grid-template-columns:82px 1fr;gap:6px 10px;font-size:12.5px;margin-top:9px}
+  .kv .k{color:var(--label-secondary)}
+
+  /* ── 设置 ── */
+  .form-row{display:grid;grid-template-columns:168px 1fr;gap:10px;align-items:start;
+    padding:8px 0;border-bottom:1px solid var(--border-l2)}
+  .form-row:last-child{border-bottom:0}
+  .form-row .lab{font-size:12.5px}
+  .save-bar{position:sticky;bottom:12px;display:flex;align-items:center;gap:9px;margin-top:12px;
+    padding:9px 13px;background:var(--bg-layer-1);border:1px solid var(--border-l1);
+    border-radius:var(--r);box-shadow:0 4px 14px rgba(9,12,18,.07)}
+
+  /* ── 登录弹框（已确认的那套） ── */
+  .modal-root{position:fixed;inset:0;z-index:100;display:none;align-items:center;justify-content:center;
+    padding:20px;background:var(--bg-overlay)}
+  .modal-root.on{display:flex}
+  .modal-root.with-browser{justify-content:flex-start;padding-left:6%}
+  .modal{width:100%;max-width:508px;background:var(--bg-layer-1);border:1px solid var(--border-l1);
+    border-radius:10px;box-shadow:0 18px 48px rgba(9,12,18,.3);overflow:hidden;
+    display:flex;flex-direction:column}
+  .modal-hd{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--border-l2)}
+  .modal-hd b{font-size:13.5px;font-weight:600}
+  .modal-hd .x{margin-left:auto;border:0;background:0 0;cursor:pointer;color:var(--label-secondary);
+    font-size:15px;line-height:1;padding:2px 4px;border-radius:4px}
+  .modal-hd .x:hover{background:var(--bg-layer-2);color:var(--label-primary)}
+  .modal-bd{padding:14px;display:flex;flex-direction:column;gap:11px}
+  .modal-bd.center{align-items:center;text-align:center;gap:8px;padding:24px 20px}
+  .modal-bd.center .t{font-size:14px;font-weight:600}
+  .modal-ft{display:flex;align-items:center;gap:8px;padding:11px 14px;
+    border-top:1px solid var(--border-l2);background:var(--bg-layer-2)}
+  .steps{display:flex;flex-direction:column;gap:6px}
+  .step{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--label-secondary)}
+  .step .n{width:16px;height:16px;border-radius:50%;border:1px solid var(--border-l1);flex:0 0 auto;
+    display:grid;place-items:center;font-size:10px;background:var(--bg-layer-1)}
+  .step.on{color:var(--label-primary)}
+  .step.on .n{border-color:var(--brand-primary);color:var(--brand-primary);font-weight:600}
+  .step.done{color:var(--label-primary)}
+  .step.done .n{background:var(--state-success-primary);border-color:var(--state-success-primary);color:#fff}
+  .urlbox{display:flex;align-items:center;gap:8px;padding:5px 5px 5px 9px;
+    border:1px solid var(--border-l1);border-radius:6px;background:var(--bg-layer-2)}
+  .urlbox .u{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    color:var(--label-secondary);font-family:var(--mono);font-size:11.5px}
+  .cta{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .cta .ext{margin-left:5px;font-size:11px;opacity:.85}
+  .status{border:1px solid var(--border-l1);border-radius:6px;background:var(--bg-layer-2);
+    padding:9px 11px;display:flex;flex-direction:column;gap:6px}
+  .status .line{display:flex;align-items:center;gap:7px;font-size:12.5px}
+  .status .line b{font-weight:600}
+  .status .line.sub{color:var(--label-secondary);font-size:11.5px}
+  .status .line.sub b{color:var(--label-primary)}
+  .status .line.note{color:var(--state-warn-primary);font-size:11.5px}
+  .status .t{color:var(--label-secondary);font-size:11.5px;font-variant-numeric:tabular-nums}
+  .dot.poll{background:var(--brand-primary);animation:poll 1.6s ease-out infinite}
+  @keyframes poll{
+    0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--brand-primary) 50%,transparent)}
+    70%{box-shadow:0 0 0 5px transparent}
+    100%{box-shadow:0 0 0 0 transparent}}
+  .tick{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;font-size:19px;
+    background:color-mix(in srgb,var(--state-success-primary) 14%,transparent);color:var(--state-success-primary)}
+  .ic{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;font-size:18px;font-weight:600}
+  .ic.warn{background:color-mix(in srgb,var(--state-warn-primary) 14%,transparent);color:var(--state-warn-primary)}
+  .ic.err{background:color-mix(in srgb,var(--state-error-primary) 12%,transparent);color:var(--state-error-primary)}
+  .reason{width:100%;margin:2px 0 0;padding:7px 9px;border-radius:5px;background:var(--bg-layer-2);
+    border:1px solid var(--border-l1);color:var(--label-secondary);text-align:left;word-break:break-all;
+    font-family:var(--mono);font-size:11px}
+
+  /* 模拟浏览器窗口 */
+  .fake-browser{position:fixed;right:34px;top:84px;width:392px;z-index:110;border-radius:9px;
+    overflow:hidden;background:var(--bg-layer-1);border:1px solid #c9ced6;
+    box-shadow:0 22px 56px rgba(9,12,18,.42);display:none}
+  .fake-browser.on{display:block}
+  .fb-label{position:fixed;right:34px;top:58px;z-index:111;font-size:11px;color:#fff;
+    background:rgba(17,20,26,.62);border-radius:20px;padding:2px 10px;display:none}
+  .fb-label.on{display:block}
+  .fb-bar{display:flex;align-items:center;gap:9px;padding:6px 10px;background:#e9ecf1;
+    border-bottom:1px solid #d7dbe2}
+  .fb-bar .lights{display:flex;gap:5px}
+  .fb-bar .lights i{width:9px;height:9px;border-radius:50%;background:#c9ced6}
+  .fb-bar .lights i:first-child{background:#f2a3a0}
+  .fb-bar .lights i:nth-child(2){background:#f2cf9a}
+  .fb-tab{flex:1;display:flex;align-items:center;gap:6px;background:#fff;border-radius:5px 5px 0 0;
+    padding:3px 8px;font-size:11.5px;color:#4c5566;min-width:0}
+  .fb-tab .fav{width:13px;height:13px;border-radius:3px;background:#0a66c2;color:#fff;font-size:9px;
+    display:grid;place-items:center;font-weight:700;flex:0 0 auto}
+  .fb-url{display:flex;align-items:center;gap:6px;padding:5px 9px;background:#fff;
+    border-bottom:1px solid #e3e6ec}
+  .fb-url .lock{font-size:10px;color:#5c8a5c}
+  .fb-url .u{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    font-size:11px;color:#5b6473;font-family:var(--mono)}
+  .fb-url .sim{flex:0 0 auto;font-size:10px;color:#8a93a1;border:1px solid #d7dbe2;border-radius:3px;padding:0 4px}
+  .fb-page{padding:20px 22px 16px;display:flex;flex-direction:column;align-items:center;gap:9px;text-align:center}
+  .wb-logo{font-size:15px;font-weight:700;letter-spacing:.3px;color:#0a3d7a}
+  .fb-page p{margin:0;font-size:11.5px;color:#7b8494}
+  .qr{width:84px;height:84px;border:1px solid #d7dbe2;border-radius:4px;padding:6px;background:#fff}
+  .qr i{display:block;width:100%;height:100%;border-radius:2px;
+    background:repeating-conic-gradient(#1d2129 0 25%,#fff 0 50%) 0 0/7px 7px}
+  .fb-actions{display:flex;gap:8px;margin-top:3px}
+  .fb-note{margin:2px 0 0;font-size:10.5px;color:#9aa3b1;line-height:1.6}
+  .fb-done{display:flex;flex-direction:column;align-items:center;gap:8px;padding:44px 24px;text-align:center}
+  .fb-done .tick{width:36px;height:36px;font-size:16px}
+
+  /* ── Toast ── */
+  .toasts{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:200;
+    display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none}
+  .toast{display:flex;align-items:center;gap:8px;padding:8px 14px;border-radius:8px;
+    background:#1f2733;color:#f0f2f5;font-size:12.5px;box-shadow:0 8px 24px rgba(9,12,18,.28);
+    animation:rise .16s ease-out}
+  .toast .dot{background:var(--state-success-primary)}
+  .toast.err .dot{background:#ff6b5e}
+  @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+
+<div class="proto-bar">
+  <b>交互原型 v3</b><span>· 五页全量 · 可点</span>
+  <span class="spacer"></span>
+  <span>跳转：</span>
+  <button data-jump="overview" aria-pressed="true">总览</button>
+  <button data-jump="accounts">账号</button>
+  <button data-jump="tasks">任务</button>
+  <button data-jump="logs">日志</button>
+  <button data-jump="settings">设置</button>
+</div>
+
+<div class="app" id="app"></div>
+<div class="modal-root" id="modalRoot"></div>
+<div class="fb-label" id="fbLabel">系统浏览器（原型替身）</div>
+<div class="fake-browser" id="fakeBrowser"></div>
+<div class="toasts" id="toasts"></div>
+
+<script>
+(function(){
+  'use strict';
+
+  /* ══════════════════════════════════════════════════════════════
+     1. 数据（示例） — 真实实现里由 host 提供
+     ══════════════════════════════════════════════════════════════ */
+  const AGENTS = [
+    { id:'opencode',       name:'OpenCode',       ab:'OC', free:true },
+    { id:'qoder',          name:'Qoder',          ab:'QD' },
+    { id:'qoder-cn',       name:'Qoder CN',       ab:'QC' },
+    { id:'workbuddy',      name:'WorkBuddy',      ab:'WB' },
+    { id:'workbuddy-intl', name:'WorkBuddy 国际版', ab:'WI' },
+  ];
+
+  // 有免费层的平台：只拉免费模型
+  const FREE_ONLY = new Set(['opencode']);
+
+  const AGENT_BY_ID = Object.fromEntries(AGENTS.map(a => [a.id, a]));
+
+  // 模型：mult=0 即免费；st: ok|unknown|region|down
+  const MODELS = {
+    opencode: [
+      { id:'deepseek-v4.1-flash-free', n:'DeepSeek V4.1 Flash Free', v:'DeepSeek', mult:0, ctx:200000, st:'ok' },
+      { id:'glm-5.3-flash-free',       n:'GLM-5.3 Flash Free',       v:'智谱',     mult:0, ctx:200000, st:'ok' },
+      { id:'mimo-v2.6-flash-free',     n:'MiMo V2.6 Flash Free',     v:'小米',     mult:0, ctx:200000, st:'unknown' },
+      { id:'longcat-2.5-preview-free', n:'LongCat 2.5 Preview Free', v:'美团',     mult:0, ctx:1000000, st:'ok' },
+      { id:'nemotron-3.5-lightning-free', n:'Nemotron 3.5 Lightning Free', v:'NVIDIA', mult:0, ctx:262144, st:'ok' },
+      { id:'nemotron-3.5-super-vl-free',  n:'Nemotron 3.5 Super VL Free',  v:'NVIDIA', mult:0, ctx:1048576, st:'ok' },
+      { id:'space-bunny-free',         n:'Space Bunny Free',         v:'Space',    mult:0, ctx:1048576, st:'unknown' },
+      { id:'big-pickle',               n:'Big Pickle',               v:'Pickle',   mult:0, ctx:200000, st:'ok' },
+      { id:'beam-free',                n:'Beam Free',                v:'Beam',     mult:0, ctx:1048576, st:'region' },
+    ],
+    qoder: [
+      { id:'qwen3.8-flash',   n:'Qwen3.8 Flash',   v:'阿里云', mult:0.4, ctx:131072, st:'ok' },
+      { id:'qwen3.8-max',     n:'Qwen3.8 Max',     v:'阿里云', mult:1.2, ctx:262144, st:'ok' },
+      { id:'claude-sonnet-4.5', n:'Claude Sonnet 4.5', v:'Anthropic', mult:1.8, ctx:200000, st:'ok' },
+    ],
+    'qoder-cn': [
+      { id:'qwen3.8-flash-cn', n:'Qwen3.8 Flash', v:'阿里云', mult:0.4, ctx:131072, st:'ok' },
+      { id:'glm-5.3',          n:'GLM-5.3',       v:'智谱',   mult:1.0, ctx:200000, st:'ok' },
+    ],
+    workbuddy: [
+      { id:'hy3-preview',        n:'Hy3 Preview',        v:'腾讯混元', mult:0,   ctx:192000, st:'ok' },
+      { id:'glm-5.3-flash',      n:'GLM-5.3 Flash',      v:'智谱',     mult:0,   ctx:128000, st:'ok' },
+      { id:'claude-sonnet-4.5',  n:'Claude Sonnet 4.5',  v:'Anthropic', mult:1.8, ctx:200000, st:'ok' },
+      { id:'claude-opus-4.1',    n:'Claude Opus 4.1',    v:'Anthropic', mult:5.0, ctx:200000, st:'down' },
+      { id:'gpt-5',              n:'GPT-5',              v:'OpenAI',    mult:2.4, ctx:400000, st:'ok' },
+      { id:'gpt-5-mini',         n:'GPT-5 mini',         v:'OpenAI',    mult:0.6, ctx:400000, st:'ok' },
+      { id:'o4-mini',            n:'o4-mini',            v:'OpenAI',    mult:0.8, ctx:200000, st:'unknown' },
+      { id:'gemini-2.5-pro',     n:'Gemini 2.5 Pro',     v:'Google',    mult:1.5, ctx:1048576, st:'region' },
+      { id:'gemini-2.5-flash',   n:'Gemini 2.5 Flash',   v:'Google',    mult:0.5, ctx:1048576, st:'ok' },
+      { id:'deepseek-v3.2',      n:'DeepSeek V3.2',      v:'DeepSeek',  mult:0.4, ctx:128000, st:'ok' },
+    ],
+    'workbuddy-intl': [
+      { id:'claude-sonnet-4.5',  n:'Claude Sonnet 4.5',  v:'Anthropic', mult:1.8, ctx:200000, st:'ok' },
+      { id:'gpt-5',              n:'GPT-5',              v:'OpenAI',    mult:2.4, ctx:400000, st:'ok' },
+      { id:'gemini-2.5-pro',     n:'Gemini 2.5 Pro',     v:'Google',    mult:1.5, ctx:1048576, st:'ok' },
+      { id:'deepseek-v3.2',      n:'DeepSeek V3.2',      v:'DeepSeek',  mult:0.4, ctx:128000, st:'ok' },
+    ],
+  };
+
+  // Auto：拉取时过滤掉，不进列表
+  const AUTO_IDS = new Set(['auto', 'auto-router']);
+
+  /* 厂商排序：拉丁字母在前（A→Z），中文按拼音在后 */
+  function vendorCmp(a, b) {
+    const lat = /^[\x20-\x7e]/;
+    const la = lat.test(a), lb = lat.test(b);
+    if (la !== lb) return la ? -1 : 1;
+    return a.localeCompare(b, la ? 'en' : 'zh-Hans-CN');
+  }
+
+  const ACCOUNTS = {
+    opencode: [],
+    qoder: [
+      { id:'q1', label:'主号', st:'ok', quota:840, today:26, models:3,
+        chat:true, checkin:true, task:false },
+    ],
+    'qoder-cn': [],
+    workbuddy: [
+      { id:'w1', label:'主号', st:'ok', quota:1240, today:12, models:10,
+        chat:true, checkin:true, task:false },
+      { id:'w2', label:'备用', st:'warn', quota:320, today:0, models:10,
+        chat:true, checkin:false, task:false, note:'429 限流 · 3 分钟后恢复' },
+    ],
+    'workbuddy-intl': [],
+  };
+
+  const LOGS = [
+    { t:'14:12:33', agent:'opencode', model:'DeepSeek V4.1 Flash Free', acct:'免账号', r:'ok',   ms:'8.4 s',  ttft:'380 ms', tps:'38', in:'8.4K',  out:'1.1K', mult:0 },
+    { t:'14:02:11', agent:'opencode', model:'Beam Free',                acct:'免账号', r:'err',  ms:'120 ms', ttft:'—',      tps:'—',  in:'—',     out:'—',    mult:0, why:'403 RegionError: This model is not available in your country' },
+    { t:'13:58:40', agent:'opencode', model:'GLM-5.3 Flash Free',       acct:'免账号', r:'ok',   ms:'11.2 s', ttft:'512 ms', tps:'31', in:'12.1K', out:'2.0K', mult:0 },
+    { t:'13:52:02', agent:'workbuddy', model:'Claude Sonnet 4.5',       acct:'主号',   r:'ok',   ms:'6.1 s',  ttft:'290 ms', tps:'52', in:'3.2K',  out:'640',  mult:1.8 },
+    { t:'13:41:09', agent:'workbuddy', model:'Claude Sonnet 4.5',       acct:'备用',   r:'slow', ms:'120 s',  ttft:'—',      tps:'—',  in:'3.0K',  out:'—',    mult:1.8, why:'120s 内没有收到首帧' },
+    { t:'13:30:55', agent:'qoder',    model:'Qwen3.8 Flash',            acct:'主号',   r:'ok',   ms:'4.4 s',  ttft:'210 ms', tps:'64', in:'1.8K',  out:'300',  mult:0.4 },
+    { t:'13:22:18', agent:'opencode', model:'Nemotron 3.5 Lightning Free', acct:'免账号', r:'ok', ms:'9.8 s', ttft:'640 ms', tps:'27', in:'6.6K',  out:'1.3K', mult:0 },
+    { t:'13:10:04', agent:'workbuddy', model:'Claude Opus 4.1',         acct:'主号',   r:'err',  ms:'1.4 s',  ttft:'—',      tps:'—',  in:'2.1K',  out:'—',    mult:5.0, why:'401 unauthorized：账号已失效' },
+  ];
+
+  const TASKLOG = [
+    { t:'08:30:12', agent:'workbuddy', acct:'主号', kind:'签到', r:'ok',   ms:'412 ms', d:'+20 积分' },
+    { t:'08:30:13', agent:'workbuddy', acct:'备用', kind:'签到', r:'ok',   ms:'380 ms', d:'+20 积分' },
+    { t:'08:30:15', agent:'qoder',     acct:'主号', kind:'签到', r:'skip', ms:'1.2 s',  d:'上游无签到接口（不是故障）' },
+    { t:'07:00:04', agent:'workbuddy', acct:'主号', kind:'活动任务', r:'ok', ms:'2.6 s', d:'完成 1 个：每日对话' },
+  ];
+
+  const STATE_LABEL = { ok:'可用', unknown:'未探测', region:'地区受限', down:'不可用' };
+  const STATE_BADGE = { ok:'ok', unknown:'idle', region:'warn', down:'err' };
+
+  /* ══════════════════════════════════════════════════════════════
+     2. 状态
+     ══════════════════════════════════════════════════════════════ */
+  const S = {
+    page: 'overview',
+    plat: 'opencode',
+    q: '',
+    freeOnly: false,
+    open: {},        // agentId + '|' + vendor -> bool（是否展开）
+    collapsed: {},   // agentId -> true（整个模型列表收起）
+    sel: {},         // modelId -> bool（草稿：勾选但还没保存）
+    ctx: {},         // modelId -> 覆盖值（草稿）
+    selSaved: {},    // 已保存的勾选
+    ctxSaved: {},    // 已保存的上下文覆盖
+    pulling: false,
+    testing: null,   // modelId
+    fetchedAt: {},   // agentId -> 'HH:MM'
+    accounts: ACCOUNTS,
+    settings: {
+      enabled: true, strategy: 'quota', concurrency: 4,
+      defaultCtx: 0, prefix: true, keepLogs: 2000,
+      checkin: true, checkinCron: '30 8 * * *',
+      tasks: false, taskInterval: 60, taskConcurrency: 1, taskPause: 3,
+    },
+    dirty: 0,
+    lastSaved: null,  // 模型勾选/上下文/账号开关 即时保存后的时间戳
+    update: { current:'0.1.0', latest:'0.2.3', available:true, busy:null },
+    modal: null,
+    auth: 'idle',    // 模拟上游：idle|ok|denied
+  };
+
+  const TTL = 600, POLL_MS = 3000;
+  let tickTimer = null, pollTimer = null, refreshTimer = null;
+
+  /* ══════════════════════════════════════════════════════════════
+     3. 小工具
+     ══════════════════════════════════════════════════════════════ */
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const pad = n => String(n).padStart(2, '0');
+  const clock = () => { const d = new Date(); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+  const stamp = () => { const d = new Date(); return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()); };
+  const fmtLeft = s => Math.floor(s / 60) + ':' + pad(s % 60);
+  const num = n => Number(n || 0).toLocaleString('en-US');
+  const money = m => m === 0 ? '免费' : '×' + m;
+
+  function modelsOf(agentId) {
+    /* 排序规则：免费优先 → 厂商 → 倍率 */
+    return (MODELS[agentId] || []).filter(m => !AUTO_IDS.has(m.id)).slice().sort(function(a, b) {
+      const fa = a.mult === 0 ? 0 : 1, fb = b.mult === 0 ? 0 : 1;
+      if (fa !== fb) return fa - fb;
+      if (a.v !== b.v) return vendorCmp(a.v, b.v);
+      return a.mult - b.mult;
+    });
+  }
+  function accountsOf(agentId) { return S.accounts[agentId] || []; }
+  function isSelected(id) { return S.sel[id] !== undefined ? S.sel[id] : defSelected(id); }
+  function isSavedSel(id) { return S.selSaved[id] !== undefined ? S.selSaved[id] : defSelected(id); }
+  function defSelected(id) {
+    const m = Object.values(MODELS).flat().find(x => x.id === id);
+    if (!m) return false;
+    const owners = Object.keys(MODELS).filter(a => MODELS[a].some(x => x.id === id));
+    return owners.every(a => defaultSetFor(a).includes(id));
+  }
+  function defaultSetFor(agentId) {
+    const list = modelsOf(agentId);
+    return FREE_ONLY.has(agentId) ? list.filter(m => m.mult === 0).map(m => m.id) : list.map(m => m.id);
+  }
+  function selectedCount(agentId) {
+    return modelsOf(agentId).filter(m => isSelected(m.id)).length;
+  }
+  /* 已生效（= 已保存）的模型数：对话框下拉实际能看到的数量 */
+  function savedSelectedCount(agentId) {
+    return modelsOf(agentId).filter(m => isSavedSel(m.id)).length;
+  }
+  /* 草稿与已保存状态的差异条数（勾选 + 上下文长度） */
+  function dirtyCount(agentId) {
+    let n = 0;
+    for (const m of modelsOf(agentId)) {
+      if (isSelected(m.id) !== isSavedSel(m.id)) n++;
+      if ((S.ctx[m.id] || '') !== (S.ctxSaved[m.id] || '')) n++;
+    }
+    return n;
+  }
+  function commitModels(agentId) {
+    modelsOf(agentId).forEach(function(m) {
+      if (S.sel[m.id] === undefined) delete S.selSaved[m.id];
+      else S.selSaved[m.id] = S.sel[m.id];
+      if (S.ctx[m.id] === undefined) delete S.ctxSaved[m.id];
+      else S.ctxSaved[m.id] = S.ctx[m.id];
+    });
+  }
+  function revertModels(agentId) {
+    modelsOf(agentId).forEach(function(m) {
+      if (S.selSaved[m.id] === undefined) delete S.sel[m.id];
+      else S.sel[m.id] = S.selSaved[m.id];
+      if (S.ctxSaved[m.id] === undefined) delete S.ctx[m.id];
+      else S.ctx[m.id] = S.ctxSaved[m.id];
+    });
+  }
+  const totalAccounts = AGENTS.reduce((n, a) => n + accountsOf(a.id).length, 0);
+
+  /* 模型区、账号开关是「点一下就落盘」，这里只负责给出可见的保存痕迹 */
+  function markSaved() { S.lastSaved = clock(); }
+
+  /* ══════════════════════════════════════════════════════════════
+     4. 渲染：外壳
+     ══════════════════════════════════════════════════════════════ */
+  const app = document.getElementById('app');
+
+  function render() {
+    app.innerHTML = head() + page();
+    if (S.modal) renderModal(); else closeModal();
+  }
+
+  function head() {
+    const tabs = [['overview','总览'],['accounts','账号'],['tasks','任务'],['logs','日志'],['settings','设置']];
+    return '<div class="head">'
+      + '<span class="brand"><span class="dot"></span>多 Agent 网关</span>'
+      + '<div class="tabs" role="tablist">'
+      + tabs.map(([id, label]) => {
+          const n = id === 'accounts' ? totalAccounts : id === 'tasks' ? 2 : 0;
+          return '<button class="tab" role="tab" data-jump="' + id + '" aria-selected="' + (S.page === id) + '">'
+            + label + (n ? ' <span class="n">' + n + '</span>' : '') + '</button>';
+        }).join('')
+      + '</div>'
+      + '<span class="spacer"></span>'
+      + (S.update.available
+          ? '<button class="btn xs brand" data-act="goto-update">有新版本 ' + S.update.latest + ' ↗</button>'
+          : '')
+      + '<span class="tag strong">' + (S.settings.enabled ? '已启用' : '已停用') + '</span>'
+      + '</div>';
+  }
+
+  function page() {
+    if (S.page === 'overview') return viewOverview();
+    if (S.page === 'accounts') return viewAccounts();
+    if (S.page === 'tasks') return viewTasks();
+    if (S.page === 'logs') return viewLogs();
+    return viewSettings();
+  }
+
+  /* ── 总览 ───────────────────────────────────────────────── */
+  function viewOverview() {
+    const avail = AGENTS.reduce((n, a) => n + (a.free || accountsOf(a.id).length ? savedSelectedCount(a.id) : 0), 0);
+    return (S.update.available
+        ? '<div class="banner"><span class="dot warn"></span>'
+          + '<b>插件有新版本 ' + S.update.latest + '</b>'
+          + '<span class="hint">当前 ' + S.update.current + ' · 走 git 快进更新，不覆盖本地改动</span>'
+          + '<span class="spacer"></span><button class="btn sm" data-act="goto-update">去更新</button></div>'
+        : '')
+      + '<div class="card">'
+      +   '<div class="hero"><div>'
+      +     '<h2>' + AGENTS.length + ' 个平台 · ' + totalAccounts + ' 个账号 · ' + avail + ' 个模型进选择器</h2>'
+      +     '<p>免费通道直连，账号平台按额度路由；模型按平台分组上报到对话框的选择器。</p>'
+      +   '</div><span class="spacer"></span><div class="row">'
+      +     '<button class="btn" data-act="checkin-now">立即签到</button>'
+      +     '<button class="btn" data-act="refresh-quota">刷新额度</button>'
+      +     '<button class="btn" data-act="pull-all">拉取全部模型</button>'
+      +   '</div></div>'
+      +   '<div class="kpis">'
+      +     kpi(avail, '进选择器的模型')
+      +     kpi(148, '今日请求')
+      +     kpi('1.2M', '今日 Token')
+      +     kpi('2.0%', '失败率', true)
+      +     kpi('412<span style="font-size:11px">ms</span>', '平均首字')
+      +     kpi('38<span style="font-size:11px">tok/s</span>', '平均速度')
+      +   '</div>'
+      +   '<div class="last-turn"><b>最近一回合</b><b>DeepSeek V4.1 Flash Free</b>'
+      +     '<span class="hint">对话 · 输入 8.4K · 输出 1.1K tok · 首字 380 ms · 38 tok/s · 倍率 免费</span>'
+      +     '<span class="spacer"></span><span class="hint">32 秒前</span></div>'
+      + '</div>'
+      + '<div class="two">'
+      +   '<div class="card"><h3>平台健康</h3>'
+      +     '<p class="hint">每行一个平台；免费平台显示「免账号」。</p>'
+      +     '<div class="tbl-wrap" style="margin-top:7px"><table><thead><tr>'
+      +       '<th>平台</th><th>通道</th><th class="num">账号</th><th class="num">模型</th><th>状态</th>'
+      +     '</tr></thead><tbody>'
+      +     AGENTS.map(a => {
+            const accs = accountsOf(a.id);
+            const sel = (a.free || accs.length) ? savedSelectedCount(a.id) : 0;
+            const bad = accs.filter(x => x.st !== 'ok').length;
+            const st = a.free ? (sel ? 'ok' : 'idle') : accs.length === 0 ? 'idle' : bad ? 'warn' : 'ok';
+            return '<tr><td>' + esc(a.name) + '</td><td>' + (a.free ? '免账号' : '账号') + '</td>'
+              + '<td class="num">' + (a.free ? '—' : accs.length) + '</td>'
+              + '<td class="num">' + sel + '</td>'
+              + '<td>' + badge(st === 'ok' ? '可用' : st === 'warn' ? bad + ' 个降权' : '未配置', st) + '</td></tr>';
+          }).join('')
+      +     '</tbody></table></div></div>'
+      +   '<div class="card"><h3>最近失败</h3>'
+      +     '<p class="hint">失败不吞，原样带原因；悬停看完整报文。</p>'
+      +     '<div class="tbl-wrap" style="margin-top:7px"><table><thead><tr>'
+      +       '<th>时间</th><th>模型</th><th>原因</th></tr></thead><tbody>'
+      +     LOGS.filter(x => x.r !== 'ok').slice(0, 3).map(x =>
+            '<tr class="failed"><td>' + x.t + '</td><td>' + esc(x.model) + '</td>'
+            + '<td title="' + esc(x.why) + '">' + (x.r === 'slow' ? badge('超时','warn') : badge('失败','err'))
+            + ' ' + esc((x.why || '').slice(0, 26)) + '</td></tr>').join('')
+      +     '</tbody></table></div></div>'
+      + '</div>';
+  }
+  function kpi(v, label, bad) {
+    return '<div class="kpi' + (bad ? ' bad' : '') + '"><b>' + v + '</b><span>' + label + '</span></div>';
+  }
+  function badge(text, tone) { return '<span class="badge ' + tone + '">' + text + '</span>'; }
+
+  /* ── 账号 ───────────────────────────────────────────────── */
+  function viewAccounts() {
+    const a = AGENT_BY_ID[S.plat];
+    const accs = accountsOf(a.id);
+    const pills = AGENTS.map(x => {
+      const list = accountsOf(x.id);
+      const bad = list.some(y => y.st !== 'ok');
+      const cls = x.free ? 'ok' : list.length === 0 ? '' : bad ? 'warn' : 'ok';
+      const cnt = x.free ? '免账号' : String(list.length);
+      return '<button class="plat" data-plat="' + x.id + '" aria-selected="' + (S.plat === x.id) + '">'
+        + '<span class="st ' + cls + '"></span>' + esc(x.name)
+        + '<span class="tag">' + cnt + '</span></button>';
+    }).join('');
+
+    return '<div class="platforms" role="tablist">' + pills + '</div>'
+      + (a.free
+          ? freeChannelCard() + modelCard(a)
+          : accountCard(a, accs) + (accs.length ? modelCard(a) : ''));
+  }
+
+  function freeChannelCard() {
+    return '<div class="card">'
+      + '<div class="acct">'
+      +   '<span class="avatar">OC</span>'
+      +   '<div class="who"><b>免账号通道</b><span class="hint">匿名 · 无需凭证 · 免费层</span></div>'
+      +   '<span class="spacer"></span>'
+      +   '<div class="meta"><span>免费模型 <b>' + modelsOf('opencode').length + '</b> 个</span>'
+      +   '<span>健康 ' + badge('正常','ok') + '</span></div>'
+      +   '<button class="btn sm" data-act="probe-all">测活</button>'
+      + '</div></div>';
+  }
+
+  function accountCard(a, accs) {
+    const body = accs.length
+      ? '<div class="acct-list">' + accs.map((acc, i) => accountRow(a, acc, i)).join('') + '</div>'
+      : '<div class="acct empty">'
+        + '<p class="hint" style="margin:0">还没有账号。登录后在浏览器完成授权，账号与模型会自动出现在这里。</p>'
+        + '<button class="btn primary sm" data-act="login" data-agent="' + a.id + '">登录 ' + esc(a.name) + '</button>'
+        + '</div>';
+
+    return '<div class="card">'
+      + '<div class="card-hd"><h3>账号</h3>'
+      +   '<span class="hint">' + (S.settings.strategy === 'quota' ? '按额度挑账号' : '轮询') + ' · 失败降权 3 分钟后自动恢复</span>'
+      +   '<span class="spacer"></span>'
+      +   (accs.length ? '<button class="btn primary sm" data-act="login" data-agent="' + a.id + '">＋ 添加账号</button>' : '')
+      + '</div>'
+      + '<div style="margin-top:9px">' + body + '</div></div>';
+  }
+
+  function accountRow(a, acc, i) {
+    const st = acc.st === 'ok' ? badge('可用','ok')
+      : acc.st === 'warn' ? badge('降权中','warn') : badge('不可用','err');
+    return '<div class="acct' + (acc.st === 'warn' ? ' warn' : '') + '">'
+      + '<span class="avatar">' + esc(a.ab) + '</span>'
+      + '<div class="who"><div class="row" style="gap:7px">'
+      +   '<b>' + esc(a.id) + '-' + (i + 1) + '</b>'
+      +   '<span class="tag">' + esc(acc.label) + '</span>' + st
+      +   (acc.note ? '<span class="hint">' + esc(acc.note) + '</span>' : '')
+      + '</div>'
+      + '<div class="meta"><span>今日 <b>' + acc.today + '</b> 次</span>'
+      +   '<span>额度 <b>' + num(acc.quota) + '</b></span>'
+      +   '<span>健康 <b>' + (acc.st === 'ok' ? '正常' : '1 次失败') + '</b></span></div></div>'
+      + '<span class="spacer"></span>'
+      + '<div class="togs">'
+      +   tog('对话', acc.chat, 'acc-tog', a.id, acc.id, 'chat')
+      +   tog('签到', acc.checkin, 'acc-tog', a.id, acc.id, 'checkin')
+      +   tog('任务', acc.task, 'acc-tog', a.id, acc.id, 'task')
+      + '</div>'
+      + '<button class="btn xs" data-act="test-account" data-agent="' + a.id + '" data-id="' + acc.id + '">测活</button>'
+      + (acc.st === 'warn' ? '<button class="btn xs" data-act="reset-account" data-agent="' + a.id + '" data-id="' + acc.id + '">恢复</button>' : '')
+      + '<button class="btn xs danger" data-act="logout" data-agent="' + a.id + '" data-id="' + acc.id + '">退出</button>'
+      + '</div>';
+  }
+  function tog(label, on, act, agentId, accId, key) {
+    return '<span class="tog">' + label + '<button class="switch" data-act="' + act + '"'
+      + ' data-agent="' + agentId + '" data-id="' + accId + '" data-key="' + key + '"'
+      + ' aria-checked="' + (on ? 'true' : 'false') + '"></button></span>';
+  }
+
+  /* ── 模型卡（本次重点） ─────────────────────────────────── */
+  function modelCard(a) {
+    const list = modelsOf(a.id);
+    const sel = list.filter(m => isSelected(m.id)).length;
+    const collapsed = S.collapsed[a.id] === true;
+    const shown = visibleModels(a.id);
+
+    return '<div class="card">'
+      + '<div class="card-hd">'
+      +   '<button class="btn ghost xs" data-act="toggle-models" data-agent="' + a.id + '"'
+      +     ' title="' + (collapsed ? '展开模型列表' : '收起模型列表') + '"'
+      +     ' style="font-size:10px;padding:1px 4px">' + (collapsed ? '▶' : '▼') + '</button>'
+      +   '<h3>模型</h3>'
+      +   (collapsed ? '' : '<span class="tag">' + (FREE_ONLY.has(a.id) ? '只拉免费' : '拉全量') + '</span>')
+      +   (collapsed ? '' : '<span class="tag" title="上游返回的 auto 路由聚合模型会被过滤：不进列表、不计入勾选">Auto 已排除</span>')
+      +   (!collapsed && S.fetchedAt[a.id] ? '<span class="hint">拉取于 ' + S.fetchedAt[a.id] + '</span>' : '')
+      +   '<span class="spacer"></span>'
+      +   (dirtyCount(a.id) ? '<span class="badge warn">未保存</span>' : '')
+      +   '<span class="mcount">已勾选 <b>' + sel + '</b> / 共 <b>' + list.length + '</b></span>'
+      +   (collapsed ? '<button class="btn xs" data-act="toggle-models" data-agent="' + a.id + '">展开</button>' : '')
+      + '</div>'
+      + (collapsed
+          ? (dirtyCount(a.id) ? saveBarHTML(a) : '')
+          : toolbarHTML(a, sel, list.length) + saveBarHTML(a) + modelBody(a, sel, list, shown))
+      + '</div>';
+  }
+
+  /* 标题与列表之间的保存条：默认吸顶，滚长列表时也够得着 */
+  function saveBarHTML(a) {
+    const n = dirtyCount(a.id);
+    const live = savedSelectedCount(a.id);
+    const clean = '<span class="ok">✓</span><span class="hint">'
+      + (S.lastSaved ? '已保存 · ' + S.lastSaved + ' · ' : '')
+      + '当前生效 <b style="color:var(--label-primary)">' + live + '</b> 个模型</span>';
+    const dirty = '<span class="dot warn"></span><b>' + n + ' 项改动未保存</b>'
+      + '<span class="hint">点「保存并生效」后，对话框的模型下拉才会更新 · 离开本页会丢失</span>';
+    return '<div class="msave' + (n ? ' dirty' : '') + '">'
+      + (n ? dirty : clean)
+      + '<span class="spacer"></span>'
+      + (n ? '<button class="btn sm" data-act="discard-models" data-agent="' + a.id + '">放弃改动</button>' : '')
+      + '<button class="btn sm primary" data-act="save-models" data-agent="' + a.id + '"'
+      +   (n ? '' : ' disabled') + '>保存并生效' + (n ? '（' + n + '）' : '') + '</button>'
+      + '</div>';
+  }
+
+  function toolbarHTML(a, sel, total) {
+    return '<div class="mtoolbar">'
+      + '<input class="input search" type="search" placeholder="搜索模型名或 ID…" value="' + esc(S.q) + '" data-role="q">'
+      + '<label class="row" style="gap:5px;font-size:12.5px;cursor:pointer">'
+      +   '<input class="check" type="checkbox" data-act="free-only"' + (S.freeOnly ? ' checked' : '') + '>只看免费</label>'
+      + '<span class="spacer"></span>'
+      + '<span class="seg2"><button data-act="select-all">全选</button>'
+      +   '<button data-act="select-none">清空</button></span>'
+      + '<button class="btn sm' + (S.pulling ? '' : ' primary') + '" data-act="pull" data-agent="' + a.id + '"'
+      +   (S.pulling ? ' disabled' : '') + '>' + (S.pulling ? '<span class="spin"></span> 拉取中…' : '拉取模型') + '</button>'
+      + '</div>';
+  }
+
+  function modelBody(a, sel, list, shown) {
+    return '<div class="mgroups">'
+      + '<div class="mthead"><span>加入</span><span>模型 / ID</span><span>倍率</span><span>上下文长度</span>'
+      +   '<span>状态</span><span></span></div>'
+      + (shown.length
+          ? shown.map(m => rowHTML(a, m, true)).join('')
+          : '<div class="mempty">没有匹配的模型。' + (S.q || S.freeOnly ? '试试清空搜索或筛选。' : '先拉取模型。') + '</div>')
+      + '</div>'
+
+      + '<p class="hint" style="margin-top:8px">'
+      +   (FREE_ONLY.has(a.id)
+            ? '这个平台只拉免费模型，默认已勾选全部免费模型。'
+            : '默认已勾选全部模型；把不要的取消勾选即可。')
+      + ' <b style="color:var(--label-primary);font-weight:600">勾选和上下文长度都是草稿</b>'
+      +   '：点上方「保存并生效」才写入并刷新对话框的模型下拉（一次改动只发一次请求）。'
+      +   '上下文长度留空 = 用上游报的值，只有勾选的模型才会出现在选择器里。'
+      + '</p>';
+  }
+
+  function visibleModels(agentId) {
+    const q = S.q.trim().toLowerCase();
+    return modelsOf(agentId).filter(m => {
+      if (S.freeOnly && m.mult !== 0) return false;
+      if (!q) return true;
+      return (m.n + ' ' + m.id + ' ' + m.v).toLowerCase().includes(q);
+    });
+  }
+
+  function rowHTML(a, m, showVendor) {
+    const on = isSelected(m.id);
+    const over = S.ctx[m.id] !== undefined ? S.ctx[m.id] : '';
+    const ph = String(m.ctx);
+    return '<div class="mrow' + (on ? '' : ' off') + '">'
+      + '<input class="check" type="checkbox" data-act="toggle-model" data-id="' + m.id + '"' + (on ? ' checked' : '') + '>'
+      + '<div class="mname"><span class="nm">' + esc(m.n) + '</span><span class="id">' + esc(m.id)
+      +   (showVendor ? ' · ' + esc(m.v) : '') + '</span></div>'
+      + '<span class="tag' + (m.mult === 0 ? ' strong' : '') + '">' + (m.mult === 0 ? '免费' : '×' + m.mult) + '</span>'
+      + '<div class="ctxcell"><input class="input ctx" data-role="ctx" data-id="' + m.id + '"'
+      +   ' placeholder="' + ph + '" value="' + esc(over) + '" title="留空 = 用上游报的 ' + num(m.ctx) + '">'
+      +   '<span class="up">' + (over !== '' ? '覆盖' : '上游') + '</span></div>'
+      + '<span class="stcell">' + badge(STATE_LABEL[m.st], STATE_BADGE[m.st]) + '</span>'
+      + '<button class="btn ghost xs" data-act="test-model" data-id="' + m.id + '"' + (a.id === 'opencode' ? '' : '') + '>'
+      +   (S.testing === m.id ? '<span class="spin"></span>' : '测一次') + '</button>'
+      + '</div>';
+  }
+
+  /* ── 任务 ───────────────────────────────────────────────── */
+  function viewTasks() {
+    const st = S.settings;
+    return '<div class="modules">'
+      + '<div class="card module">'
+      +   '<div class="hd"><b>每日签到</b>' + badge(st.checkin ? '已开启' : '已关闭', st.checkin ? 'ok' : 'idle')
+      +     '<span class="spacer"></span><button class="switch" data-act="tog" data-key="checkin" aria-checked="' + st.checkin + '"></button></div>'
+      +   '<p class="hint">与活动任务完全独立的一套开关。</p>'
+      +   '<div class="kv">'
+      +     '<span class="k">执行时间</span><span><input class="input xs" style="width:120px" value="' + st.checkinCron + '"> '
+      +       '<span class="hint">每天 08:30</span></span>'
+      +     '<span class="k">上次执行</span><span>今天 08:30 · 成功 2 / 3</span>'
+      +     '<span class="k">下次执行</span><span>明天 08:30</span>'
+      +     '<span class="k">启动错峰</span><span>60 秒</span>'
+      +   '</div>'
+      +   '<div class="row" style="margin-top:9px"><button class="btn sm primary" data-act="checkin-now">立即签到</button>'
+      +     '<button class="btn sm ghost" data-act="jump-log">查看流水</button></div>'
+      + '</div>'
+      + '<div class="card module">'
+      +   '<div class="hd"><b>活动任务</b>' + badge(st.tasks ? '已开启' : '已关闭', st.tasks ? 'ok' : 'idle')
+      +     '<span class="spacer"></span><button class="switch" data-act="tog" data-key="tasks" aria-checked="' + st.tasks + '"></button></div>'
+      +   '<p class="hint">默认关；上游没有活动任务接口时，打开也不会有收获。</p>'
+      +   '<div class="kv">'
+      +     '<span class="k">轮询间隔</span><span><input class="input sm" value="' + st.taskInterval + '"> 分钟</span>'
+      +     '<span class="k">并发上限</span><span><input class="input sm" value="' + st.taskConcurrency + '"> 个账号</span>'
+      +     '<span class="k">失败暂停</span><span>连续 <input class="input sm" value="' + st.taskPause + '"> 次</span>'
+      +     '<span class="k">上次执行</span><span>' + (st.tasks ? '今天 07:00 · 完成 1 个' : '—') + '</span>'
+      +   '</div>'
+      +   '<div class="row" style="margin-top:9px"><button class="btn sm primary" data-act="run-tasks">跑一轮任务</button>'
+      +     '<button class="btn sm ghost" data-act="jump-log">查看流水</button></div>'
+      + '</div></div>'
+
+      + '<div class="card"><div class="card-hd"><h3>任务流水</h3>'
+      +   '<span class="hint">按时间倒序，最近 200 条</span><span class="spacer"></span>'
+      +   '<button class="btn sm ghost" data-act="clear-tasklog">清空</button></div>'
+      + '<div class="tbl-wrap" style="margin-top:7px"><table><thead><tr>'
+      +   '<th>时间</th><th>平台</th><th>账号</th><th>类型</th><th>结果</th><th class="num">耗时</th><th>详情</th>'
+      + '</tr></thead><tbody>'
+      + TASKLOG.map(x => '<tr><td>' + x.t + '</td><td>' + esc(AGENT_BY_ID[x.agent].name) + '</td>'
+          + '<td>' + esc(x.acct) + '</td><td>' + x.kind + '</td>'
+          + '<td>' + (x.r === 'ok' ? badge('成功','ok') : badge('不支持','idle')) + '</td>'
+          + '<td class="num">' + x.ms + '</td><td class="hint">' + esc(x.d) + '</td></tr>').join('')
+      + '</tbody></table></div></div>';
+  }
+
+  /* ── 日志 ───────────────────────────────────────────────── */
+  function viewLogs() {
+    return '<div class="card"><div class="card-hd"><h3>请求日志</h3>'
+      + '<span class="hint">逐请求明细，失败行标红，原因悬停可见</span>'
+      + '<span class="spacer"></span>'
+      + '<span class="seg2"><button aria-pressed="true">20</button><button>50</button><button>100</button></span>'
+      + '<label class="row" style="gap:5px;font-size:12.5px;cursor:pointer">'
+      +   '<input class="check" type="checkbox" data-act="auto-refresh">自动刷新</label>'
+      + '<button class="btn sm" data-act="reload-logs">刷新</button>'
+      + '<button class="btn sm ghost" data-act="clear-logs">清空</button></div>'
+
+      + '<div class="tbl-wrap" style="margin-top:8px"><table><thead><tr>'
+      + '<th>时间</th><th>平台</th><th>模型</th><th>账号</th><th>结果</th>'
+      + '<th class="num">耗时</th><th class="num">首字</th><th class="num">速度</th>'
+      + '<th class="num">输入</th><th class="num">输出</th><th>倍率</th>'
+      + '</tr></thead><tbody>'
+      + LOGS.map(x => {
+          const r = x.r === 'ok' ? badge('成功','ok') : x.r === 'slow' ? badge('超时','warn') : badge('失败','err');
+          return '<tr' + (x.r === 'ok' ? '' : ' class="failed"') + '>'
+            + '<td>' + x.t + '</td>'
+            + '<td>' + esc(AGENT_BY_ID[x.agent].name) + '</td>'
+            + '<td>' + esc(x.model) + '</td>'
+            + '<td>' + esc(x.acct) + '</td>'
+            + '<td title="' + esc(x.why || '') + '">' + r + '</td>'
+            + '<td class="num">' + x.ms + '</td>'
+            + '<td class="num">' + x.ttft + '</td>'
+            + '<td class="num">' + x.tps + '</td>'
+            + '<td class="num">' + x.in + '</td>'
+            + '<td class="num">' + x.out + '</td>'
+            + '<td><span class="tag">' + money(x.mult) + '</span></td></tr>';
+        }).join('')
+      + '</tbody></table></div>'
+      + '<div class="row" style="margin-top:9px"><span class="hint">显示 ' + LOGS.length + ' / 共 148 条</span>'
+      + '<span class="spacer"></span><button class="btn ghost sm" disabled>‹</button>'
+      + '<span class="hint">第 1 / 8 页</span><button class="btn ghost sm">›</button></div>'
+      + '</div>';
+  }
+
+  /* ── 设置 ───────────────────────────────────────────────── */
+  function viewSettings() {
+    const st = S.settings;
+    const u = S.update;
+    return '<div class="card"><h3>基础</h3>'
+      + row('插件总开关',
+          '<button class="switch" data-act="tog" data-key="enabled" aria-checked="' + st.enabled + '"></button>'
+          + '<div class="hint">关掉后不注册任何 provider，模型选择器里看不到本插件的分组。</div>')
+      + row('账号路由策略',
+          '<select class="input" data-set="strategy">'
+          + '<option value="quota"' + (st.strategy === 'quota' ? ' selected' : '') + '>优先额度高的账号</option>'
+          + '<option value="round"' + (st.strategy === 'round' ? ' selected' : '') + '>轮询</option></select>'
+          + '<div class="hint">同平台多账号时怎么挑；失败会降权并自动恢复。</div>')
+      + row('并发上限',
+          '<input class="input sm" value="' + st.concurrency + '" data-set="concurrency">'
+          + '<div class="hint">同时进行中的对话请求数，防上游风控。</div>')
+      + '</div>'
+
+      + '<div class="card"><h3>模型默认</h3>'
+      + row('默认上下文长度',
+          '<input class="input sm" value="' + st.defaultCtx + '" data-set="defaultCtx">'
+          + '<div class="hint">0 = 不覆盖。单个模型在「账号 → 模型」里单独改，优先于这里。</div>')
+      + row('模型名带平台前缀',
+          '<button class="switch" data-act="tog" data-key="prefix" aria-checked="' + st.prefix + '"></button>'
+          + '<div class="hint">开启后显示成 <span class="mono">'
+          + (st.prefix ? 'OpenCode · DeepSeek V4.1 Flash Free (免费)' : 'DeepSeek V4.1 Flash Free') + '</span></div>')
+      + '</div>'
+
+      + '<div class="card"><h3>日志</h3>'
+      + row('保留条数',
+          '<input class="input sm" value="' + st.keepLogs + '" data-set="keepLogs">'
+          + '<div class="hint">超出后自动裁掉最旧的。</div>')
+      + '</div>'
+
+      + '<div class="card" id="update-card"><h3>版本更新</h3>'
+      + row('当前版本', '<span class="mono">' + u.current + '</span>'
+          + (u.available ? ' <span class="badge warn">可更新到 ' + u.latest + '</span>' : ' <span class="badge ok">已是最新</span>'))
+      + row('更新方式', '<span class="hint">走 git <span class="mono">pull --ff-only</span> 快进；本地有未提交改动时会拒绝，不覆盖你的东西。</span>')
+      + row('', '<div class="row">'
+          + '<button class="btn sm" data-act="check-update">' + (u.busy === 'check' ? '<span class="spin"></span> 检查中…' : '检查更新') + '</button>'
+          + (u.available
+              ? '<button class="btn sm primary" data-act="apply-update">' + (u.busy === 'apply' ? '<span class="spin"></span> 更新中…' : '立即更新到 ' + u.latest) + '</button>'
+              : '')
+          + '</div>')
+      + '</div>'
+
+      + '<div class="card"><h3>关于</h3>'
+      + row('交流群', 'QQ 群 <b>1105449571</b> <span class="hint">（进群备注「dsh 插件」）</span>')
+      + '</div>'
+
+      + '<div class="save-bar"><span class="hint">'
+      +   (S.dirty
+            ? '<b style="color:var(--label-primary)">' + S.dirty + '</b> 项待保存 · 数字输入集中提交，避免每敲一个字就重建 provider'
+            : '没有未保存的改动 · 这里的开关即时生效；模型勾选与上下文长度在「账号」页单独保存')
+      + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="btn sm" data-act="discard"' + (S.dirty ? '' : ' disabled') + '>放弃改动</button>'
+      + '<button class="btn sm primary" data-act="save"' + (S.dirty ? '' : ' disabled') + '>保存配置</button></div>';
+  }
+  function row(label, body) {
+    return '<div class="form-row"><div><div class="lab">' + label + '</div></div><div>' + body + '</div></div>';
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     5. 登录弹框（与已确认原型一致）
+     ══════════════════════════════════════════════════════════════ */
+  const modalRoot = document.getElementById('modalRoot');
+  const fbBrowser = document.getElementById('fakeBrowser');
+  const fbLabel = document.getElementById('fbLabel');
+
+  function authUrlOf(agentId) {
+    const a = AGENT_BY_ID[agentId];
+    if (agentId === 'workbuddy') return 'https://copilot.tencent.com/login?platform=ide&state=8f3c1a97e04b2d6e';
+    if (agentId === 'workbuddy-intl') return 'https://www.workbuddy.ai/login?platform=workbuddy-ai&state=8f3c1a97e04b2d6e';
+    if (agentId === 'qoder') return 'https://qoder.com/device/selectAccounts?challenge=8f3c&challenge_method=S256';
+    if (agentId === 'qoder-cn') return 'https://qoder.com.cn/device/selectAccounts?challenge=8f3c&challenge_method=S256';
+    return 'https://opencode.ai/console/device?code=WDJB-MJHT';
+  }
+
+  function openLogin(agentId) {
+    stopTimers();
+    S.auth = 'idle';
+    fbBrowser.classList.remove('on');
+    fbLabel.classList.remove('on');
+    modalRoot.classList.remove('with-browser');
+    S.modal = { phase: 'linking', agent: agentId };
+    render();
+    setTimeout(function() {
+      if (!S.modal || S.modal.phase !== 'linking') return;
+      S.modal = { phase: 'waiting', agent: agentId, url: authUrlOf(agentId), opened: false,
+                  left: TTL, checks: 0, last: null, note: null, checking: false, auto: true };
+      renderModal();
+      startTimers();
+    }, 800);
+  }
+
+  function renderModal() {
+    const s = S.modal;
+    if (!s) { closeModal(); return; }
+    modalRoot.innerHTML = modalHTML(s);
+    modalRoot.classList.add('on');
+    modalRoot.querySelectorAll('[data-mact]').forEach(function(b) {
+      b.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        modalAct(b.getAttribute('data-mact'));
+      });
+    });
+  }
+
+  function closeModal() {
+    modalRoot.classList.remove('on');
+    modalRoot.classList.remove('with-browser');
+    modalRoot.innerHTML = '';
+    fbBrowser.classList.remove('on');
+    fbLabel.classList.remove('on');
+  }
+
+  function modalHTML(s) {
+    const a = AGENT_BY_ID[s.agent] || { name: 'WorkBuddy', ab: 'WB' };
+    const head = '<div class="modal-hd"><span class="dot ok"></span><b>登录 ' + esc(a.name) + '</b>'
+      + '<span class="tag">' + (a.free ? '免账号' : '账号') + '</span>'
+      + '<button class="x" data-mact="close" aria-label="关闭">✕</button></div>';
+    let body = '', foot = '';
+
+    if (s.phase === 'linking') {
+      body = '<div class="modal-bd center" style="padding:32px 20px">'
+        + '<span class="spin" style="width:18px;height:18px;border-width:2.5px"></span>'
+        + '<b class="t" style="margin-top:4px">正在获取授权链接…</b>'
+        + '<p class="hint">向 ' + esc(a.name) + ' 申请一次登录会话</p></div>';
+      foot = '<span class="spacer"></span><button class="btn" data-mact="close">取消</button>';
+
+    } else if (s.phase === 'waiting') {
+      const lead = s.checking
+        ? '<span class="spin"></span><b>正在检查授权状态…</b>'
+        : '<span class="dot' + (s.opened ? ' poll' : '') + '"></span><b>'
+          + (s.opened ? '等待授权…' : '等待在浏览器中登录…') + '</b>';
+      body = '<p class="hint">在浏览器里完成登录。本窗口每 3 秒自动检查一次，成功后自动添加账号。</p>'
+        + '<div class="steps">'
+        +   '<div class="step ' + (s.opened ? 'done' : 'on') + '">'
+        +     '<span class="n">' + (s.opened ? '✓' : '1') + '</span>在浏览器中打开授权页</div>'
+        +   '<div class="step ' + (s.opened ? 'on' : '') + '">'
+        +     '<span class="n">2</span>完成登录，回到本窗口</div>'
+        + '</div>'
+        + '<div class="urlbox"><span class="u" title="' + esc(s.url) + '">' + esc(s.url) + '</span>'
+        +   '<button class="btn xs" data-mact="copy">复制</button></div>'
+        + '<div class="cta"><button class="btn ' + (s.opened ? '' : 'primary') + '" data-mact="open">'
+        +   (s.opened ? '重新打开浏览器' : '在浏览器打开') + '<span class="ext">↗</span></button>'
+        +   '<span class="hint">打不开？复制链接到手机或其它浏览器</span></div>'
+        + '<div class="status">'
+        +   '<div class="line">' + lead + '<span class="spacer"></span>'
+        +     '<span class="t" data-bind="left">剩余 ' + fmtLeft(s.left) + '</span></div>'
+        +   '<div class="line sub">已自动检查 <b>' + s.checks + '</b> 次'
+        +     (s.last ? ' · 上次 ' + s.last : '') + '<span class="spacer"></span>'
+        +     '<span style="font-size:11.5px">每 3 秒自动</span>'
+        +     '<span class="switch" data-mact="auto" role="switch" aria-checked="' + (s.auto ? 'true' : 'false') + '"'
+        +       ' style="width:26px;height:15px"></span></div>'
+        +   (s.note ? '<div class="line note"><span class="dot warn"></span><span>' + esc(s.note) + '</span></div>' : '')
+        + '</div>';
+      foot = '<span class="spacer"></span><button class="btn" data-mact="cancel">取消</button>'
+        + '<button class="btn brand" data-mact="refresh"' + (s.checking ? ' disabled' : '') + '>'
+        +   (s.checking ? '检查中…' : '手动刷新状态') + '</button>';
+
+    } else if (s.phase === 'success') {
+      const acc = s.account;
+      body = '<div class="modal-bd center">'
+        + '<span class="tick">✓</span><b class="t">已添加账号</b>'
+        + '<span class="mono" style="color:var(--label-secondary)">' + esc(acc.label) + ' · ' + esc(a.name) + '</span>'
+        + '<div class="row" style="justify-content:center;margin-top:2px">'
+        +   '<span class="tag">' + s.models + ' 个模型</span>'
+        +   '<span class="tag">上下文 ' + num(s.ctx) + '</span>'
+        +   '<span class="badge ok">可用</span></div>'
+        + '<p class="hint" style="margin-top:4px">账号已出现在「账号」页；模型默认已勾选。</p></div>';
+      foot = '<span class="hint">浏览器窗口可以关掉了</span><span class="spacer"></span>'
+        + '<button class="btn primary" data-mact="done">完成</button>';
+
+    } else if (s.phase === 'expired') {
+      body = '<div class="modal-bd center"><span class="ic warn">!</span>'
+        + '<b class="t">授权链接已过期</b>'
+        + '<p class="hint">链接有效期 10 分钟，已经超时。请重新获取一条再登录。</p></div>';
+      foot = '<span class="spacer"></span><button class="btn" data-mact="cancel">取消</button>'
+        + '<button class="btn primary" data-mact="retry">重新获取链接</button>';
+
+    } else if (s.phase === 'error') {
+      body = '<div class="modal-bd center"><span class="ic err">!</span>'
+        + '<b class="t">获取授权链接失败</b>'
+        + '<div class="reason">' + esc(s.reason) + '</div>'
+        + '<p class="hint">上游暂时不可用，重试即可；不需要重新登录。</p></div>';
+      foot = '<span class="spacer"></span><button class="btn" data-mact="cancel">取消</button>'
+        + '<button class="btn primary" data-mact="retry">重试</button>';
+
+    } else if (s.phase === 'denied') {
+      body = '<div class="modal-bd center"><span class="ic err">✕</span>'
+        + '<b class="t">授权被拒绝</b>'
+        + '<p class="hint">你在浏览器里取消了这次授权。可以重新发起一次登录。</p></div>';
+      foot = '<span class="spacer"></span><button class="btn" data-mact="cancel">取消</button>'
+        + '<button class="btn primary" data-mact="retry">重新获取链接</button>';
+    }
+
+    return '<div class="modal" role="dialog" aria-modal="true">'
+      + head + body + '<div class="modal-ft">' + foot + '</div></div>';
+  }
+
+  function stopTimers() {
+    clearInterval(tickTimer); clearInterval(pollTimer); clearTimeout(refreshTimer);
+    tickTimer = pollTimer = refreshTimer = null;
+  }
+  function startTimers() {
+    stopTimers();
+    tickTimer = setInterval(function() {
+      const s = S.modal;
+      if (!s || s.phase !== 'waiting') return;
+      s.left = Math.max(0, s.left - 1);
+      if (s.left === 0) { S.modal = { phase: 'expired', agent: s.agent }; stopTimers(); renderModal(); return; }
+      const l = modalRoot.querySelector('[data-bind="left"]');
+      if (l) l.textContent = '剩余 ' + fmtLeft(s.left);
+    }, 1000);
+    pollTimer = setInterval(function() { poll('auto'); }, POLL_MS);
+  }
+  function poll(kind) {
+    const s = S.modal;
+    if (!s || s.phase !== 'waiting') return;
+    s.checks++; s.last = stamp();
+    if (S.auth === 'ok') { succeed(); return; }
+    if (S.auth === 'denied') { stopTimers(); S.modal = { phase: 'denied', agent: s.agent }; renderModal(); return; }
+    if (kind === 'manual') s.note = s.last + ' 手动检查：未授权，继续等待';
+    renderModal();
+  }
+  function succeed() {
+    const s = S.modal;
+    stopTimers();
+    const agentId = s.agent;
+    const a = AGENT_BY_ID[agentId];
+    const list = accountsOf(agentId);
+    const label = a.id + '-' + (list.length + 1);
+    const acc = { id: 'acc' + Date.now(), label: String(list.length + 1), full: label, st: 'ok',
+                  quota: 0, today: 0, chat: true, checkin: false, task: false };
+    S.accounts[agentId] = list.concat([acc]);
+    S.plat = agentId;
+    S.modal = { phase: 'success', agent: agentId, account: { label: label }, models: modelsOf(agentId).length,
+                ctx: modelsOf(agentId)[0] ? modelsOf(agentId)[0].ctx : 0 };
+    render();
+    fbBrowser.querySelector('.fb-page') && (fbBrowser.innerHTML = fbDoneHTML());
+    toast('登录成功，账号 ' + label + ' 已添加');
+  }
+  function fbDoneHTML() {
+    return '<div class="fb-done"><span class="tick">✓</span>'
+      + '<b style="font-size:13px">授权成功</b>'
+      + '<p>可以关闭这个窗口了，插件已经拿到登录态。</p></div>';
+  }
+
+  function modalAct(act) {
+    const s = S.modal;
+    if (!s) return;
+    if (act === 'close' || act === 'cancel' || act === 'done') {
+      const agentId = s.agent;
+      stopTimers();
+      S.modal = null;
+      render();
+      fbBrowser.classList.remove('on');
+      fbLabel.classList.remove('on');
+      if (act === 'done') S.page = 'accounts', S.plat = agentId, render();
+      return;
+    }
+    if (act === 'retry') { openLogin(s.agent); return; }
+    if (act === 'copy') {
+      const note = function(t) { if (S.modal && S.modal.phase === 'waiting') { S.modal.note = t; renderModal(); } };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(s.url).then(function() { note('链接已复制到剪贴板'); })
+          .catch(function() { note('复制被浏览器拦下，请选中链接手动复制'); });
+      } else note('当前环境不支持剪贴板，请选中链接手动复制');
+      return;
+    }
+    if (act === 'open') {
+      S.modal.opened = true;
+      modalRoot.classList.add('with-browser');
+      showBrowser(s.url, (AGENT_BY_ID[s.agent] || {}).name);
+      renderModal();
+      return;
+    }
+    if (act === 'refresh') {
+      if (s.phase !== 'waiting' || s.checking) return;
+      s.checking = true;
+      renderModal();
+      refreshTimer = setTimeout(function() {
+        if (!S.modal || S.modal.phase !== 'waiting') return;
+        S.modal.checking = false;
+        poll('manual');
+      }, 650);
+      return;
+    }
+    if (act === 'auto') {
+      s.auto = !s.auto;
+      if (s.auto) startTimers(); else { clearInterval(pollTimer); pollTimer = null; }
+      renderModal();
+    }
+  }
+
+  function showBrowser(url, agentName) {
+    const nm = agentName || 'WorkBuddy';
+    fbBrowser.innerHTML = '<div class="fb-bar"><span class="lights"><i></i><i></i><i></i></span>'
+      + '<div class="fb-tab"><span class="fav">' + esc(nm.slice(0, 1)) + '</span>登录 · ' + esc(nm) + '</div></div>'
+      + '<div class="fb-url"><span class="lock">🔒</span><span class="u">' + esc(url) + '</span>'
+      + '<span class="sim">原型模拟</span></div>'
+      + '<div class="fb-page"><div class="wb-logo">' + esc(nm) + '</div>'
+      + '<p>使用微信扫码登录</p><div class="qr"><i></i></div>'
+      + '<div class="fb-actions">'
+      + '<button class="btn primary sm" data-fb="ok">授权并登录</button>'
+      + '<button class="btn sm" data-fb="no">拒绝</button></div>'
+      + '<p class="fb-note">真实实现会用系统默认浏览器打开同一链接，<br>这个窗口只是原型里的替身。</p></div>';
+    fbBrowser.classList.add('on');
+    fbLabel.classList.add('on');
+    fbBrowser.querySelectorAll('[data-fb]').forEach(function(b) {
+      b.addEventListener('click', function() {
+        if (b.getAttribute('data-fb') === 'ok') {
+          S.auth = 'ok';
+          fbBrowser.innerHTML = '<div class="fb-done"><span class="spin" style="width:16px;height:16px"></span>'
+            + '<b style="font-size:13px">授权成功</b><p>正在等插件确认…（最多 3 秒）</p></div>';
+        } else {
+          S.auth = 'denied';
+          fbBrowser.innerHTML = '<div class="fb-done">'
+            + '<span class="ic err" style="width:36px;height:36px;font-size:15px">✕</span>'
+            + '<b style="font-size:13px">已取消授权</b><p>可以关闭这个窗口了。</p></div>';
+        }
+      });
+    });
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     6. Toast
+     ══════════════════════════════════════════════════════════════ */
+  const toasts = document.getElementById('toasts');
+  function toast(text, kind) {
+    const el = document.createElement('div');
+    el.className = 'toast' + (kind === 'err' ? ' err' : '');
+    el.innerHTML = '<span class="dot"></span>' + esc(text);
+    toasts.appendChild(el);
+    setTimeout(function() { el.remove(); }, 2600);
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     7. 事件
+     ══════════════════════════════════════════════════════════════ */
+  document.addEventListener('click', function(ev) {
+    const jump = ev.target.closest('[data-jump]');
+    if (jump) { S.page = jump.getAttribute('data-jump'); render(); window.scrollTo({ top:0 }); return; }
+
+    const plat = ev.target.closest('[data-plat]');
+    if (plat) { S.plat = plat.getAttribute('data-plat'); S.q = ''; S.freeOnly = false; render(); return; }
+
+    const el = ev.target.closest('[data-act]');
+    if (!el) return;
+    const act = el.getAttribute('data-act');
+    const agentId = el.getAttribute('data-agent') || S.plat;
+
+    if (act === 'goto-update') {
+      S.page = 'settings';
+      render();
+      setTimeout(function() {
+        const c = document.getElementById('update-card');
+        if (c) c.scrollIntoView({ block: 'center' });
+      }, 30);
+      return;
+    }
+
+    if (act === 'login') { openLogin(agentId); return; }
+
+    if (act === 'tog') {
+      /* 开关是布尔量，没有「输入到一半」的中间态 → 即时落盘 */
+      const key = el.getAttribute('data-key');
+      S.settings[key] = !S.settings[key];
+      render();
+      return;
+    }
+
+    if (act === 'acc-tog') {
+      const accId = el.getAttribute('data-id');
+      const key = el.getAttribute('data-key');
+      const acc = accountsOf(agentId).find(x => x.id === accId);
+      if (acc) acc[key] = !acc[key];
+      render();
+      return;
+    }
+
+    if (act === 'test-account') {
+      const accId = el.getAttribute('data-id');
+      const acc = accountsOf(agentId).find(x => x.id === accId);
+      el.innerHTML = '<span class="spin"></span>';
+      setTimeout(function() {
+        if (acc) { acc.st = 'ok'; acc.note = ''; }
+        render();
+        toast('账号测活成功');
+      }, 700);
+      return;
+    }
+
+    if (act === 'reset-account') {
+      const accId = el.getAttribute('data-id');
+      const acc = accountsOf(agentId).find(x => x.id === accId);
+      if (acc) { acc.st = 'ok'; acc.note = ''; }
+      render(); toast('已重置健康状态');
+      return;
+    }
+
+    if (act === 'logout') {
+      const accId = el.getAttribute('data-id');
+      S.accounts[agentId] = accountsOf(agentId).filter(x => x.id !== accId);
+      render(); toast('已退出该账号');
+      return;
+    }
+
+    if (act === 'probe-all') {
+      el.innerHTML = '<span class="spin"></span>';
+      setTimeout(function() {
+        toast('测活完成：9 个模型里 7 个可用、1 个地区受限、1 个未探测');
+        render();
+      }, 800);
+      return;
+    }
+
+    if (act === 'toggle-models') {
+      S.collapsed[agentId] = !S.collapsed[agentId];
+      render();
+      return;
+    }
+
+    if (act === 'select-all' || act === 'select-none') {
+      const every = act === 'select-all';
+      visibleModels(agentId).forEach(m => { S.sel[m.id] = every; });
+      render();
+      return;
+    }
+
+    if (act === 'save-models') {
+      const n = dirtyCount(agentId);
+      if (!n) return;
+      commitModels(agentId);      // 一次改动 = 一次写盘 + 一次重新发布 provider
+      markSaved();
+      render();
+      toast('已保存 ' + n + ' 项 · 现在生效 ' + savedSelectedCount(agentId) + ' 个模型');
+      return;
+    }
+
+    if (act === 'discard-models') {
+      revertModels(agentId);
+      render();
+      toast('已放弃未保存的改动');
+      return;
+    }
+
+    if (act === 'toggle-model') {
+      const id = el.getAttribute('data-id');
+      S.sel[id] = !isSelected(id);
+      render();
+      return;
+    }
+
+    if (act === 'test-model') {
+      const id = el.getAttribute('data-id');
+      S.testing = id;
+      render();
+      setTimeout(function() {
+        const m = Object.values(MODELS).flat().find(x => x.id === id);
+        if (m) m.st = 'ok';
+        S.testing = null;
+        render();
+        toast('该模型可用（首字 320 ms）');
+      }, 800);
+      return;
+    }
+
+    if (act === 'pull') {
+      S.pulling = true;
+      render();
+      setTimeout(function() {
+        S.pulling = false;
+        S.fetchedAt[agentId] = clock();
+        const list = modelsOf(agentId);
+        list.forEach(m => { if (S.sel[m.id] === undefined) S.sel[m.id] = defaultSetFor(agentId).includes(m.id); });
+        render();
+        toast('已拉取 ' + list.length + ' 个模型 · 已排除 Auto'
+          + (agentId === 'opencode' ? ' · 只保留免费' : ''));
+      }, 850);
+      return;
+    }
+
+    if (act === 'pull-all') {
+      const total = AGENTS.reduce((n, a) => n + modelsOf(a.id).length, 0);
+      AGENTS.forEach(a => { S.fetchedAt[a.id] = clock(); });
+      render();
+      toast('5 个平台共 ' + total + ' 个模型 · 已排除 Auto');
+      return;
+    }
+
+    if (act === 'checkin-now') { toast('签到已排队：3 个账号'); return; }
+    if (act === 'run-tasks') { toast('活动任务已排队：1 个账号'); return; }
+    if (act === 'refresh-quota') { toast('额度已刷新'); return; }
+    if (act === 'reload-logs') { toast('日志已刷新'); return; }
+    if (act === 'clear-logs') { toast('已清空请求日志'); return; }
+    if (act === 'clear-tasklog') { toast('已清空任务流水'); return; }
+    if (act === 'jump-log') { S.page = 'logs'; render(); return; }
+
+    if (act === 'check-update') {
+      S.update.busy = 'check';
+      render();
+      setTimeout(function() {
+        S.update.busy = null;
+        render();
+        toast(S.update.available ? '有新版本 ' + S.update.latest : '已是最新版本');
+      }, 900);
+      return;
+    }
+    if (act === 'apply-update') {
+      S.update.busy = 'apply';
+      render();
+      setTimeout(function() {
+        S.update.busy = null;
+        S.update.available = false;
+        S.update.current = S.update.latest;
+        render();
+        toast('已更新到 ' + S.update.current + '，重启宿主后生效');
+      }, 1400);
+      return;
+    }
+
+    if (act === 'save') { S.dirty = 0; render(); toast('配置已保存'); return; }
+    if (act === 'discard') { S.dirty = 0; render(); toast('已放弃改动'); return; }
+  });
+
+  // 搜索框：只重绘模型列表，保留输入焦点
+  document.addEventListener('input', function(ev) {
+    const t = ev.target;
+    if (t.getAttribute('data-role') === 'q') {
+      S.q = t.value;
+      const box = t;
+      const pos = box.selectionStart;
+      render();
+      const again = document.querySelector('[data-role="q"]');
+      if (again) { again.focus(); again.setSelectionRange(pos, pos); }
+      return;
+    }
+    if (t.getAttribute('data-role') === 'ctx') {
+      const id = t.getAttribute('data-id');
+      S.ctx[id] = t.value.replace(/[^\d]/g, '');
+    }
+  });
+  document.addEventListener('change', function(ev) {
+    const t = ev.target;
+    if (t.getAttribute('data-act') === 'free-only') { S.freeOnly = t.checked; render(); return; }
+    if (t.getAttribute('data-role') === 'ctx') {
+      const id = t.getAttribute('data-id');
+      const v = S.ctx[id];
+      if (v === '' || v === undefined) delete S.ctx[id]; else S.ctx[id] = String(Number(v) || '');
+      render();
+      toast(v ? '上下文长度改为 ' + num(Number(v)) + '（记得点保存）' : '已清空覆盖值（记得点保存）');
+      return;
+    }
+    const key = t.getAttribute('data-set');
+    if (key) { S.settings[key] = isNaN(Number(t.value)) ? t.value : Number(t.value); S.dirty++; render(); }
+  });
+
+  document.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Escape' && S.modal) { modalAct('cancel'); }
+  });
+
+  /* ══════════════════════════════════════════════════════════════
+     8. 启动 / 深链 / 自测
+     ══════════════════════════════════════════════════════════════ */
+  const Q = new URLSearchParams(location.search);
+  if (Q.get('page')) S.page = Q.get('page');
+  if (Q.get('plat')) S.plat = Q.get('plat');
+  if (Q.get('q')) S.q = Q.get('q');
+  if (Q.get('saved')) S.lastSaved = Q.get('saved');
+  if (Q.get('uncheck')) Q.get('uncheck').split(',').forEach(function(id) { S.sel[id] = false; });
+  if (Q.get('collapsed')) S.collapsed[Q.get('collapsed')] = true;
+
+  // 原型外壳的跳转按钮高亮
+  function syncProtoBar() {
+    document.querySelectorAll('.proto-bar [data-jump]').forEach(function(b) {
+      b.setAttribute('aria-pressed', String(b.getAttribute('data-jump') === S.page));
+    });
+  }
+  const origRender = render;
+  render = function() { origRender(); syncProtoBar(); };
+
+  render();
+
+  if (Q.get('open') === 'login') {
+    openLogin(Q.get('agent') || 'workbuddy');
+    setTimeout(function() { if (S.modal) modalAct('open'); }, 1000);
+  }
+
+  if (Q.get('selftest')) {
+    const log = [];
+    const step = function(fn, ms) { setTimeout(fn, ms); };
+    step(function() { S.page = 'accounts'; S.plat = 'workbuddy'; render(); log.push('page=' + S.page); }, 60);
+    step(function() {
+      log.push('sel=' + selectedCount('workbuddy') + '/' + modelsOf('workbuddy').length);
+      log.push('autoHidden=' + !modelsOf('workbuddy').some(m => AUTO_IDS.has(m.id)));
+      log.push('rows=' + document.querySelectorAll('.mrow').length);
+      log.push('groupHeaders=' + document.querySelectorAll('.mghead').length);
+    }, 160);
+    step(function() {
+      const cb = document.querySelector('[data-act="toggle-model"]');
+      if (cb) cb.click();
+      log.push('draft=' + selectedCount('workbuddy') + ' live=' + savedSelectedCount('workbuddy')
+        + ' dirty=' + dirtyCount('workbuddy'));
+      const save = document.querySelector('[data-act="save-models"]');
+      if (save) save.click();
+      log.push('afterSave live=' + savedSelectedCount('workbuddy') + ' dirty=' + dirtyCount('workbuddy'));
+      S.page = 'accounts'; S.plat = 'opencode'; render();
+      log.push('oc=' + selectedCount('opencode') + '/' + modelsOf('opencode').length);
+    }, 260);
+    step(function() { openLogin('workbuddy'); }, 340);
+    step(function() {
+      log.push('modal=' + (S.modal && S.modal.phase));
+      modalAct('open');
+      log.push('browser=' + fbBrowser.classList.contains('on'));
+    }, 1300);
+    step(function() {
+      const b = fbBrowser.querySelector('[data-fb="ok"]');
+      if (b) b.click();
+      log.push('auth=' + S.auth);
+    }, 1500);
+    step(function() {
+      log.push('modal2=' + (S.modal && S.modal.phase));
+      modalAct('refresh');
+    }, 1900);
+    step(function() {
+      log.push('final=' + (S.modal && S.modal.phase));
+      log.push('accts=' + accountsOf('workbuddy').length);
+      document.body.setAttribute('data-selftest', log.join(' | '));
+      const d = document.createElement('div');
+      d.id = 'selftest'; d.textContent = log.join(' | ');
+      document.body.appendChild(d);
+    }, 3000);
+  }
+})();
+</script>
+</body>
+</html>

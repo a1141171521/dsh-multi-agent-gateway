@@ -161,25 +161,31 @@ OpenCode 官方**不给「积分倍率」**，给的是**每百万 token 的美�
 （OpenCode → Qoder → Qoder CN → Trae → WorkBuddy → WorkBuddy International）。
 DSH 自己会把 `deepseek-account` / `deepseek-official` 排到最前面，其余保持注册顺序。
 
-## 6.5 只上报我勾选的模型（默认就不是「全部」）
+## 6.5 只上报我勾选的模型（默认一个都不报）
 
 上游 OpenCode 目录实测 **85 个模型**，全塞进 DSH 的模型下拉里，免费的那几个会被彻底淹没。
-所以每个 Agent 都有一份**上报策略**（设置页里就是那三个按钮 + 勾选列表）：
+所以每个 Agent 都有一份**上报策略**：
 
 | `models.mode` | 行为 | 什么时候用 |
 |---|---|---|
-| `free`（**默认**） | 只上报 `free === true` 的模型 | 匿名免费层 —— 这就是这个插件的主场景 |
-| `selected` | 只上报勾选列表里的 id | 你有 key，只想用其中几个 |
-| `all` | 全部上报（旧行为） | 你要挑付费模型 |
+| `selected`（**默认**） | 只上报勾选列表里的 id；列表为空 = **一个都不报** | 你想精确控制下拉里有什么 |
+| `free` | 只上报 `free === true` 的模型 | 匿名免费层，懒得一个个勾 |
+| `all` | 全部上报 | 你要挑付费模型 |
+
+> 默认从 `free` 改成 `selected` 是因为「没配过的平台会自己冒出模型」—— 用户明确要求
+> **勾了并保存才出现**。旧配置里显式写了 `mode: free` 的仍然按 free 走。
 
 ```yaml
 agents:
   opencode:
     exposeModels: true          # 总开关：关掉 = 一个都不上报
     models:
-      mode: free                # free | selected | all
+      mode: selected            # selected | free | all
       selected: "gpt-5.4,deepseek-v4.1-flash-free"   # 逗号或换行分隔
 ```
+
+界面上：模型卡片里勾选 → 点「保存并生效」→ 选择器才更新；一个都没勾时有个
+「按推荐预选 N 个」按钮（opencode 推免费、其它平台推全部），点了仍然要保存。
 
 **两条路径是分开的，这是刻意的：**
 

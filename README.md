@@ -6,7 +6,33 @@
 活动任务自动执行、多账号智能路由；同时把各平台的模型**按 Agent 分组**上报到 DSH
 对话框的**原生模型选择器**，并在每个模型名后标注**积分消耗倍率**。
 
-不是独立 Nginx，也不是外部代理进程 —— 请求全部在插件内部转发，账号凭证加密存在本机。
+不是独立 Nginx，也不是外部代理进程 —— 请求全部在插件内部转发，账号凭证只存在本机。
+
+## 界面：五页 + 浏览器登录
+
+设置页现在是**独立一页**（设置 → 多 Agent 网关），内部按「你此刻要回答的问题」分五页：
+
+| 页 | 回答什么问题 |
+|---|---|
+| **总览** | 现在健康吗？刚才那条花了多少？ |
+| **账号** | 这个平台有哪些账号 / 模型？ |
+| **任务** | 签到和活动任务跑得怎么样？ |
+| **日志** | 刚才那次为什么失败？ |
+| **设置** | 那些不常动的东西（含版本更新） |
+
+**添加账号不用手抄 token**：账号页点「打开登录页」→ 浏览器里完成平台登录 → 回来点
+「刷新登录状态」→ 插件自己去换 token 并建账号（token 不经过浏览器，加密落盘）。
+
+| 平台 | 登录形态 |
+|---|---|
+| OpenCode | 设备码（显示 user_code，前端自动轮询） |
+| WorkBuddy / 国际版 | 外链（`auth/state` → 打开登录页 → `auth/token?state=`） |
+| Qoder / Qoder CN | 设备码 + PKCE |
+
+> 外链形态**不自动轮询** —— 用户可能在浏览器里待几分钟，后台一直打上游纯属浪费。
+
+**模型表**按「免费 → 厂商 → 倍率」排序，默认勾选免费模型（没有免费就全不勾），
+每行可单独改上下文长度、可单独「测一次」，状态列显示 可用 / 地区受限 / 不可用 / 未探测。
 
 ## 💬 DeepSeek Harness 插件交流群
 
@@ -104,6 +130,8 @@ dsh plugin --profile desktop add D:\AI\DeepseekPlugin\dsh-multi-agent-gateway
 | [`docs/OPENCODE-API.md`](docs/OPENCODE-API.md) | OpenCode 上游的真实接口事实（含核对过的端点表） |
 | [`docs/EXTENDING.md`](docs/EXTENDING.md) | **新增一个 Agent 适配器要写什么**（含完整模板） |
 | [`docs/ERROR-HANDLING.md`](docs/ERROR-HANDLING.md) | 账号降级、重试规则、任务失败与熔断 |
+| [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md) | **已知问题 / 待修清单**（含验证步骤与排查顺序） |
+| [`docs/NEXT-PHASE.md`](docs/NEXT-PHASE.md) | 本期刻意没做的功能，以及做它们需要的条件 |
 
 ## 架构（分层模块化）
 
@@ -158,7 +186,7 @@ node test/live-opencode.mjs # 真机管线：打真实 OpenCode 目录核倍率�
 |---|---|
 | `node scripts/build.mjs` | 26 个 TS 文件 → `lib/`，零不可擦除语法 |
 | 单元测试 | **72/72** 通过 |
-| 客户端契约测试 | **15/15** 通过（端点、描述符、volatile 路径、真 `apply(ctx)`、**无参端点零参数**、真渲染 ModelList） |
+| 客户端契约测试 | **24/24** 通过（端点、描述符、volatile 路径、真 `apply(ctx)`、**无参端点零参数**、真渲染 ModelList） |
 | 假宿主冒烟 | 通过（provider 路由 / 5 个工具 / **模型上报策略真的改变选择器内容** / 密文落盘） |
 | **真机免费层**（`npm run test:free`，联网） | **空凭证账号 → 200 → 正文「收到」+ 思维链 + usage，全程零 key** |
 | 真机管线（`npm run test:live`，联网） | 真实模型目录 + 倍率；设备码登录实测发起成功、未授权正确返回 `pending` |

@@ -149,8 +149,7 @@ export class JsonlLog {
   }
 
   /** 读最近 n 条（新的在后）。 */
-  tail(count = 100): unknown[] {
-    try {
+  tail(count = 100): unknown[] {    try {
       const raw = readFileSync(this.path, 'utf8')
       const all = raw.split('\n').filter((line) => line.trim() !== '')
       const slice = all.slice(Math.max(0, all.length - count))
@@ -165,6 +164,18 @@ export class JsonlLog {
       return out
     } catch {
       return []
+    }
+  }
+
+  /** 清空文件（行数计数归零）。 */
+  clear(): void {
+    try {
+      mkdirSync(dirname(this.path), { recursive: true })
+      writeFileSync(this.path, '', 'utf8')
+      this.lines = 0
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.log?.warn(`日志清空失败：${this.path}`, message)
     }
   }
 

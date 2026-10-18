@@ -527,6 +527,14 @@ export interface ResolvedAgentConfig {
   id: string
   name: string
   enabled: boolean
+  /**
+   * 是否在设置页里**露出**这个平台。
+   *
+   * 与 `enabled` 是两件事：`enabled=false` 是「用户关掉了」，
+   * `visible=false` 是「这一期还没做，先别让用户看见」。
+   * 隐藏的平台既不注册 provider，也不出现在模型选择器里。
+   */
+  visible: boolean
   /** 是否把该 Agent 的模型上报给 DSH 模型选择器。 */
   exposeModels: boolean
   /** 模型名是否带 `<Agent> · ` 前缀（任务书要求的 `OpenCode · DeepSeek-R1 (×2)` 形态）。 */

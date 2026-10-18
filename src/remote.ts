@@ -68,6 +68,18 @@ export const REMOTE_ENDPOINTS = Object.freeze({
   loginPoll: `${REMOTE_NAMESPACE}/loginPoll`,
   /** 取消一次登录会话。 */
   loginCancel: `${REMOTE_NAMESPACE}/loginCancel`,
+  /** 对某个平台的模型跑一轮可用性探测（返回逐模型结论）。 */
+  probeModels: `${REMOTE_NAMESPACE}/probeModels`,
+  /** 分页读请求日志（新的在前）。 */
+  requestLog: `${REMOTE_NAMESPACE}/requestLog`,
+  /** 请求汇总（总览页 KPI / 最近一回合）。 */
+  requestSummary: `${REMOTE_NAMESPACE}/requestSummary`,
+  /** 清空请求日志。 */
+  clearRequestLog: `${REMOTE_NAMESPACE}/clearRequestLog`,
+  /** 检查插件版本更新（git 远端）。 */
+  updateStatus: `${REMOTE_NAMESPACE}/updateStatus`,
+  /** 一键更新（`git pull --ff-only`）。 */
+  updateApply: `${REMOTE_NAMESPACE}/updateApply`,
 })
 
 /** 客户端页面要的方法集合（宿主要一一实现）。 */
@@ -91,6 +103,12 @@ export interface RemoteImplementation {
   loginStart(input: Record<string, unknown>): Promise<unknown> | unknown
   loginPoll(input: Record<string, unknown>): Promise<unknown> | unknown
   loginCancel(input: Record<string, unknown>): Promise<unknown> | unknown
+  probeModels(input: Record<string, unknown>): Promise<unknown> | unknown
+  requestLog(input: { limit?: number; offset?: number }): Promise<unknown> | unknown
+  requestSummary(input: Record<string, unknown>): Promise<unknown> | unknown
+  clearRequestLog(input: Record<string, unknown>): Promise<unknown> | unknown
+  updateStatus(input: Record<string, unknown>): Promise<unknown> | unknown
+  updateApply(input: Record<string, unknown>): Promise<unknown> | unknown
 }
 
 /** 造一个 strict codec（`create().parse(value)` 会在**宿主**解码参数时真的被调用）。 */
@@ -151,6 +169,12 @@ export function remoteDescriptors(): Array<Record<string, unknown>> {
     withInput('loginStart'),
     withInput('loginPoll'),
     withInput('loginCancel'),
+    withInput('probeModels'),
+    withInput('requestLog'),
+    withInput('requestSummary'),
+    withInput('clearRequestLog'),
+    withInput('updateStatus'),
+    withInput('updateApply'),
   ]
 }
 

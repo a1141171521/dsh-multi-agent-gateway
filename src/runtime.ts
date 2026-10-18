@@ -16,7 +16,10 @@
 import { AccountManager, freshHealth, type AccountDraft, type AccountPatch, type PersistedState } from './core/accounts.js'
 import { MemoryCache, TokenBucket } from './core/cache.js'
 import { createHttp } from './core/http.js'
-import { JsonlLog, DebouncedWriter, readJsonSafe } from './core/store.js'
+import { JsonlLog, DebouncedWriter, readJsonSafe, writeJsonAtomic } from './core/store.js'
+import { checkUpdate, applyUpdate, type UpdateResult, type UpdateStatus } from './core/updater.js'
+import type { LoginPollResult, LoginStartResult } from './core/login.js'
+import { fileURLToPath } from 'node:url'
 import { AccountRouter } from './core/router.js'
 import { Scheduler } from './core/scheduler.js'
 import { TaskEngine } from './core/tasks.js'
@@ -30,12 +33,22 @@ import type {
   AccountRecord,
   AdapterContext,
   AgentAdapter,
+  ChatRequest,
   Logger,
   ModelMeta,
   QuotaSnapshot,
   ResolvedConfig,
+  StreamEvent,
   TaskRecord,
 } from './core/types.js'
+import { RequestLog, type RequestSummary } from './core/request-log.js'
+import {
+  PROBE_DEFAULTS,
+  mergeProbeCache,
+  runProbeBatch,
+  type ModelProbeResult,
+  type ProbeAttempt,
+} from './core/probe.js'
 
 /** 建 runtime 的依赖。 */
 export interface RuntimeOptions {
@@ -79,6 +92,20 @@ export class GatewayRuntime {
   readonly tasks: TaskEngine
   /** 任务流水（JSONL）。 */
   readonly taskLogStore: JsonlLog
+  /** 逐请求采样（日志页 + 总览 KPI 的数据源）。 */
+  readonly requestLog: RequestLog
+  /** 模型可用性探测的缓存：`modelId → 结论`。 */
+  private probes: Record<string, ModelProbeResult> = {}
+  private readonly probePath: string
+  /** 同一时刻只允许一轮探测（两轮并发只会把上游打成 429）。 */
+  private probing = false
+  /**
+   * 插件自身的安装目录（`lib/runtime.js` 的上一级）。
+   *
+   * git 更新只在这里跑：不碰数据目录，也不接受调用方传入路径 ——
+   * 让界面能指定目录等于给了一个任意 git 操作的入口。
+   */
+  private readonly pluginDir = fileURLToPath(new URL('..', import.meta.url))
   /** 每个账号一个令牌桶（防上游风控）。 */
   private readonly buckets = new Map<string, TokenBucket>()
   /** 适配器上下文（每个 Agent 一份，缓存的持有者）。 */
@@ -146,6 +173,12 @@ export class GatewayRuntime {
     this.registry.registerAll(options.adapters ?? [])
     this.router = new AccountRouter(this.accounts, options.config.gateway, this.logger.child('router'))
     this.taskLogStore = new JsonlLog(`${options.config.dataDir}/task-log.jsonl`, 4000, this.logger.child('tasks'))
+    this.requestLog = new RequestLog(`${options.config.dataDir}/requests.jsonl`, {
+      maxEntries: 2000,
+      log: this.logger.child('requests'),
+    })
+    this.probePath = `${options.config.dataDir}/probes.json`
+    this.probes = readJsonSafe<Record<string, ModelProbeResult>>(this.probePath, {}, this.logger.child('probe'))
     this.tasks = new TaskEngine({
       accounts: this.accounts,
       log: this.logger.child('tasks'),
@@ -220,12 +253,39 @@ export class GatewayRuntime {
    */
   async loginStart(agentId: string, label?: string): Promise<Record<string, unknown>> {
     const adapter = this.registry.get(agentId) as
-      | (AgentAdapter & { startDeviceLogin?: (ctx: AdapterContext) => Promise<unknown> })
+      | (AgentAdapter & {
+          startDeviceLogin?: (ctx: AdapterContext) => Promise<unknown>
+          beginLogin?: (ctx: AdapterContext) => Promise<LoginStartResult>
+        })
       | undefined
     const ctx = this.contextOf(agentId)
     if (adapter === undefined || ctx === undefined) throw new Error(`适配器未装载：${agentId}`)
+    const defaultLabel = label !== undefined && label.trim() !== '' ? label.trim() : `${this.agentConfig(agentId).name} 账号`
+    const loginId = `login-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+
+    // ① 通用形态（浏览器打开链接 → 用户登录 → 用户点「刷新登录状态」问一次）
+    if (typeof adapter.beginLogin === 'function') {
+      const start = await adapter.beginLogin(ctx)
+      this.loginSessions.set(loginId, {
+        agentId,
+        mode: 'generic',
+        state: start.state,
+        expiresAt: Date.now() + start.expiresInSec * 1000,
+        label: defaultLabel,
+        intervalSec: 0,
+      } as never)
+      this.logger.info(`[${agentId}] 已生成登录链接`, `请打开 ${start.authUrl}`)
+      return {
+        loginId,
+        authUrl: start.authUrl,
+        ...(start.userCode === undefined ? {} : { userCode: start.userCode }),
+        expiresInSec: start.expiresInSec,
+      }
+    }
+
+    // ② 设备码形态（OpenCode）
     if (typeof adapter.startDeviceLogin !== 'function') {
-      throw new Error(`「${adapter.name}」适配器没有实现设备码登录`)
+      throw new Error(`「${adapter.name}」适配器没有实现登录`)
     }
     const start = (await adapter.startDeviceLogin(ctx)) as {
       deviceCode: string
@@ -234,12 +294,11 @@ export class GatewayRuntime {
       expiresInSec: number
       intervalSec: number
     }
-    const loginId = `login-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     this.loginSessions.set(loginId, {
       agentId,
       deviceCode: start.deviceCode,
       expiresAt: Date.now() + start.expiresInSec * 1000,
-      label: label !== undefined && label.trim() !== '' ? label.trim() : `${this.agentConfig(agentId).name} 账号`,
+      label: defaultLabel,
       intervalSec: start.intervalSec,
     })
     this.logger.info(`[${agentId}] 已发起设备码登录`, `请打开 ${start.verificationUrl}`)
@@ -250,6 +309,25 @@ export class GatewayRuntime {
       expiresInSec: start.expiresInSec,
       intervalSec: start.intervalSec,
     }
+  }
+
+  /** 登录成功后的统一落盘：同名标签就换凭证，否则新建。 */
+  private persistLogin(
+    agentId: string,
+    label: string,
+    credentials: AccountCredentials,
+  ): { created: boolean; record: AccountRecord } {
+    let record: AccountRecord | undefined = this.accounts.byAgent(agentId).find((item) => item.label === label)
+    let created = false
+    if (record === undefined) {
+      record = this.accounts.add({ agentId, label, credentials })
+      created = true
+    } else {
+      record = this.accounts.setCredentials(record.id, { ...record.credentials, ...credentials })
+    }
+    this.refreshSchedule()
+    this.accounts.persistState()
+    return { created, record }
   }
 
   /**
@@ -266,6 +344,37 @@ export class GatewayRuntime {
       this.loginSessions.delete(loginId)
       return { status: 'expired', message: '设备码已过期（10 分钟），请重新发起登录' }
     }
+    const generic = session as unknown as { mode?: string; state?: unknown; label: string }
+    if (generic.mode === 'generic') {
+      const genericAdapter = this.registry.get(session.agentId) as
+        | (AgentAdapter & { pollLogin?: (state: unknown, ctx: AdapterContext) => Promise<LoginPollResult> })
+        | undefined
+      const genericCtx = this.contextOf(session.agentId)
+      if (genericAdapter === undefined || genericCtx === undefined || typeof genericAdapter.pollLogin !== 'function') {
+        this.loginSessions.delete(loginId)
+        return { status: 'failed', message: '适配器已卸载' }
+      }
+      let outcome: LoginPollResult
+      try {
+        outcome = await genericAdapter.pollLogin(generic.state, genericCtx)
+      } catch (error) {
+        return { status: 'failed', message: error instanceof Error ? error.message : String(error) }
+      }
+      if (outcome.status !== 'ready') {
+        if (outcome.status === 'expired' || outcome.status === 'failed') this.loginSessions.delete(loginId)
+        return { status: outcome.status, message: outcome.message ?? '' }
+      }
+      this.loginSessions.delete(loginId)
+      const label = outcome.label !== undefined && outcome.label !== '' ? outcome.label : generic.label
+      const { created, record } = this.persistLogin(session.agentId, label, outcome.credentials ?? { token: '' })
+      this.logger.info(`${created ? '已登录并新增账号' : '已更新已有账号'}：${record.id}`)
+      return {
+        status: 'ready',
+        message: created ? `登录成功，已新增账号「${label}」` : `登录成功，已更新账号「${label}」`,
+        account: this.publicAccount(record),
+      }
+    }
+
     const adapter = this.registry.get(session.agentId) as
       | (AgentAdapter & { pollDeviceLogin?: (code: string, ctx: AdapterContext) => Promise<unknown> })
       | undefined
@@ -306,16 +415,7 @@ export class GatewayRuntime {
       ...(outcome.account === undefined ? {} : { account: outcome.account }),
       authKind: 'oauth-device',
     }
-    let record = this.accounts.byAgent(session.agentId).find((item) => item.label === label)
-    let created = false
-    if (record === undefined) {
-      record = this.accounts.add({ agentId: session.agentId, label, credentials })
-      created = true
-    } else {
-      record = this.accounts.setCredentials(record.id, { ...record.credentials, ...credentials })
-    }
-    this.refreshSchedule()
-    this.accounts.persistState()
+    const { created, record } = this.persistLogin(session.agentId, label, credentials)
     this.logger.info(
       `${created ? '已登录并新增账号' : '已更新已有账号'}：${record.id}`,
       `账号=${label}${outcome.orgId === undefined ? '' : ` 工作区=${outcome.orgId}`}`,
@@ -337,11 +437,17 @@ export class GatewayRuntime {
     return this.loginSessions.size
   }
 
-  /** 该 Agent 是否要参与（配置启用 + 注册表里有实现）。 */
+  /**
+   * 该 Agent 是否要参与（注册表里有实现 + 已启用 + **这一期露出**）。
+   *
+   * `visible=false` 的平台（Qoder / Trae 等）与「用户关掉」效果一致：
+   * 不注册 provider、不进模型选择器。区别只在于设置页也不显示它。
+   */
   isAgentActive(agentId: string): boolean {
     const adapter = this.registry.get(agentId)
     if (adapter === undefined) return false
-    return this.agentConfig(agentId).enabled
+    const config = this.agentConfig(agentId)
+    return config.enabled && config.visible
   }
 
   /** 全部「要上报给 DSH 模型选择器」的 Agent（**顺序就是分组顺序**）。 */
@@ -787,6 +893,161 @@ export class GatewayRuntime {
     return redactDeep(this.tasks.recent(count)) as unknown[]
   }
 
+  // ───────────────────────── 请求日志 / 模型探测 ─────────────────────────
+
+  /** 分页读请求日志（新的在前）。 */
+  requestLogPage(options: { limit?: number; offset?: number } = {}): { total: number; entries: unknown[] } {
+    const page = this.requestLog.list(options)
+    return { total: page.total, entries: redactDeep(page.entries) as unknown[] }
+  }
+
+  /** 请求汇总（总览页 KPI）。 */
+  requestSummary(): RequestSummary {
+    return this.requestLog.summary()
+  }
+
+  /** 清空请求日志。 */
+  clearRequestLog(): { ok: boolean } {
+    this.requestLog.clear()
+    return { ok: true }
+  }
+
+  // ───────────────────────── 版本更新 ─────────────────────────
+
+  /** 检查有没有新版本（只读；不动工作区）。 */
+  async updateStatus(): Promise<UpdateStatus> {
+    return checkUpdate(this.pluginDir)
+  }
+
+  /**
+   * 一键更新（`git pull --ff-only`）。
+   *
+   * 成功后**必须重启 DSH** 才生效：宿主在启动时加载 `lib/`，换掉磁盘上的文件
+   * 不会让已经加载的模块重新执行。
+   */
+  async updateApply(): Promise<UpdateResult & { restartRequired: boolean }> {
+    const result = await applyUpdate(this.pluginDir)
+    if (result.ok && result.from !== result.to) {
+      this.ring.push({
+        at: Date.now(),
+        level: 'info',
+        scope: 'update',
+        message: `插件已更新：${result.from} → ${result.to}`,
+        detail: '需要重启 DSH 才生效',
+      })
+    }
+    return { ...result, restartRequired: result.ok && result.from !== result.to }
+  }
+
+  /** 某个模型的探测结论（没有就是 undefined）。 */
+  probeOf(modelId: string): ModelProbeResult | undefined {
+    return this.probes[modelId]
+  }
+
+  /** 全部探测结论的只读快照。 */
+  probeSnapshot(): Readonly<Record<string, ModelProbeResult>> {
+    return this.probes
+  }
+
+  /**
+   * 对某个 Agent 的模型跑一轮可用性探测。
+   *
+   * 每个模型发一次**极小**的真实请求（8 token、不带工具），只等首帧。
+   * 结论按模型缓存到 `probes.json`，界面上标成徽章。
+   *
+   * `ids` 省略 = 探测该 Agent 当前上报的全部模型。
+   */
+  async probeModels(agentId: string, options: { ids?: string[]; force?: boolean } = {}): Promise<{
+    ok: boolean
+    probed: number
+    results: ModelProbeResult[]
+    error?: string
+  }> {
+    if (this.probing) return { ok: false, probed: 0, results: [], error: '已有一轮探测在进行中' }
+    const adapter = this.registry.get(agentId)
+    if (adapter === undefined) return { ok: false, probed: 0, results: [], error: `没有 ${agentId} 的适配器` }
+
+    const { usable, penalized } = this.router.candidates(agentId)
+    const record = usable[0] ?? penalized[0]
+    if (record === undefined) return { ok: false, probed: 0, results: [], error: `${agentId} 下没有可用账号` }
+
+    const all = await this.modelsOf(agentId, options.force === true)
+    const wanted = options.ids === undefined ? all.map((meta) => meta.id) : options.ids
+    const known = new Set(all.map((meta) => meta.id))
+    const ids = wanted.filter((id) => known.has(id))
+    if (ids.length === 0) return { ok: true, probed: 0, results: [] }
+
+    const context = this.contextOf(agentId)
+    this.probing = true
+    try {
+      const results = await runProbeBatch(ids, (modelId) => this.attemptProbe(adapter, record, context, modelId), {
+        concurrency: PROBE_DEFAULTS.concurrency,
+      })
+      this.probes = mergeProbeCache(this.probes, results)
+      try {
+        writeJsonAtomic(this.probePath, this.probes)
+      } catch (error) {
+        this.logger.warn('探测结果落盘失败', error instanceof Error ? error.message : String(error))
+      }
+      this.ring.push({
+        at: Date.now(),
+        level: 'info',
+        scope: 'probe',
+        message: `${this.agentConfig(agentId).name} 模型探测完成`,
+        detail: results.map((item) => `${item.modelId}=${item.status}`).join(' '),
+      })
+      return { ok: true, probed: results.length, results }
+    } finally {
+      this.probing = false
+    }
+  }
+
+  /**
+   * 探测单个模型：发一个 8 token 的流式请求，等到第一段内容或 finish 就收手。
+   *
+   * 只等首帧而不是等整段生成 —— 探测要回答的是「这个模型对本地放不放行」，
+   * 不是「它写得好不好」。
+   */
+  private async attemptProbe(
+    adapter: AgentAdapter,
+    record: AccountRecord,
+    context: AdapterContext,
+    modelId: string,
+  ): Promise<ProbeAttempt> {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), PROBE_DEFAULTS.timeoutMs)
+    const started = Date.now()
+    let ttftMs: number | undefined
+    const payload: ChatRequest = {
+      model: modelId,
+      messages: [{ role: 'user', content: 'ping' }],
+      stream: true,
+      max_tokens: 8,
+    }
+    try {
+      for await (const event of adapter.requestChatStream(payload, record, context, controller.signal) as AsyncIterable<StreamEvent>) {
+        if (event.type === 'text' || event.type === 'reasoning' || event.type === 'tool_call') {
+          if (ttftMs === undefined) ttftMs = Date.now() - started
+          break
+        }
+        if (event.type === 'error') {
+          const failure = event.failure
+          const status = typeof failure.status === 'number' ? failure.status : undefined
+          return { status, text: failure.message ?? '', error: failure.message, ...(ttftMs === undefined ? {} : { ttftMs }) }
+        }
+        if (event.type === 'finish') break
+      }
+      // 走到这里说明拿到过内容（或上游正常收尾）—— 只要没抛错就算放行
+      return { status: 200, text: 'ok', ...(ttftMs === undefined ? {} : { ttftMs }) }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // 超时是 abort 触发的，归到「网络层没答复」而不是模型坏了
+      return { error: message }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   // ───────────────────────── 账号（写操作） ─────────────────────────
 
   /** 新增账号（返回脱敏对象）。 */
@@ -940,6 +1201,8 @@ export class GatewayRuntime {
         name: config.name,
         implemented: adapter !== undefined && (adapter as AgentAdapter & { implemented?: boolean }).implemented === true,
         enabled: this.isAgentActive(agentId),
+        /** 这一期是否露出（隐藏的平台设置页不显示）。 */
+        visible: config.visible,
         exposeModels: config.exposeModels,
         labelWithAgent: config.labelWithAgent,
         capabilities: adapter?.capabilities ?? null,
@@ -950,6 +1213,18 @@ export class GatewayRuntime {
         modelCount: (() => {
           const cached = this.modelCache.get<ModelMeta[]>(`models:${agentId}`)
           return cached === undefined ? null : cached.length
+        })(),
+        /**
+         * **实际会进 DSH 选择器**的模型数（= 上游拉回来的 ∩ 上报策略）。
+         *
+         * 与 `modelCount` 分开是有意的：拉回来 85 个但只上报 2 个时，界面上
+         * 「进选择器的模型」必须显示 2 —— 早期两个地方都读 `modelCount`，
+         * 于是用户看到「22 个模型进选择器」，而下拉里空空如也。
+         */
+        exposedCount: (() => {
+          if (config.exposeModels !== true) return 0
+          const cached = this.modelCache.get<ModelMeta[]>(`models:${agentId}`)
+          return cached === undefined ? null : selectExposedModels(cached, config.models).length
         })(),
         docs: adapter !== undefined && 'doc' in adapter ? (adapter as { doc?: string }).doc ?? null : null,
         credentialHint:
@@ -968,6 +1243,8 @@ export class GatewayRuntime {
         state: this.accounts.statePath,
         key: this.accounts.keyPath,
         taskLog: `${this.config.dataDir}/task-log.jsonl`,
+        requests: `${this.config.dataDir}/requests.jsonl`,
+        probes: this.probePath,
       },
       gateway: this.config.gateway,
       routing: this.snapshotRouting(),

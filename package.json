@@ -45,7 +45,10 @@
     "test:smoke": "node test/smoke.mjs",
     "test:live": "node test/live-opencode.mjs",
     "test:free": "node test/live-freetier.mjs",
-    "test:demo": "node test/demo-pipeline.mjs"
+    "test:demo": "node test/demo-pipeline.mjs",
+    "test:login": "node test/live-login.mjs",
+    "test:e2e": "node test/e2e-login.mjs",
+    "test:login:opencode": "node test/live-login-opencode.mjs"
   },
   "dsh": {
     "manifestVersion": 1,
