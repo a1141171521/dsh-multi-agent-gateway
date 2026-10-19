@@ -224,7 +224,13 @@
     padding:9px 13px;background:var(--bg-layer-1);border:1px solid var(--border-l1);
     border-radius:var(--r);box-shadow:0 4px 14px rgba(9,12,18,.07)}
 
-  /* ── 登录弹框（已确认的那套） ── */
+  /* ── 登录弹框（已确认的那套） ──
+     2026-10-19 补充：真实界面按 KNOWN-ISSUES #0e 又收紧了一版 ——
+     弹框 520px、主按钮整行、设备码单独成块（大字 + 独立复制）、
+     状态卡带「剩余 m:ss + 进度条」。
+     ⚠️ 下面 `.modal-root.with-browser` 的**左移不要抄**（#0h）：
+     真机是全屏窗口，左移 6% 看起来就是弹框跑偏了，实现里已改成永远居中。
+     原型这里仍保留旧排布，仅作交互参考；要照着改 UI 请以 #0e / #0h 为准。 */
   .modal-root{position:fixed;inset:0;z-index:100;display:none;align-items:center;justify-content:center;
     padding:20px;background:var(--bg-overlay)}
   .modal-root.on{display:flex}

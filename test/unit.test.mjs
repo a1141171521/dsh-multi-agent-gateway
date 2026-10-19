@@ -13,12 +13,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { classify, flattenBody, parseRetryAfter, failureOf } from '../lib/core/errors.js'
+import { utc8DateString, utc8Hour, hasQoderCampaignRefreshedToday } from '../lib/core/time.js'
+import { checkInKey, taskKey } from '../lib/core/tasks.js'
 import { redactSecret, redactDeep, CredentialVault } from '../lib/core/crypto.js'
 import { MemoryCache, TokenBucket, Semaphore } from '../lib/core/cache.js'
 import { SseDecoder, translateChunk, normalizeUsage, isParseableJson } from '../lib/core/sse.js'
 import { parseSchedule, matches, isDue } from '../lib/core/scheduler.js'
 import { AccountManager } from '../lib/core/accounts.js'
-import { AccountRouter } from '../lib/core/router.js'
+import { AccountRouter, penaltyMsFor, RETRY_AFTER_CAP_MS, QUOTA_COOLDOWN_MS, AUTH_COOLDOWN_MS } from '../lib/core/router.js'
 import { formatMultiplier, shouldSwitchAccount, isRetryable, selectExposedModels } from '../lib/core/types.js'
 import {
   vendorOf,
@@ -71,6 +73,7 @@ import {
   createLlmAdapter,
 } from '../lib/llm/adapter.js'
 import { builtinAdapters } from '../lib/adapters/index.js'
+import { SKELETON_IDS } from '../lib/adapters/skeletons.js'
 
 const silent = {
   debug() {},
@@ -135,6 +138,127 @@ test('parseRetryAfter 认秒数与 HTTP-date', () => {
   const at = new Date(60_000).toUTCString()
   assert.equal(parseRetryAfter(new Headers({ 'retry-after': at }), 1000), 59_000)
   assert.equal(parseRetryAfter(new Headers(), 0), undefined)
+})
+
+/**
+ * 畸形 `retry-after` 的回归（真实缺陷，对齐参考实现 `retry-after.ts` 的两个细节）。
+ *
+ * ⚠️ 真正踩到的洞**只有负数那一条**（2026-10-19 从 git 取旧实现实测确认）：
+ * 旧版是 `Number.isFinite(seconds) && seconds >= 0`，有 `>= 0` 守卫，所以
+ * `'900'` 一直走秒分支、**从来不是洞**；只有 `'-5'` / `'-1'` 掉过守卫落到
+ * `Date.parse` 被当成 ISO 年份（2001 年），`at - now` 成了巨大负数，
+ * 再被 `Math.max(0, …)` 抹成 0 = 「立即解除限流」
+ * ⇒ **刚落限流的账号马上被重选，无限空转**。
+ */
+test('parseRetryAfter 不把畸形数字串当成 HTTP-date', () => {
+  const headers = (value) => new Headers({ 'retry-after': value })
+  const now = Date.UTC(2026, 9, 19, 12, 0, 0)
+  // 前置事实：负数串确实能被 Date.parse 解析出「合法」结果（缺陷的成因）。
+  assert.ok(Number.isFinite(Date.parse('-5')))
+  // ★ 核心回归：负数一律按「服务端没声明」处理，绝不落到 Date.parse。
+  assert.equal(parseRetryAfter(headers('-5'), now), undefined)
+  assert.equal(parseRetryAfter(headers('-1'), now), undefined)
+  // 纯数字走「秒」分支（旧版也是对的，这条守住它别被改坏）。
+  assert.equal(parseRetryAfter(headers('900'), now), 900_000)
+  assert.equal(parseRetryAfter(headers('120'), now), 120_000)
+  // 其它畸形值同样不产生「立即解除」。
+  assert.equal(parseRetryAfter(headers('abc'), now), undefined)
+  assert.equal(parseRetryAfter(headers(''), now), undefined)
+})
+
+test('parseRetryAfter 的 0 是合法值（立即解除），不是「没声明」', () => {
+  // 两者语义不同：0 = 服务端明说可以立刻重试；undefined = 服务端没给。
+  // 调用方必须用 `=== undefined` 判空，任何 falsy 判据都会让 0 退到保守兜底。
+  assert.equal(parseRetryAfter(new Headers({ 'retry-after': '0' }), 1234), 0)
+  assert.notEqual(parseRetryAfter(new Headers({ 'retry-after': '0' }), 1234), undefined)
+})
+
+test('parseRetryAfter 的 HTTP-date 分支：未来给正数，过去给 0 而不是 undefined', () => {
+  const now = Date.UTC(2026, 9, 19, 12, 0, 0)
+  const future = new Date(now + 60_000).toUTCString()
+  const past = new Date(now - 60_000).toUTCString()
+  assert.equal(parseRetryAfter(new Headers({ 'retry-after': future }), now), 60_000)
+  // 过去的日期 = 「已经可以重试了」，是 0（合法值），不是 undefined（没声明）。
+  assert.equal(parseRetryAfter(new Headers({ 'retry-after': past }), now), 0)
+})
+
+// ───────────────────────── 降权时长（对齐参考实现） ─────────────────────────
+
+/**
+ * 额度耗尽的冷却必须是**当日量级**，不是几十分钟。
+ *
+ * 真实取舍（参考实现注释原话）：「钱不会在 60 秒内到账，**短冷却会让同一个
+ * 空钱包账号被反复选中、反复 402**」。我们原来给 30 分钟 —— 半小时后那个号
+ * 仍然没钱，于是被反复选中、反复失败，白白消耗换号次数。
+ */
+test('penaltyMsFor：额度耗尽按当日冷却（24h），不是 30 分钟', () => {
+  assert.equal(penaltyMsFor('quota', undefined, 300), QUOTA_COOLDOWN_MS)
+  assert.equal(QUOTA_COOLDOWN_MS, 24 * 60 * 60 * 1000)
+})
+
+test('penaltyMsFor：上游给了 retry-after 就用它，但封顶 30 分钟', () => {
+  // 上游给 12 小时 —— 不封顶就会把账号锁 12 小时，UI 分不清「在等」与「卡死」。
+  assert.equal(penaltyMsFor('quota', 12 * 60 * 60 * 1000, 300), RETRY_AFTER_CAP_MS)
+  assert.equal(RETRY_AFTER_CAP_MS, 30 * 60 * 1000)
+  // 没超上限就照用。
+  assert.equal(penaltyMsFor('rate_limit', 90_000, 300), 90_000)
+})
+
+test('penaltyMsFor：0 是合法值（立即解除），必须被当 falsy 吞掉', () => {
+  // 判空必须用 `!== undefined`；写成 falsy 判据会把「立刻可用」换成默认冷却，
+  // 让刚恢复的账号继续被跳过。
+  assert.equal(penaltyMsFor('rate_limit', 0, 300), 0)
+  assert.equal(penaltyMsFor('quota', 0, 300), 0)
+  assert.equal(penaltyMsFor('auth', 0, 300), 0)
+})
+
+test('penaltyMsFor：各类型的兜底互不相同', () => {
+  assert.equal(penaltyMsFor('auth', undefined, 300), AUTH_COOLDOWN_MS)
+  // 限流通常很快过去，用配置的短冷却（不额外抬高）。
+  assert.equal(penaltyMsFor('rate_limit', undefined, 300), 300_000)
+  // 配置的 penaltySec 比内置下限还大时，取大的那个（不缩水）。
+  assert.equal(penaltyMsFor('auth', undefined, 3600), 3_600_000)
+})
+
+// ───────────────────────── 服务端日界（UTC+8） ─────────────────────────
+
+/**
+ * 幂等键的日期必须是**服务端业务日（UTC+8）**。
+ *
+ * 真实缺陷：原实现用 `new Date(at).toISOString().slice(0, 10)`（UTC 日），
+ * 与 UTC+8 日在每天 00:00–08:00（UTC+8）之间**不是同一天** ⇒ 同一个业务日
+ * 算出两个不同的幂等键 ⇒ **跨零点重复领取**。
+ */
+test('checkInKey 用 UTC+8 业务日，跨零点不会变成两次', () => {
+  const early = Date.parse('2026-10-19T07:00:00+08:00')
+  const late = Date.parse('2026-10-19T09:00:00+08:00')
+  // 前置事实：UTC 日在这两点确实不同（这正是缺陷的成因）。
+  assert.notEqual(new Date(early).toISOString().slice(0, 10), new Date(late).toISOString().slice(0, 10))
+  assert.equal(checkInKey('qoder-cn', 'a1', early), checkInKey('qoder-cn', 'a1', late))
+  assert.ok(checkInKey('qoder-cn', 'a1', early).endsWith(':2026-10-19'))
+  // 跨到下一个业务日必须换键，否则第二天就漏签。
+  assert.notEqual(checkInKey('qoder-cn', 'a1', early), checkInKey('qoder-cn', 'a1', Date.parse('2026-10-20T09:00:00+08:00')))
+})
+
+test('taskKey 与 checkInKey 同一日期口径', () => {
+  const at = Date.parse('2026-10-19T07:30:00+08:00')
+  assert.ok(taskKey('trae', 'a1', 'sign', at).endsWith(':2026-10-19'))
+})
+
+test('utc8DateString / utc8Hour 是算术平移而非本机时区', () => {
+  // 取一个 UTC+8 与 UTC 分属不同日期的时刻：UTC 是 18 日 23:30，UTC+8 已是 19 日 07:30。
+  const at = Date.parse('2026-10-19T07:30:00+08:00')
+  assert.equal(utc8DateString(at), '2026-10-19')
+  assert.equal(utc8Hour(at), 7)
+  // 与「本机时区」无关：结果只由偏移常量决定。
+  assert.equal(utc8DateString(Date.parse('2026-01-01T00:30:00+08:00')), '2026-01-01')
+})
+
+test('Qoder 活动刷新时刻：10:00（UTC+8）之前不算今天已刷新', () => {
+  const before = Date.parse('2026-10-19T09:59:00+08:00')
+  const after = Date.parse('2026-10-19T10:00:00+08:00')
+  assert.equal(hasQoderCampaignRefreshedToday(before), false)
+  assert.equal(hasQoderCampaignRefreshedToday(after), true)
 })
 
 test('failureOf 只带上真正给了的字段', () => {
@@ -427,6 +551,72 @@ test('路由：额度优先按剩余额度排序', () => {
   }
 })
 
+test('路由：账号「对话」开关关掉时，错误要说清是开关问题（不是密钥无效）', async () => {
+  const { manager, cleanup } = freshAccounts()
+  try {
+    const account = manager.add({ agentId: 'qoder-cn', label: '主号', credentials: { token: 't' } })
+    manager.update(account.id, { routeChat: false })
+    const router = new AccountRouter(manager, GATEWAY, silent)
+    const outcome = await router.execute('qoder-cn', async () => ({ ok: true, value: 1 }))
+
+    assert.equal(outcome.ok, false)
+    // ⚠️ 两条都是回归点：
+    //   ① 归类不能是 auth —— DSH 把 code === 'AUTH' 直接渲染成「API 密钥无效」
+    //      （`dsh-client-ui-chat` 的 `message.failure.auth`），用户被引向错误方向；
+    //   ② 话术要点名「对话」开关，否则用户不知道该点哪里。
+    assert.notEqual(outcome.failure?.kind, 'auth', '配置没就绪不该归成 auth')
+    assert.match(outcome.failure?.message ?? '', /「对话」开关/, '要说清是「对话」开关关着')
+    assert.match(outcome.failure?.message ?? '', /账号/, '要指向「账号」页')
+  } finally {
+    cleanup()
+  }
+})
+
+test('路由：账号被停用 / 凭证失效各有各的话术', async () => {
+  const { manager, cleanup } = freshAccounts()
+  try {
+    const router = new AccountRouter(manager, GATEWAY, silent)
+
+    // 一个账号都没有时不会走到「没有可用账号」——`candidates()` 会给匿名占位
+    // （见上面那条测试）。所以这里只覆盖「有账号、但都不能用」的分支。
+    const account = manager.add({ agentId: 'qoder-cn', label: '主号', credentials: { token: 't' } })
+    manager.update(account.id, { enabled: false })
+    const off = await router.execute('qoder-cn', async () => ({ ok: true, value: 1 }))
+    assert.equal(off.ok, false)
+    assert.match(off.failure?.message ?? '', /停用/)
+    // ⚠️ 归类必须是 unsupported：DSH 把 code === 'AUTH' 渲染成「API 密钥无效」
+    assert.equal(off.failure?.kind, 'unsupported')
+
+    // 凭证失效（健康状态 invalid）→ 说「重新登录」，不要说「没有可用账号」
+    const second = manager.add({ agentId: 'qoder', label: '主号', credentials: { token: 't' } })
+    manager.markInvalid(second.id, { kind: 'auth', message: '401 invalid credential', at: Date.now() })
+    const invalid = await new AccountRouter(manager, GATEWAY, silent).execute('qoder', async () => ({
+      ok: true,
+      value: 1,
+    }))
+    assert.equal(invalid.ok, false)
+    assert.match(invalid.failure?.message ?? '', /重新登录|凭证/, `实际：${invalid.failure?.message}`)
+  } finally {
+    cleanup()
+  }
+})
+
+test('账号快照里的三个开关给的是「生效值」，不是「磁盘上存了什么」', async () => {
+  const { manager, cleanup } = freshAccounts()
+  try {
+    // 登录新建的账号：三个字段都是 undefined
+    const account = manager.add({ agentId: 'qoder-cn', label: '主号', credentials: { token: 't' } })
+    assert.equal(account.routeChat, undefined, '前提：新建账号不写 routeChat')
+
+    // 路由的真实判据是 `routeChat !== false` → 参与对话。
+    // 界面若把 undefined 画成「关」，用户看到的就是**与真实行为相反**的状态。
+    const { usable } = new AccountRouter(manager, GATEWAY, silent).candidates('qoder-cn')
+    assert.equal(usable.length, 1, '未写 routeChat 的账号必须参与路由')
+  } finally {
+    cleanup()
+  }
+})
+
 test('路由：一个账号都没有时用匿名占位（免费层不该要求先建账号）', async () => {
   const { manager, cleanup } = freshAccounts()
   try {
@@ -460,7 +650,9 @@ test('路由：有账号但全被禁用时仍然报配置错误，不被匿名�
     const router = new AccountRouter(manager, GATEWAY, silent)
     const outcome = await router.execute('opencode', async () => ({ ok: true, value: 1 }))
     assert.equal(outcome.ok, false, '有账号但全禁用 = 真实配置问题，必须报错')
-    assert.match(outcome.failure.message, /没有可用账号/)
+    // 话术按现状分情况：全被停用就直说「停用」，别再含糊地说「没有可用账号」
+    assert.match(outcome.failure.message, /停用/)
+    assert.notEqual(outcome.failure.kind, 'auth', '配置问题不该显示成「API 密钥无效」')
   } finally {
     cleanup()
   }
@@ -624,6 +816,51 @@ async function chunksOf(events) {
   }
   return chunks
 }
+
+test('选择器档位行：看模型声明的档位，不看 `reasoning` 标志', async () => {
+  /**
+   * 真实缺口（2026-10-19 实测）：档位行原先被包在 `if (meta.reasoning === true)` 里，
+   * 于是**声明了档位但 `reasoning` 为假**的模型一个档位行都拿不到。
+   * 实测 Qoder CN 的 `performance` 正是这种：目录 `is_reasoning: false`
+   * （请求体 `isReasoning` 为假），但 `thinking_config.enabled` 为真、
+   * 上游**确实**提供档位选择 —— 参考实现的 `resolveModel` 也只看
+   * `qoderEffortsFor(entry).length > 0`，从不看 `is_reasoning`。
+   *
+   * 两个字段语义独立：`reasoning` = 会不会吐思维链；`reasoningEfforts` = 能不能调强度。
+   */
+  const log = { child: () => log, debug() {}, info() {}, warn() {}, error() {} }
+  const makeInfo = async (meta) => {
+    const llm = createLlmAdapter({
+      agentId: 'qoder-cn',
+      displayName: 'Qoder CN',
+      labelWithAgent: true,
+      accounts: new Proxy({}, { get: () => () => undefined }),
+      router: { execute: async () => ({ ok: false, kind: 'unknown', message: 'x' }) },
+      adapterOf: () => ({ id: 'qoder-cn', name: 'Qoder CN' }),
+      contextOf: () => ({ config: { upstream: {} }, log, http: async () => ({ ok: true }), cache: new MemoryCache(), now: () => 0 }),
+      modelsOf: async () => [meta],
+      log,
+    })
+    return llm.resolveModel('multiagent-qoder-cn', meta.id)
+  }
+
+  // ① 有档位但 reasoning 为假 → **仍然**要出档位行（这就是被吞掉的那类）。
+  const perf = await makeInfo({
+    id: 'performance', name: 'Performance', agentId: 'qoder-cn', agentName: 'Qoder CN',
+    reasoningEfforts: ['xhigh', 'high', 'low', 'max', 'medium', 'none'], defaultReasoningEffort: 'medium',
+  })
+  assert.ok(perf.reasoning, 'performance 的档位行不该被吞掉')
+  assert.deepEqual(perf.reasoning.efforts.map((e) => e.id), ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+  assert.equal(perf.reasoning.defaultEffort, 'medium', '用上游声明的默认档')
+
+  // ② 只有 reasoning、没有档位 → 不出档位行（不谎报能力）。
+  const noTiers = await makeInfo({ id: 'efficient', name: 'Efficient', agentId: 'qoder-cn', agentName: 'Qoder CN', reasoning: true })
+  assert.equal(noTiers.reasoning, undefined, '不知道有哪些档位时不该出一行空的')
+
+  // ③ 两者都没有 → 同样不出。
+  const nothing = await makeInfo({ id: 'auto', name: 'Auto', agentId: 'qoder-cn', agentName: 'Qoder CN' })
+  assert.equal(nothing.reasoning, undefined)
+})
 
 test('block-end 必须带上累积的正文：宿主是覆盖式赋值，给空串就等于把输出抹掉', async () => {
   // 宿主 `BlockAssembler.push()` 的分支是 `partial.block = chunk.block`，
@@ -801,7 +1038,7 @@ test('端到端：把适配器的 chunk 喂进宿主装配逻辑，流式正文�
 
 // ───────────────────────── 适配器 ─────────────────────────
 
-test('注册表：内置清单包含 OpenCode 与五个骨架，且接口完整', () => {
+test('注册表：内置清单包含全部六个平台，且接口完整', () => {
   const adapters = builtinAdapters()
   const registry = new AdapterRegistry()
   registry.registerAll(adapters)
@@ -861,6 +1098,110 @@ test('formatMultiplier：免费 / ×N / 未知倍率', () => {
 test('OpenCode：模型 id → 人看的名字', () => {
   assert.equal(prettifyModelId('deepseek-v4.1-flash-free'), 'DeepSeek V4.1 Flash Free')
   assert.equal(prettifyModelId('big-pickle'), 'Big Pickle')
+})
+
+// ───────────────────── OpenCode 只拉免费模型 ─────────────────────
+//
+// 需求：这个平台只拉免费模型 —— 免费通道调不动付费模型，全列出来只会把
+// 免费那几个淹没。判据两条：价格源说峰值价 0，或 id 以 `-free` 结尾（兜底）。
+
+/** 只跑 `getModelMetaList` 的假 ctx：目录 + 价格源各回一份，其它请求 404。 */
+function modelCtx({ catalog, pricing = {}, pricingFails = false }) {
+  const json = (body) => ({
+    ok: true,
+    status: 200,
+    kind: 'none',
+    headers: new Headers({ 'content-type': 'application/json' }),
+    body,
+    text: JSON.stringify(body),
+  })
+  return {
+    config: {
+      id: 'opencode',
+      upstream: {
+        chatBaseUrl: 'https://proxy.example/v1',
+        apiBaseUrl: 'https://proxy.example',
+        modelsUrl: 'https://proxy.example/v1/models',
+        pricingUrl: 'https://proxy.example/models.dev.json',
+        freeTierMode: 'auto',
+      },
+      credits: { unit: 'usd', baselineUsdPerMTok: 1.2 },
+      requestTimeoutMs: 10_000,
+    },
+    log: silent,
+    cache: new MemoryCache(),
+    now: () => Date.now(),
+    http: async (url) => {
+      if (String(url).endsWith('/models')) return json({ data: catalog.map((id) => ({ id })) })
+      if (String(url).includes('models.dev')) {
+        if (pricingFails) {
+          return { ok: false, status: 502, kind: 'retryable', headers: new Headers(), text: '', message: 'HTTP 502' }
+        }
+        return json({ opencode: { models: pricing } })
+      }
+      return { ok: false, status: 404, kind: 'none', headers: new Headers(), text: '', message: 'HTTP 404' }
+    },
+  }
+}
+
+const anonymousRecord = () => ({
+  id: 'opencode:anon',
+  agentId: 'opencode',
+  label: '免账号',
+  credentials: {},
+  enabled: true,
+  createdAt: 0,
+  updatedAt: 0,
+})
+
+test('OpenCode 只拉免费模型：付费模型不进模型列表', async () => {
+  const adapter = new OpenCodeAdapter()
+  const ctx = modelCtx({
+    catalog: ['deepseek-v4.1-flash-free', 'glm-5.3-flash-free', 'claude-opus-4.1', 'gpt-5', 'big-pickle'],
+    pricing: {
+      'deepseek-v4.1-flash-free': { cost: { input: 0, output: 0 } },
+      'glm-5.3-flash-free': { cost: { input: 0, output: 0 } },
+      'claude-opus-4.1': { cost: { input: 10, output: 50 } },
+      'gpt-5': { cost: { input: 1.25, output: 10 } },
+      // big-pickle 的 id 里没有 free，只能靠价格认出来
+      'big-pickle': { cost: { input: 0, output: 0 } },
+    },
+  })
+  const list = await adapter.getModelMetaList(anonymousRecord(), ctx)
+  assert.deepEqual(
+    list.map((meta) => meta.id).sort(),
+    ['big-pickle', 'deepseek-v4.1-flash-free', 'glm-5.3-flash-free'],
+    '付费模型（claude-opus-4.1 / gpt-5）不该出现在模型列表里',
+  )
+  for (const meta of list) {
+    assert.equal(meta.free === true || meta.multiplier === 0, true, `${meta.id} 没被标成免费`)
+  }
+})
+
+test('OpenCode 免费判定有兜底：价格源挂了也不清空列表（靠 id 的 -free 特征）', async () => {
+  const adapter = new OpenCodeAdapter()
+  const ctx = modelCtx({
+    catalog: ['deepseek-v4.1-flash-free', 'beam-free', 'claude-opus-4.1', 'gpt-5'],
+    pricingFails: true,
+  })
+  const list = await adapter.getModelMetaList(anonymousRecord(), ctx)
+  assert.deepEqual(
+    list.map((meta) => meta.id).sort(),
+    ['beam-free', 'deepseek-v4.1-flash-free'],
+    '价格拿不到时只能靠 id 认免费，但绝不能把整个列表清空',
+  )
+  // 兜底认下来的也要标「免费」，否则 UI 显示「未知倍率」会让用户以为要花钱
+  for (const meta of list) assert.equal(meta.free, true)
+})
+
+test('FREE_MODEL_ID：只认 id 结尾的 free，不误伤别的模型', async () => {
+  const { FREE_MODEL_ID } = await import('../lib/adapters/opencode.js')
+  for (const id of ['deepseek-v4.1-flash-free', 'beam-free', 'space_bunny.free']) {
+    assert.equal(FREE_MODEL_ID.test(id), true, `${id} 应当算免费`)
+  }
+  for (const id of ['big-pickle', 'claude-opus-4.1', 'free-tier', 'freedom', 'gpt-free-mini']) {
+    assert.equal(FREE_MODEL_ID.test(id), false, `${id} 不该靠 id 被当成免费`)
+  }
 })
 
 test('OpenCode：任务列表解析认多种字段名', () => {
@@ -1859,19 +2200,21 @@ test('buddyHeaders：五个身份头 + Bearer 一个都不能少', () => {
   assert.equal(cn['x-product'], 'CodeBuddy')
 })
 
-test('内置适配器：五个平台已真实现，Trae 仍是骨架', async () => {
+test('内置适配器：六个平台全部已真实现（不再有骨架）', async () => {
   const { builtinAdapters } = await import('../lib/adapters/index.js')
   const adapters = builtinAdapters()
   const byId = new Map(adapters.map((item) => [item.id, item]))
-  for (const id of ['opencode', 'qoder', 'qoder-cn', 'workbuddy', 'workbuddy-intl']) {
+  // 2026-10-19 Trae 升级为真实现后，六个平台全部 implemented。
+  for (const id of ['opencode', 'qoder', 'qoder-cn', 'trae', 'workbuddy', 'workbuddy-intl']) {
     assert.equal(byId.get(id)?.implemented, true, `${id} 应当已实现`)
     assert.equal(byId.get(id)?.capabilities.chat, true, `${id} 应当声明支持对话`)
   }
-  assert.equal(byId.get('trae')?.implemented, false, 'Trae 本期仍是骨架')
   assert.deepEqual(
     adapters.map((item) => item.id),
     ['opencode', 'qoder', 'qoder-cn', 'trae', 'workbuddy', 'workbuddy-intl'],
   )
+  // 骨架工厂仍然存在（新增平台时的起点），只是当前没有平台停在骨架状态。
+  assert.deepEqual([...SKELETON_IDS], ['qoder', 'qoder-cn', 'workbuddy', 'workbuddy-intl'])
 })
 
 // ─────────────────────────── 版本更新（真实 git 仓库） ───────────────────────────
@@ -2041,9 +2384,15 @@ test('Qoder：缺 uid 的 token 在发请求前就被拒（否则上游只会回
   const verdict = await adapter.validateCredentials(record, {})
   assert.equal(verdict.ok, false)
   assert.equal(verdict.kind, 'auth')
-  assert.ok(String(verdict.message).includes('user_id'))
+  // 话术要**可操作**：说「重新登录」，而不是只报「解不出 user_id」（用户无法自救）
+  assert.ok(String(verdict.message).includes('重新登录'), `实际：${verdict.message}`)
 
-  // 有 uid 的 JWT 就通过本地校验
+  // ① 凭证里直接存了 uid（设备码登录的正常形态）→ 通过
+  const withUid = { ...record, credentials: { token: 'dt-opaque-device-token', uid: 'u_stored' } }
+  const storedVerdict = await adapter.validateCredentials(withUid, {})
+  assert.equal(storedVerdict.ok, true, `存了 uid 就该通过，实际：${storedVerdict.message}`)
+
+  // ② 没有存 uid 时，退回到从 JWT 里解（手工粘贴 JWT 的老路径）
   const payload = Buffer.from(JSON.stringify({ user_id: 'u_ok' }), 'utf8').toString('base64url')
   const okRecord = { ...record, credentials: { token: `h.${payload}.s` } }
   const okVerdict = await adapter.validateCredentials(okRecord, {})
@@ -2125,4 +2474,146 @@ test('Qoder 登录：beginLogin 给出带 PKCE 的授权链接，poll 空 data �
   assert.equal(ready.status, 'ready')
   assert.equal(ready.credentials.token, 'qd_at')
   assert.ok(seen[0].startsWith(QODER_CN.openApiBase), '轮询要打 openApiBase')
+})
+
+test('Qoder 登录：设备码响应里的 user_id 必须存成 uid（否则对话报解不出 user_id）', async () => {
+  // ⚠️ 回归点：Qoder 给的是 `dt-...` **不透明设备令牌**，不是 JWT。
+  // 早期 pollLogin 只存 token / refreshToken，漏了 user_id ——
+  // 于是 clientFor 拿 token 去当 JWT 解，永远解不出 uid，
+  // 用户刚登录成功却被报「token 里解不出 user_id」。
+  const ctx = loginCtx(async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      data: { token: 'dt-opaque-token', refresh_token: 'drt-x', user_id: '019e88b9-1c04-7552-8feb-7b4a137d4c3d', user_name: '张三' },
+    }),
+  }))
+  const adapter = new QoderAdapter(QODER_CN)
+  const start = await adapter.beginLogin(ctx)
+  const ready = await adapter.pollLogin(start.state, ctx)
+  assert.equal(ready.status, 'ready')
+  assert.equal(ready.credentials.uid, '019e88b9-1c04-7552-8feb-7b4a137d4c3d', '登录响应里的 user_id 要存成 uid')
+  assert.equal(ready.credentials.token, 'dt-opaque-token')
+  assert.equal(ready.label, '张三', 'user_name 用作账号标签')
+})
+
+test('Qoder uid 补齐：上游用量接口能给出 uid，且能在多个端点间兜底', async () => {
+  const { findUserId } = await import('../lib/adapters/qoder.js')
+  // 实测两种真实形状
+  assert.equal(
+    findUserId({ displayMode: 'qoder', qoderUsage: { userId: 'u-1', userType: 'personal_standard' } }),
+    'u-1',
+    '/sash/api/v2/me/usage 的形状：qoderUsage.userId',
+  )
+  assert.equal(findUserId({ uid: 'u-2', showCampaign: false }), 'u-2', '/sash/api/v1/me/campaigns 的形状：顶层 uid')
+  assert.equal(findUserId({ data: { list: [{ user_id: 42 }] } }), '42', '数字 id 也要认')
+  assert.equal(findUserId({ nothing: 'here' }), '', '找不到就返回空串，不许瞎猜')
+  assert.equal(findUserId(null), '')
+  // 同一层里有多个候选时按 userId → user_id → uid 的顺序取；
+  // 两个**真实**响应各自只有一种形状，所以这条只是保证行为确定，不是优先级承诺。
+  assert.equal(findUserId({ uid: 'top', qoderUsage: { userId: 'nested' } }), 'top', '本层先命中就用本层的')
+})
+
+// ───────────────── 没登录就不列模型（Qoder / WorkBuddy） ─────────────────
+//
+// 报障原话：「还没登录账号就拉取到了模型，但是倍率是未知呢？太不友好了。」
+// 目录是产品级的（内置在插件里），登录前也拿得到，但**一个都调不动** ——
+// 提前列出来只会让人以为已经能用，还全是「未知倍率」。
+
+const qoderRecord = (token) => ({
+  id: 'acc-qoder-1',
+  agentId: 'qoder-cn',
+  label: '主号',
+  credentials: token === undefined ? {} : { token },
+  enabled: true,
+  createdAt: 0,
+  updatedAt: 0,
+})
+
+test('Qoder：还没有账号时模型列表为空（不提前列目录）', async () => {
+  const adapter = new QoderAdapter(QODER_CN)
+  // 这条路径在碰 ctx 之前就返回了，传空对象即可
+  assert.deepEqual(await adapter.getModelMetaList(qoderRecord(undefined), {}), [])
+})
+
+test('Qoder：倍率按错峰窗口推算；「免费」只认 price_factor=0', async () => {
+  const adapter = new QoderAdapter(QODER_CN)
+  const list = await adapter.getModelMetaList(qoderRecord('dt-fake-token'), {})
+  assert.ok(list.length > 5, '兜底目录应当有多个模型')
+  const byId = new Map(list.map((meta) => [meta.id, meta]))
+  // 无促销的模型直接用目录价
+  assert.equal(byId.get('auto')?.multiplier, 0.5, 'auto 的目录倍率是 0.5')
+  assert.equal(byId.get('auto')?.multiplierSource, 'qoder:catalog')
+  // qfmodel 的 price_factor 是 0（合法值）→ 真免费
+  assert.equal(byId.get('qfmodel')?.multiplier, 0)
+  assert.equal(byId.get('qfmodel')?.free, true)
+  // ⚠️ 回归点 1：Qwen3.8-Max 是 `is_free: true` —— 「免费额度模型」照样扣积分，
+  // **不能**标「免费」（真机报障过）。
+  assert.notEqual(byId.get('qmodel_38max')?.free, true, 'is_free 不等于免费')
+  // ⚠️ 回归点 2：它的倍率是**随窗口变的**，不能直接用目录里存的折后价 0.2。
+  // 目录存 0.2 = 22:00–08:00 窗口内的价；窗口外（白天）应为原价 0.5。
+  assert.ok(
+    [0.2, 0.5].includes(byId.get('qmodel_38max')?.multiplier),
+    `Qwen3.8-Max 的倍率只可能是窗口内 0.2 或窗口外 0.5，实际 ${byId.get('qmodel_38max')?.multiplier}`,
+  )
+  // 每一条都得有倍率，界面不该再出现「未知倍率」
+  for (const meta of list) {
+    assert.equal(typeof meta.multiplier, 'number', `${meta.id} 缺倍率`)
+  }
+  // 除 qfmodel 外不该再有别的模型被标免费
+  const freebies = list.filter((meta) => meta.free === true).map((meta) => meta.id)
+  assert.deepEqual(freebies, ['qfmodel'], `只有 price_factor=0 的才算免费，实际：${freebies.join(',')}`)
+})
+
+test('Qoder 错峰窗口：窗口内折后价、窗口外原价（按 UTC+8 本地推算）', async () => {
+  const { effectiveMultiplier, promotionActiveNow, isPromotionActive } = await import('../lib/adapters/qoder.js')
+  // 目录里存的 priceFactor 0.2 是**采集时刻**的折后价；原价在 promotion 里
+  const qwenMax = {
+    id: 'qmodel_38max', name: 'Qwen3.8-Max', contextWindow: 1_000_000,
+    isFree: true, priceFactor: 0.2,
+    promotion: { active: true, discountFactor: 0.4, beforePromotionPriceFactor: 0.5, windowStart: '22:00', windowEnd: '08:00' },
+  }
+  // UTC+8 22:30 → 窗口内
+  const inWindow = new Date(Date.UTC(2026, 9, 19, 14, 30))
+  // UTC+8 10:00 → 窗口外
+  const outWindow = new Date(Date.UTC(2026, 9, 19, 2, 0))
+
+  assert.equal(promotionActiveNow(qwenMax.promotion, inWindow), true, '22:30 应在窗口内')
+  assert.equal(promotionActiveNow(qwenMax.promotion, outWindow), false, '10:00 应在窗口外')
+  assert.equal(effectiveMultiplier(qwenMax, inWindow), 0.2, '窗口内 = 原价 × 折扣 = 0.5 × 0.4')
+  assert.equal(effectiveMultiplier(qwenMax, outWindow), 0.5, '窗口外 = 原价 0.5（用户确认过的正确值）')
+  assert.equal(isPromotionActive(qwenMax, inWindow), true)
+  assert.equal(isPromotionActive(qwenMax, outWindow), false)
+
+  // 跨零点窗口：02:00 在窗口内，12:00 不在
+  assert.equal(promotionActiveNow(qwenMax.promotion, new Date(Date.UTC(2026, 9, 18, 18, 0))), true, '02:00 跨零点窗口内')
+  assert.equal(promotionActiveNow(qwenMax.promotion, new Date(Date.UTC(2026, 9, 19, 4, 0))), false, '12:00 窗口外')
+
+  // 没有 promotion 的模型直接用目录价，不受窗口影响
+  const plain = { id: 'auto', name: 'Auto', contextWindow: 200_000, priceFactor: 0.5 }
+  assert.equal(effectiveMultiplier(plain, inWindow), 0.5)
+  assert.equal(effectiveMultiplier(plain, outWindow), 0.5)
+  assert.equal(isPromotionActive(plain, inWindow), false)
+})
+
+test('Qoder uid：优先用凭证里存的（设备令牌不是 JWT，解不出来）', async () => {
+  const adapter = new QoderAdapter(QODER_CN)
+  // 真实形态：设备码登录给的是 `dt-...` 不透明令牌，JWT 解析必然失败
+  const deviceToken = 'dt-4OLYeuvgM5u36ofdBZpJcRBE'
+  const withoutUid = { ...qoderRecord(deviceToken) }
+  const invalid = await adapter.validateCredentials(withoutUid, {})
+  assert.equal(invalid.ok, false, '没有 uid 时不能假装可用')
+  // ⚠️ 报错要说「重新登录」，不能只说「解不出 user_id」（用户无法自救）
+  assert.match(invalid.message, /重新登录/, `实际：${invalid.message}`)
+
+  // 存了 uid（登录响应里的 user_id）→ 校验通过
+  const withUid = { ...qoderRecord(deviceToken), credentials: { token: deviceToken, uid: '12345678901234567' } }
+  const valid = await adapter.validateCredentials(withUid, {})
+  assert.equal(valid.ok, true, `存了 uid 就该通过，实际：${valid.message}`)
+  assert.match(valid.message, /12345678901234567/, '报错/提示里要能看出用的是哪个 uid')
+})
+
+test('WorkBuddy：没有 token 时不列模型（登录前一个都调不动）', async () => {
+  const adapter = new BuddyAdapter(BUDDY_CN)
+  assert.deepEqual(await adapter.getModelMetaList(qoderRecord(undefined), {}), [])
 })

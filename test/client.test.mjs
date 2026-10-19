@@ -32,7 +32,7 @@ const root = join(here, '..')
  * 用来验证**样式注入**那条路径：没有 document 时它会被静默跳过，
  * 而「CSS 根本没注入」正是「界面没原型好看」的一种可能原因。
  */
-function loadClientBundle(sandbox = {}) {
+function loadClientBundle(sandbox = {}, requireOverrides = {}) {
   const source = readFileSync(join(root, 'client', 'client.js'), 'utf8')
   let definition = null
   const window = {
@@ -47,6 +47,7 @@ function loadClientBundle(sandbox = {}) {
   assert.equal(definition.id, 'dsh-multi-agent-gateway')
 
   const require = (specifier) => {
+    if (requireOverrides[specifier] !== undefined) return requireOverrides[specifier]
     if (specifier === 'react/jsx-runtime') {
       return {
         Fragment: Symbol('Fragment'),
@@ -444,6 +445,24 @@ test('登录弹框挂在 body 上的独立层里（不被设置面板的 overflo
   assert.ok(!html.includes('mag-overlay'), '面板 HTML 里不该再有 mag-overlay')
 })
 
+test('登录弹框永远居中：不再因为「浏览器已打开」往左甩', () => {
+  const source = readFileSync(join(root, 'client', 'client.js'), 'utf8')
+  // ⚠️ 回归点（真机报「弹框位置偏移太厉害」）：全屏窗口下左移 6% 看起来就是跑偏。
+  assert.ok(!source.includes('data-side'), '遮罩不该再带 data-side（左移那套已删除）')
+  // 只针对遮罩自己的 flex 对齐 —— `align-items:flex-start` 在别处是正常写法。
+  // 注意别去断言「源码里不出现 with-browser 这个词」：注释里会提到它。
+  assert.ok(
+    !/\.mag-overlay[^}]*justify-content:\s*flex-start/.test(source),
+    '遮罩不该把弹框推到左边（justify-content:flex-start）',
+  )
+  // 居中必须是遮罩的默认行为
+  assert.match(
+    source,
+    /\.mag-overlay\{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center/,
+    '遮罩要保持 flex 居中',
+  )
+})
+
 test('连续取消两个模型不会互相覆盖（草稿必须优先于宿主 selectedIds）', () => {
   const items = [
     { id: 'free-a', name: 'A', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000 },
@@ -459,18 +478,149 @@ test('连续取消两个模型不会互相覆盖（草稿必须优先于宿主 s
   panel.dispose()
 })
 
-test('按推荐预选：只写草稿，保存前不上报', () => {
+test('模型卡片没有「按推荐预选」按钮（只勾选免费模型的入口已去掉）', () => {
   const items = [
     { id: 'free-a', name: 'A', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000 },
     { id: 'paid-b', name: 'B', agentId: 'opencode', free: false, multiplier: 2, contextWindow: 1000 },
   ]
   const { panel, html } = dashboardWith({ page: 'accounts', items, policy: { mode: 'selected', selected: [] } })
-  assert.ok(html.includes('按推荐预选'), '没勾任何模型时要给推荐预选按钮')
-  panel.preselectModels(['free-a'])
-  const policy = panel.projection().modelPolicy
-  assert.deepEqual([...policy.selected], ['free-a'])
-  assert.equal(policy.mode, 'selected')
-  assert.equal(panel.projection().shell.dirty, true, '预选只进草稿，仍然要保存')
+  assert.ok(!html.includes('按推荐预选'), '不该再渲染「按推荐预选 N 个」按钮')
+  assert.ok(!html.includes('data-act="preselect"'), 'preselect 按钮必须彻底消失')
+  assert.equal(typeof panel.preselectModels, 'undefined', 'preselectModels 已删除，避免按钮又长回来')
+  // 勾选仍然是「草稿 + 保存」：手动勾一个，保存条要亮
+  panel.toggleModel('free-a', true)
+  assert.deepEqual([...panel.projection().modelPolicy.selected], ['free-a'])
+  assert.equal(panel.projection().shell.dirty, true, '勾选必须产生未保存改动')
+  panel.dispose()
+})
+
+test('「只看免费」只在平台真有付费模型时出现（OpenCode 只拉免费，不需要过滤器）', () => {
+  const allFree = [
+    { id: 'free-a', name: 'A', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000 },
+    { id: 'free-b', name: 'B', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000 },
+  ]
+  const mixed = [
+    ...allFree,
+    { id: 'paid-c', name: 'C', agentId: 'opencode', free: false, multiplier: 3, contextWindow: 1000 },
+  ]
+  const freeOnly = dashboardWith({ page: 'accounts', items: allFree })
+  assert.ok(!freeOnly.html.includes('只看免费'), '全是免费模型时不该再给「只看免费」勾选框')
+  freeOnly.panel.dispose()
+  const full = dashboardWith({ page: 'accounts', items: mixed })
+  assert.ok(full.html.includes('只看免费'), '有付费模型时「只看免费」仍然要有')
+  full.panel.dispose()
+})
+
+test('没登录的平台不列模型：给「先登录」的引导，而不是一堆「未知倍率」', () => {
+  const { panel, html } = dashboardWith({
+    page: 'accounts',
+    agents: [{ agentId: 'qoder', name: 'Qoder', visible: true, implemented: true, enabled: true, accounts: [], modelCount: 17 }],
+    // 宿主即使给了目录也不该画出来
+    models: {
+      status: 'ready',
+      agentId: 'qoder',
+      items: [{ id: 'auto', name: 'Auto', agentId: 'qoder', contextWindow: 200000 }],
+      exposedIds: [],
+      selectedIds: [],
+      policy: { mode: 'selected', selected: [] },
+      error: null,
+    },
+  })
+  assert.ok(html.includes('登录后自动拉取'), '要说清楚「登录后自动拉取」')
+  assert.ok(html.includes('登录 Qoder'), '引导要指向登录按钮')
+  assert.ok(!html.includes('mag-mtable'), '没登录不该画模型表格')
+  assert.ok(!html.includes('mag-mrow'), '没登录不该画模型行')
+  assert.ok(!html.includes('>未知倍率<'), '没登录不该出现「未知倍率」的倍率标签')
+  assert.ok(!html.includes('data-act="probe"'), '没账号不该出现「测一次」')
+  assert.ok(!html.includes('data-act="load-models"'), '没账号不该出现「拉取模型」')
+  panel.dispose()
+})
+
+test('探测可用性时行内显示「测试中」，不给反馈就是「点了没反应」', () => {
+  const items = [
+    { id: 'free-a', name: 'A', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000, availability: 'unknown' },
+    { id: 'free-b', name: 'B', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000, availability: 'unknown' },
+  ]
+  const { panel } = dashboardWith({ page: 'accounts', items })
+  // ① 平时：两行都有「测一次」
+  const idle = client.DashboardHTML(panel.projection())
+  assert.equal((idle.match(/data-act="probe"/g) ?? []).length, 2, '没在探测时每行都有「测一次」')
+  assert.ok(idle.includes('测一次'))
+  assert.ok(!idle.includes('测试中…'), '没在探测时不该出现「测试中…」')
+
+  // ② 探测中：那一行变成禁用的「测试中…」，工具栏给出进度说明，别的行也不许再点
+  const probing = client.DashboardHTML({ ...panel.projection(), probing: ['free-a'] })
+  assert.ok(probing.includes('测试中…'), '探测中的行要显示「测试中…」')
+  assert.ok(probing.includes('正在测试 1 个模型'), '工具栏要说明正在进行')
+  assert.equal((probing.match(/data-act="probe"/g) ?? []).length, 1, '探测中的行不该还有「测一次」')
+  assert.ok(/data-act="probe" data-id="free-b" disabled/.test(probing), '同一时间只跑一轮，其余行的按钮要禁掉')
+  panel.dispose()
+})
+
+/**
+ * 回归：面板正文是 `innerHTML` 字符串，事件目标节点没有 React fiber。
+ * React 的 `onChange` 走 ChangeEventPlugin，只在「目标节点是表单元素」时派发 ——
+ * 目标被解析成根 div 之后**一次都不派发**。
+ *
+ * 真机症状：模型勾选框点下去什么也没发生，草稿没写入，保存条永远是灰的
+ * （用户报的就是「勾选模型后没有保存按钮」）。所以交互必须挂原生监听。
+ */
+test('交互事件挂原生监听：勾选能写进草稿，根节点不再用 React 合成事件', () => {
+  const listeners = new Map()
+  const root = {
+    innerHTML: '',
+    addEventListener: (name, handler) => listeners.set(name, handler),
+    removeEventListener: (name) => listeners.delete(name),
+    querySelector: () => null,
+  }
+  const effects = []
+  const react = {
+    Fragment: Symbol('Fragment'),
+    jsx: (type, props) => ({ type, props }),
+    jsxs: (type, props) => ({ type, props }),
+    useRef: () => ({ current: root }),
+    useEffect: (fn) => {
+      effects.push(fn)
+    },
+    useState: (value) => [value, () => {}],
+  }
+  const bundle = loadClientBundle({}, { react })
+  const items = [
+    { id: 'free-a', name: 'A', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000 },
+    { id: 'free-b', name: 'B', agentId: 'opencode', free: true, multiplier: 0, contextWindow: 1000 },
+  ]
+  const { panel } = dashboardWith({ page: 'accounts', items, policy: { mode: 'selected', selected: [] } })
+  const state = panel.projection()
+  // 真实环境里 props = slot 注入的动作 + 槽位给的 t/view
+  const props = { t: (key) => key, view: 'page', useGatewayPanel: () => state, ...panel.inject() }
+  const tree = bundle.GatewayPanelView(props)
+
+  // ① 根节点上不能再用 React 的合成事件：onChange 根本不派发，
+  //    onClick 再挂一份会和原生监听一起把开关翻两次。
+  assert.equal(tree.props.onChange, undefined, '根节点不该再用 React 的 onChange')
+  assert.equal(tree.props.onClick, undefined, '根节点不该再用 React 的 onClick（会和原生监听重复）')
+  assert.equal(tree.props.onInput, undefined, '根节点不该再用 React 的 onInput')
+
+  // ② effect 跑起来后三个原生监听必须齐全
+  const cleanup = effects.at(-1)()
+  for (const name of ['click', 'change', 'input']) {
+    assert.equal(typeof listeners.get(name), 'function', `根节点缺原生 ${name} 监听`)
+  }
+
+  // ③ 模拟勾选：change 必须真的写进草稿 —— 这一条挂掉就是「保存按钮永远灰」
+  listeners.get('change')({
+    target: {
+      getAttribute: (name) => (name === 'data-act' ? 'toggle-model' : name === 'data-id' ? 'free-a' : null),
+      checked: true,
+    },
+  })
+  const next = panel.projection()
+  assert.equal(next.shell.dirty, true, '勾选模型后必须出现未保存改动')
+  assert.deepEqual([...next.modelPolicy.selected], ['free-a'])
+
+  // ④ 卸载时监听要摘干净（插件页会被反复挂载）
+  cleanup()
+  assert.equal(listeners.size, 0, 'effect 清理时必须把原生监听都摘掉')
   panel.dispose()
 })
 
@@ -549,6 +699,65 @@ test('登录弹框：五个状态各画各的，过期绝不能画成成功', ()
   const weird = client.LoginModalHTML({ login: { ...base, status: 'something-new' } }, agent)
   assert.ok(!weird.includes('已添加账号'), '未知状态不能画成成功')
   assert.ok(weird.includes('登录状态未知'), '未知状态要给出明确文案')
+})
+
+test('登录弹框排版：主按钮整行、状态卡带倒计时、说明在按钮下面', () => {
+  const agent = { agentId: 'qoder-cn', name: 'Qoder CN' }
+  const base = { status: 'idle', message: null, loginId: null, userCode: null, verificationUrl: null, authUrl: null, intervalSec: 5, expiresInSec: 600 }
+  const waiting = client.LoginModalHTML(
+    {
+      login: {
+        ...base, status: 'waiting', loginId: 'x',
+        authUrl: 'https://example.test/login?state=1',
+        expiresInSec: 300,
+        expiresAt: Date.now() + 272_000,
+      },
+    },
+    agent,
+  )
+
+  // ① 主按钮整行：上一版按钮和说明并排（mag-row），窄屏互相挤
+  assert.ok(waiting.includes('mag-btn-block'), '主按钮要整行')
+  assert.ok(waiting.includes('mag-cta'), '按钮与说明要用纵向的 mag-cta 包起来')
+  assert.ok(!/mag-row[^"]*"[^>]*>\s*<button[^>]*login-open/.test(waiting), 'CTA 不该再用横向 mag-row')
+
+  // ② 状态卡：剩余时间是**由到期时刻算出来的**，不是固定的「有效期 N 分钟」
+  assert.ok(waiting.includes('剩余 4:3'), `剩余时间要按 expiresAt 算，实际：${waiting.match(/剩余 [\d:]+/)?.[0]}`)
+  assert.ok(waiting.includes('data-bind="left"'), '剩余时间要可被倒计时单独更新')
+  assert.ok(waiting.includes('data-bind="bar"'), '进度条要可被倒计时单独更新')
+
+  // ③ 步骤两条，且带连接线样式类
+  assert.equal((waiting.match(/class="mag-step"/g) ?? []).length, 2, '应为两步')
+  assert.ok(waiting.includes('mag-step-t'), '步骤文字要单独包一层，好和圆圈对齐')
+
+  // ④ 终态不该出现等待区的东西
+  for (const [status, extra] of [['failed', { message: 'HTTP 502' }], ['expired', {}], ['ready', {}]]) {
+    const html = client.LoginModalHTML({ login: { ...base, status, ...extra } }, agent)
+    assert.ok(!html.includes('data-bind="bar"'), `${status} 不该有倒计时进度条`)
+    assert.ok(!html.includes('mag-steps'), `${status} 不该有步骤条`)
+  }
+})
+
+test('登录弹框：只有设备码形态才画设备码，外链登录不画空框', () => {
+  const base = { status: 'idle', message: null, loginId: 'x', verificationUrl: null, intervalSec: 5, expiresInSec: 600, expiresAt: Date.now() + 300_000 }
+
+  // OpenCode：设备码形态 —— 有 userCode，要画出来并给「复制设备码」
+  const device = client.LoginModalHTML(
+    { login: { ...base, status: 'waiting', userCode: 'OC-9F3C-1A97', verificationUrl: 'https://opencode.ai/auth/device?user_code=OC-9F3C-1A97' } },
+    { agentId: 'opencode', name: 'OpenCode' },
+  )
+  assert.ok(device.includes('mag-codebox'), '设备码要单独一块')
+  assert.ok(device.includes('OC-9F3C-1A97'), '设备码要显示出来')
+  assert.ok(device.includes('data-act="login-copy-code"'), '设备码要有独立复制按钮（复制链接是另一个）')
+
+  // Qoder：外链登录 —— 没有 userCode，不该画一个空框
+  const link = client.LoginModalHTML(
+    { login: { ...base, status: 'waiting', userCode: null, authUrl: 'https://qoder.com.cn/device/selectAccounts?challenge=abc' } },
+    { agentId: 'qoder-cn', name: 'Qoder CN' },
+  )
+  assert.ok(!link.includes('mag-codebox'), '没有设备码就不该画设备码框')
+  assert.ok(!link.includes('data-act="login-copy-code"'), '没有设备码就不该有复制设备码按钮')
+  assert.ok(link.includes('data-act="login-copy"'), '授权链接的复制按钮仍然要有')
 })
 
 test('逐模型上下文长度：写成 `id=长度` 串，清空即删除', () => {

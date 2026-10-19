@@ -14,6 +14,10 @@
  *   | 幂等键 | `<agentId>:<accountId>:checkin:<yyyy-mm-dd>` | 同左，日期 + 任务 id |
  *   | 记录 | `check-in` 类型 | `task` 类型，带 credits |
  *
+ * ⚠️ 幂等键里的 `<yyyy-mm-dd>` 是**服务端业务日（UTC+8）**，不是 UTC 日
+ * （见 `time.ts` 的文件头：两者在每天 00:00–08:00（UTC+8）之间不是同一天，
+ * 用 UTC 日会让跨零点变成两次领取）。
+ *
  * 幂等键落盘在 `state.json` 的 `schedule` 表里（借 `setLastRun`/`getLastRun`），
  * 所以 **DSH 重启不会把今天的签到漏掉，也不会重复领**。
  */
@@ -32,6 +36,7 @@ import type {
 import { AccountManager } from './accounts.js'
 import { JsonlLog } from './store.js'
 import { Semaphore, sleep } from './cache.js'
+import { utc8DateString } from './time.js'
 
 /** 一条任务执行流水（落 JSONL，UI 也能读）。 */
 export interface TaskLogRecord {
@@ -83,16 +88,21 @@ export interface TaskEngineDeps {
   now?(): number
 }
 
-/** 一天一次的签到幂等键。 */
+/**
+ * 一天一次的签到幂等键。
+ *
+ * ⚠️ 日期取**服务端业务日（UTC+8）**，不是 `toISOString()` 的 UTC 日。
+ * 两者在每天 00:00–08:00（UTC+8）之间**不是同一天**，用 UTC 日会得到两个不同的键，
+ * 后果是**跨零点重复领取**（00:00 和 08:01 各签一次）——这正是上游风控最敏感的行为。
+ * 详见 `time.ts` 的文件头。
+ */
 export function checkInKey(agentId: string, accountId: string, at: number): string {
-  const day = new Date(at).toISOString().slice(0, 10)
-  return `checkin:${agentId}:${accountId}:${day}`
+  return `checkin:${agentId}:${accountId}:${utc8DateString(at)}`
 }
 
-/** 任务幂等键：同一天内同一个任务只领一次。 */
+/** 任务幂等键：同一天内同一个任务只领一次。日期口径同 {@link checkInKey}。 */
 export function taskKey(agentId: string, accountId: string, taskId: string, at: number): string {
-  const day = new Date(at).toISOString().slice(0, 10)
-  return `task:${agentId}:${accountId}:${taskId}:${day}`
+  return `task:${agentId}:${accountId}:${taskId}:${utc8DateString(at)}`
 }
 
 export class TaskEngine {
@@ -375,31 +385,64 @@ export class TaskEngine {
   /**
    * 跑一个账号的每日签到。
    *
-   * 幂等：同一天内同一个账号只签一次（`checkin:<agent>:<account>:<yyyy-mm-dd>`）。
+   * 幂等：同一天内同一个账号只签一次（`checkin:<agent>:<account>:<yyyy-mm-dd>`，
+   * 日期是**服务端业务日 UTC+8**）。
    * 上游没有签到能力时**不是故障** —— 返回一句「上游无签到接口」，只记 debug。
+   *
+   * ⚠️ **记「今天已签」的唯一判据是 `CheckInResult.coversToday !== false`**。
+   * 「今天已领」这句话本身有歧义：有些平台的活动按日**在固定时刻刷新**
+   * （Qoder 是 10:00 UTC+8），刷新前看到的「已领」属于**昨天那一轮** ——
+   * 拿它记账会让当天刷新后再也不去领，**每天静默漏掉一份额度**。
+   * 详见 `core/types.ts` 的 `CheckInResult.coversToday`。
    */
   async checkIn(account: AccountRecord, options: { force?: boolean } = {}): Promise<{
     ok: boolean
     supported: boolean
     credits: number
     message: string
+    /** 见 `CheckInResult.coversToday`。 */
+    coversToday: boolean
+    /** 见 `CheckInResult.actionRequired`。 */
+    actionRequired: boolean
+    /** 今天已记账（幂等命中或本轮确认覆盖今天）。 */
+    recorded: boolean
   }> {
     const adapter = this.deps.adapterOf(account.agentId)
     const ctx = this.deps.contextOf(account.agentId)
     if (adapter === undefined || ctx === undefined) {
-      return { ok: false, supported: false, credits: 0, message: '适配器未装载' }
+      return { ok: false, supported: false, credits: 0, message: '适配器未装载', coversToday: false, actionRequired: false, recorded: false }
     }
     if (!adapter.capabilities.checkIn) {
-      return { ok: true, supported: false, credits: 0, message: '该 Agent 的上游没有每日签到接口（不是故障）' }
+      return {
+        ok: true,
+        supported: false,
+        credits: 0,
+        message: '该 Agent 的上游没有每日签到接口（不是故障）',
+        coversToday: false,
+        actionRequired: false,
+        recorded: false,
+      }
     }
     const at = this.now()
     const key = checkInKey(account.agentId, account.id, at)
     if (options.force !== true && this.deps.accounts.lastRun(key) !== 0) {
-      return { ok: true, supported: true, credits: 0, message: '今天已经签过了' }
+      return {
+        ok: true,
+        supported: true,
+        credits: 0,
+        message: '今天已经签过了',
+        coversToday: true,
+        actionRequired: false,
+        recorded: true,
+      }
     }
     try {
       const result = await adapter.checkIn(account, ctx)
-      if (result.supported && result.ok) this.deps.accounts.setLastRun(key, at)
+      // ⚠️ 只有「覆盖今天」的成功才记档。`coversToday === false` 时**故意不记**，
+      // 于是当天稍晚的重试仍会真的去打一次上游（那正是我们要的）。
+      const coversToday = result.coversToday !== false
+      const recorded = result.supported && result.ok && coversToday
+      if (recorded) this.deps.accounts.setLastRun(key, at)
       const record: TaskLogRecord = {
         at: result.at,
         agentId: account.agentId,
@@ -420,39 +463,68 @@ export class TaskEngine {
       }`
       if (result.ok) this.deps.log.info(text, result.message ?? '')
       else this.deps.log.warn(text, result.message ?? '')
+      if (!coversToday) {
+        // 单独记一条：这是「今天还没真正处理」的信号，排查漏领时靠它。
+        this.deps.log.info(
+          `[${account.agentId}] ${account.label} 本轮结果不覆盖今天（今天尚未记账，稍后会重试）`,
+          result.message ?? '',
+        )
+      }
       return {
         ok: result.ok,
         supported: result.supported,
         credits: result.credits ?? 0,
         message: result.message ?? (result.ok ? '签到成功' : '签到失败'),
+        coversToday,
+        actionRequired: result.actionRequired === true,
+        recorded,
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       this.deps.log.warn(`[${account.agentId}] ${account.label} 每日签到抛错`, message)
-      return { ok: false, supported: true, credits: 0, message }
+      return { ok: false, supported: true, credits: 0, message, coversToday: false, actionRequired: false, recorded: false }
     }
   }
 
-  /** 批量签到。 */
+  /**
+   * 批量签到（某个 Agent 下所有该签的账号）。
+   *
+   * ⚠️ 计数的口径与参考实现的 `shouldMarkToday` 一致：**只有能证明「今天这一轮
+   * 已被处理」的才算成功**（`coversToday`）。把「刷新前那一轮」也算成成功，
+   * 会让汇总行显示「3 个成功」而实际上三个都没领到今天的东西。
+   */
   async checkInBatch(agentId: string, signal?: AbortSignal): Promise<{
     accounts: number
     ok: number
+    /** 真正记账到今天的条数（`ok` 的子集）。 */
+    recorded: number
+    /** 需要用户去别处操作的账号（不是故障，重试无用）。 */
+    actionRequired: number
     credits: number
-    details: Array<{ accountId: string; message: string }>
+    details: Array<{ accountId: string; message: string; coversToday: boolean; actionRequired: boolean }>
   }> {
     const targets = this.deps.accounts
       .byAgent(agentId)
       .filter((account) => account.enabled && this.checkInEnabledFor(account))
-    const details: Array<{ accountId: string; message: string }> = []
+    const details: Array<{ accountId: string; message: string; coversToday: boolean; actionRequired: boolean }> = []
     let ok = 0
+    let recorded = 0
+    let actionRequired = 0
     let credits = 0
     for (const account of targets) {
       if (signal?.aborted === true) break
       const outcome = await this.checkIn(account)
-      if (outcome.ok && outcome.supported) ok += 1
+      if (outcome.ok && outcome.supported && outcome.coversToday) ok += 1
+      if (outcome.recorded) recorded += 1
+      if (outcome.actionRequired) actionRequired += 1
       credits += outcome.credits
-      details.push({ accountId: account.id, message: outcome.message })
+      details.push({
+        accountId: account.id,
+        message: outcome.message,
+        coversToday: outcome.coversToday,
+        actionRequired: outcome.actionRequired,
+      })
     }
-    return { accounts: targets.length, ok, credits, details }
+    return { accounts: targets.length, ok, recorded, actionRequired, credits, details }
   }
 }

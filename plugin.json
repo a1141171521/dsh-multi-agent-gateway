@@ -41,7 +41,7 @@
         "provider": "multiagent-trae",
         "displayName": "Trae",
         "agentId": "trae",
-        "implemented": false
+        "implemented": true
       },
       {
         "provider": "multiagent-workbuddy",

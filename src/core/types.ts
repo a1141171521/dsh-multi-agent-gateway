@@ -175,6 +175,48 @@ export interface ModelMeta {
   inputModalities?: ('text' | 'image')[]
   /** 是否支持思维链（thinking / reasoning_content）。 */
   reasoning?: boolean
+  /**
+   * 该模型**实际声明的思考档位 id**（上游 wire 值，原样）。
+   *
+   * ## 为什么不能由核心层写死一组档位
+   *
+   * 各平台的档位 id 既是**上游 wire 值**，又彼此不同名、数量也不同：
+   *
+   *   | 平台 | 真实 id |
+   *   |---|---|
+   *   | Trae | `light` / `high` / `extra_high` |
+   *   | Cline | `none` / `low` / `medium` / `high` / `max` |
+   *   | Raccoon | `on` / `off` |
+   *
+   * 而走 OpenAI 协议的客户端只有**一套固定的 8 档词汇**
+   * （`none minimal low medium high xhigh max ultra`）。两边必然撞车 ——
+   * `max` 撞 `xhigh`、`low` 撞 `light`，结果是 **400 + 整轮对话不可用**，
+   * 而用户从两端都看不出为什么。
+   *
+   * 所以：**适配器负责如实报告模型声明了哪些档位**（这个字段），
+   * **核心层负责翻译**（`core/reasoning.ts` 的 `canonicalReasoningEffortFor` /
+   * `translateReasoningEffort`）。适配器不要去猜规范档位名，核心层也不要去猜
+   * 各平台有哪些档位 —— 两侧各猜一半必然漂移。
+   *
+   * 不填 = 不知道该模型有哪些档位（UI 就不该给它出档位选择器）。
+   */
+  reasoningEfforts?: string[]
+  /**
+   * 该模型**自己声明的默认档位**（上游 wire 值，必须落在 {@link reasoningEfforts} 内）。
+   *
+   * ## 为什么不能由核心层「猜一个中性的」
+   *
+   * 有的平台在目录里**明确下发了** `is_default`（Qoder 是
+   * `thinking_config.enabled.efforts.<key>.is_default`，我们的兜底目录逐条抄了它）。
+   * 拿一个启发式（「优先 medium，否则取中间那个」）去覆盖上游的明确声明，
+   * 后果是**用户一开口就跑在与官方客户端不同的档位上** ——
+   * 实测 `dfmodel` 上游声明 `max`，启发式会挑 `low`，
+   * 于是同样的模型在插件里「想得更少」，而用户完全看不出差别在哪。
+   *
+   * 优先级：**上游声明的默认 > 核心层的启发式**（`defaultReasoningEffortFor`）。
+   * 不填 = 上游没声明，交给核心层启发式。
+   */
+  defaultReasoningEffort?: string
   /** 该模型是否被上游标记为免费。 */
   free?: boolean
   updatedAt?: number
@@ -222,13 +264,54 @@ export interface TaskResult {
   at: number
 }
 
-/** 签到结论。`supported: false` 是**一等公民**：上游没有签到接口时要如实说，不报故障。 */
+/**
+ * 签到结论。`supported: false` 是**一等公民**：上游没有签到接口时要如实说，不报故障。
+ */
 export interface CheckInResult {
   ok: boolean
   supported: boolean
   credits?: number
   message?: string
   kind?: ErrorKind
+  /**
+   * 本次结论是否**覆盖「今天」这一轮**（缺省视为 `true`）。
+   *
+   * ## 为什么必须有这个字段（真实缺陷，参考实现 2026-10-02 审查定位）
+   *
+   * 「今天已领」（`ok: true` + 一句「今天已签过了」）**天然有歧义**：它只说明
+   * 「服务端现在认为没有可领的了」，而「没有可领的」在某些平台里**不等于**
+   * 「今天这一轮已领」。
+   *
+   * 典型是 Qoder：每日活动**10:00（UTC+8）才刷新**（服务端原文「每日 10:00
+   * （UTC+8）刷新，领取后 30 天有效」）。于是上午 9 点那次签到看到的是**昨天**
+   * 那条 `CLAIMED`，适配器如实回「今天已领」—— 记账层若拿它当「今天已处理」的
+   * 凭证记档，当天 10 点刷新后就**再也不会去领**，于是**每天静默漏掉 100 积分**。
+   *
+   * ## 判据只能由适配器给
+   *
+   * 修法**不是**在核心层配一张「各平台刷新时刻表」（那必然漂移），而是让**看得见
+   * 该平台刷新语义的那一层**自己回答。所以：
+   *
+   *   - 绝大多数平台（普通每日签到）**不用填**（缺省 `true`）；
+   *   - 观察到的是「刷新前的那一轮」时置 `false` ⇒ {@link "TaskEngine".checkIn}
+   *     不会把今天记为已签，当天稍晚会**自动重试**。
+   *
+   * ⚠️ 不要在核心汇总层用猜测补这个值 —— 那正是本缺陷的成因。
+   */
+  coversToday?: boolean
+  /**
+   * 该结果是「**需要用户先去做点什么**」而不是「等一会儿就好」（缺省 `false`）。
+   *
+   * 用来把两类「现在领不到」区分开：
+   *   - `false` —— 「今天活动还没开始」「等刷新」，**等一会儿/重试**即可；
+   *   - `true`  —— 「该账号尚未开通每日领取，请先用官方客户端登录一次」，
+   *     用户**必须去别处操作**，一直重试也没用。
+   *
+   * ⚠️ UI 必须判这个**布尔字段**，不要去判 `message` 是否非空、更不要匹配文案内容
+   * —— 后者会随措辞变化而失效。带 `actionRequired` 的提示应当**单独、醒目**地展示，
+   * 混在计数行里会被读漏。
+   */
+  actionRequired?: boolean
   at: number
 }
 

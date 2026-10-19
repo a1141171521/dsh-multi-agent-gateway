@@ -40,6 +40,7 @@ import { createHash } from 'node:crypto'
 import { BaseAdapter } from './base.js'
 import { unsupportedReason } from './messages.js'
 import { authHeaders, mergeHeaders } from '../core/http.js'
+import { parseRetryAfter } from '../core/errors.js'
 import { iterateSse } from '../core/sse.js'
 import type {
   AccountCredentials,
@@ -65,6 +66,19 @@ export const OPENCODE_DEFAULTS = {
   /** models.dev 里代表 OpenCode Console 的 provider key。 */
   pricingProvider: 'opencode',
 } as const
+
+/**
+ * 免费模型的 id 特征 —— **价格源拿不到时的兜底判据**。
+ *
+ * 正常情况靠价格算（`multiplierOf` 里峰值价 0 = 免费），但 models.dev 抖动、
+ * 新上架模型还没进价格表时，价格是 `undefined`（≠ 免费）。这时如果只认价格，
+ * 整个免费模型列表会突然空掉。所以再补一条：id 以 `-free` 结尾的算免费
+ * （`deepseek-v4.1-flash-free`、`beam-free` 都是这个形状）。
+ *
+ * 反向也成立：**没价、id 也不带 free 的一律当付费过滤掉** —— 宁可少列一个，
+ * 也不要让付费模型混进免费层的列表里（免费通道根本调不动它们）。
+ */
+export const FREE_MODEL_ID = /(?:^|[-_.])free$/i
 
 /**
  * OpenCode Console 的 OAuth 设备码登录（RFC 8628）。
@@ -351,6 +365,13 @@ interface PricingModel {
   name?: string
   description?: string
   reasoning?: boolean
+  /**
+   * 该模型**声明过的思考档位**（原始形状，见 {@link declaredReasoningEfforts}）。
+   *
+   * ⚠️ 线上唯一表达是 `reasoning_effort`，而它的合法值集合**只在这里**。
+   * 类型写成 `unknown[]` 是刻意的：形状要由解析函数逐条验，不靠 TS 断言。
+   */
+  reasoning_options?: unknown[]
   modalities?: { input?: string[]; output?: string[] }
   limit?: { context?: number; output?: number }
   cost?: { input?: number; output?: number; cache_read?: number; cache_write?: number }
@@ -385,6 +406,47 @@ export function microCentsToUsd(value: string | number | null | undefined): numb
   const micro = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(micro)) return undefined
   return micro / 100_000_000
+}
+
+/**
+ * 从 models.dev 的 `reasoning_options` 抽出该模型**声明过的思考档位 id**。
+ *
+ * ## 只认 `effort` 形态（与参考实现 `opencode-capability.ts` 逐条对齐）
+ *
+ * 官方 CLI 的档位表就是 `reasoning_options` 里 `effort.values` 的机械投影
+ * （官方仓库 `packages/core/src/variant.ts` 的 `resolve()`：对 `@ai-sdk/openai-compatible`
+ * 走 `openaiChat` 协议，**只有 `effort` 形态产出变体**），而线上的唯一表达就是
+ * `reasoning_effort`。故：
+ *
+ * - `type:'effort'` + `values` → **原序**产出，值就是上游认的 id；
+ * - `type:'toggle'` → **不产出**。旧实现把它翻成「关/开」两档，那是**语义发明**：
+ *   官方客户端对这类模型一个档位都不给，而 `reasoning_effort` 也表达不了「开关」。
+ *   更糟的是**上游会校验这个字段**（参考实现 2026-10-02 实测：非法值回
+ *   `[400] reasoning_…`），发一个它没声明过的档位等于拿整轮对话赌运气。
+ * - `type:'budget_tokens'`（预算制）→ 同理不产出。`reasoning.efforts` 表达不了
+ *   预算，编一档等于谎报能力。
+ *
+ * ⚠️ **空数组 ≠ 「支持但没有档位」**，而是「**不声明**档位」：调用方（`llm/adapter.ts`）
+ * 据此决定不给这个模型出档位选择器，而不是出一个空选择器。
+ *
+ * 实测样本（2026-10-19 拉 models.dev 的 `opencode` 条目，127 条里 100 条有
+ * `reasoning_options`）：
+ *   `gpt-5.4`        → `[{type:'effort',values:['none','low','medium','high','xhigh']}]`
+ *   `gpt-5-nano`     → `[{type:'effort',values:['minimal','low','medium','high']}]`
+ *   `qwen3.6-plus-free` → `[{type:'toggle'},{type:'budget_tokens',max:81920}]` → 空表
+ */
+export function declaredReasoningEfforts(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  for (const option of raw) {
+    if (typeof option !== 'object' || option === null) continue
+    const entry = option as { type?: unknown; values?: unknown }
+    if (entry.type !== 'effort' || !Array.isArray(entry.values)) continue
+    for (const value of entry.values) {
+      if (typeof value === 'string' && value.length > 0 && !out.includes(value)) out.push(value)
+    }
+  }
+  return out
 }
 
 /**
@@ -1022,12 +1084,19 @@ export class OpenCodeAdapter extends BaseAdapter {
   /**
    * 模型元数据（含积分倍率）。
    *
+   * ⚠️ **只返回免费模型**。OpenCode 是「免账号通道」：这个插件用它就是走免费层
+   * （匿名、不需要凭证），付费模型在免费通道上**根本调不动**。上游实测 85 个
+   * 模型里只有 9 个免费，全列出来只会把免费那几个淹没，用户还得一个个排除。
+   * 所以过滤放在这一层 —— 设置页的模型列表、勾选、探测、上报全都只看免费集合，
+   * 下游不用再各自判断一遍。
+   *
    * 数据来源三层，**越靠后优先级越高**（因为越靠后越知道「这个账号能用什么」）：
    *   1. `modelsUrl` 的公开模型 id 列表（不需要鉴权，一定有）；
    *   2. `pricingUrl`（models.dev）的显示名 / 上下文 / 价格 → **倍率**；
    *   3. 账号自己的 Console `/api/v2/config` → 这个工作区真正可用的模型与它的显示名。
    *
    * 任何一层失败都**降级不报错**（倍率变 `undefined` → UI 显示「未知倍率」）。
+   * 免费判定同理：价格拿不到时退回 id 特征（见 `FREE_MODEL_ID`），不会把列表清空。
    */
   async getModelMetaList(record: AccountRecord, ctx: AdapterContext): Promise<ModelMeta[]> {
     await this.ensureFreshCredentials(record, ctx)
@@ -1047,9 +1116,16 @@ export class OpenCodeAdapter extends BaseAdapter {
     }
 
     const out: ModelMeta[] = []
+    let paid = 0
     for (const id of ids) {
       const price = pricing.get(id)
       const derived = multiplierOf(price?.cost, baseline)
+      // 只留免费模型：价格说峰值价 0 / 倍率 0，或者 id 带 `-free`（价格拿不到时的兜底）。
+      // 判据必须两条都认 —— 只认价格的话，价格源一次失败就把免费列表清空了。
+      if (!(derived.free === true || derived.multiplier === 0 || FREE_MODEL_ID.test(id))) {
+        paid += 1
+        continue
+      }
       const workspaceName = workspace?.get(id)
       const name = workspaceName ?? price?.name ?? prettifyModelId(id)
       const meta: ModelMeta = {
@@ -1060,12 +1136,27 @@ export class OpenCodeAdapter extends BaseAdapter {
         updatedAt: now,
       }
       if (derived.multiplier !== undefined) meta.multiplier = derived.multiplier
-      if (derived.free) meta.free = true
+      // 免费标记：价格说峰值价 0（`derived.free`），或者 id 带 `-free`（兜底）。
+      // 兜底那条也要标上，否则价格源没回话时 UI 显示「未知倍率」，
+      // 用户会以为这些模型要花钱。
+      if (derived.free === true || FREE_MODEL_ID.test(id)) meta.free = true
       if (price !== undefined) meta.multiplierSource = `models.dev:${OPENCODE_DEFAULTS.pricingProvider}`
       if (price?.description !== undefined) meta.description = price.description
       if (price?.limit?.context !== undefined) meta.contextWindow = price.limit.context
       if (price?.limit?.output !== undefined) meta.maxTokens = price.limit.output
       if (price?.reasoning === true) meta.reasoning = true
+      // 该模型**声明过的档位**，原样上报（`reasoning` 回答「支不支持思考」，
+      // 这个回答「有哪些档可挑」—— 两个问题，不能用一个字段表达）。
+      //
+      // ⚠️ 拿到了 models.dev 的条目就**总是**写这个字段（哪怕结果是空数组），
+      // 因为「空数组」与「不填」在下游是**两种不同处置**：
+      //   - `[]`（toggle / budget_tokens 形态，或条目没声明档位）
+      //     = 这个模型**确实**没有档位可选 ⇒ 调用方要拦下请求里的 `reasoning_effort`
+      //       （上游会校验该字段，发它没声明过的值 = 400）；
+      //   - `undefined`（连条目都没拿到，比如 models.dev 整个失败）
+      //     = 我们**不知道**它的档位 ⇒ 调用方原样放行，不能把用户的显式选择丢掉。
+      // 若这里只在 `efforts.length > 0` 时才写，这两种处境就分不开了。
+      if (price !== undefined) meta.reasoningEfforts = declaredReasoningEfforts(price.reasoning_options)
       const modalities = price?.modalities?.input
       if (Array.isArray(modalities)) {
         meta.inputModalities = modalities.filter((item): item is 'text' | 'image' => item === 'text' || item === 'image')
@@ -1075,7 +1166,8 @@ export class OpenCodeAdapter extends BaseAdapter {
       out.push(meta)
     }
     out.sort((left, right) => {
-      // 免费的排前面（对用户最有价值），然后按倍率升序，最后按名字。
+      // 全部是免费的，理论上不必再按免费排；保留是为了「价格源给了倍率 0 的
+      // 少数几个」也能稳定排在前面，然后按倍率升序、最后按 id。
       const freeLeft = left.free === true ? 0 : 1
       const freeRight = right.free === true ? 0 : 1
       if (freeLeft !== freeRight) return freeLeft - freeRight
@@ -1084,6 +1176,12 @@ export class OpenCodeAdapter extends BaseAdapter {
       if (multLeft !== multRight) return multLeft - multRight
       return left.id.localeCompare(right.id)
     })
+    if (paid > 0) {
+      ctx.log.debug(
+        `只保留免费模型：${out.length} 个（已过滤 ${paid} 个付费模型）`,
+        '免费通道只覆盖免费模型；付费模型请填真 API key 并改 adapters 配置',
+      )
+    }
     return out
   }
 
@@ -1335,6 +1433,21 @@ export class OpenCodeAdapter extends BaseAdapter {
       }
       const verdict = describeOpenCodeError(response.status, parsed, { anonymous: freeTier })
       const kind = verdict?.kind ?? this.detectError(response.status, parsed, response.headers)
+      /**
+       * ⚠️ **把上游给的 `retry-after` 一并透出**（原先完全没读）。
+       *
+       * 这里走的是**裸 `fetch`**（`ctx.fetch ?? fetch`），绕开了
+       * `core/http.ts` 里那次 `parseRetryAfter` —— 所以头必须在这一层自己解析，
+       * 否则路由器永远拿到 `retryAfterMs === undefined`，只能退到
+       * `gateway.penaltySec`（默认 300 秒）。
+       *
+       * 代价是具体的：上游对额度窗口回 `retry-after: 43200`（12 小时），
+       * 我们却只锁 5 分钟 ⇒ 到点后账号被重新选中、再撞同一堵墙，**无限空转**，
+       * 而用户在界面上只看到「触发限流」反复出现，看不出真正的等待时长。
+       *
+       * `parseRetryAfter` 收 `Headers`，而这里拿到的是标准的 `response.headers`。
+       */
+      const retryAfterMs = parseRetryAfter(response.headers, Date.now())
       yield {
         type: 'error',
         failure: {
@@ -1342,6 +1455,9 @@ export class OpenCodeAdapter extends BaseAdapter {
           // 能自己给出**可执行**的话就用自己的；否则用上游原文。
           message: verdict?.message ?? extractErrorMessage(parsed) ?? `HTTP ${response.status}`,
           status: response.status,
+          // ⚠️ `0` 是**合法值**（「立即解除」），与 `undefined`（服务端没声明）
+          // 是两件事 —— 所以只在 `undefined` 时才省略这个字段，不能用 falsy 判据。
+          ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
           at: Date.now(),
         },
       }
@@ -1489,6 +1605,24 @@ export function describeOpenCodeError(
   const upstream = extractErrorMessage(body)
 
   if (isFreeTierError(body, text)) return { kind: 'unsupported', message: FREE_TIER_MESSAGE }
+
+  // ⚠️ **额度错误必须按「响应体里的类型名」判，不能按状态码**（参考实现的结论，
+  // 与它 `opencode-product.ts` 的顺序一致）。上游的额度错误可能带 400 / 401 /
+  // 403 / 429 任一状态码，按状态码会得到三种互相矛盾的结论：
+  //   403 → 落到下面的 `auth` 兜底 ⇒ 换号 + 界面报「密钥无效」（账号其实好着）
+  //   429 → `rate_limit` ⇒ 退到 penaltySec（默认 300s）的短冷却
+  //   400 → `bad_request` ⇒ 换号也没用，直接失败
+  // 三者都错，且**用户的唯一有效动作（等窗口恢复 / 切下一个号）会被掩盖**。
+  // 类型名是唯一稳定的信号 ⇒ 一律归 `quota`（换号 + 长冷却）。
+  if (/FreeUsageLimitError|GoUsageLimitError/i.test(text)) {
+    return {
+      kind: 'quota',
+      message:
+        `${upstream ?? '免费层额度已用尽'}。` +
+        '这是**当日额度窗口**用尽（不是密钥问题，也不是短时限流）：换一个账号可以继续，' +
+        '或者等窗口恢复（上游通常在 retry-after 里给出剩余时长）。',
+    }
+  }
 
   if (/RegionError|not available in your country/i.test(text)) {
     return {

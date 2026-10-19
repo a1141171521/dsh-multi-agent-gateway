@@ -17,10 +17,16 @@ Authorization: Bearer COSY.<载荷>.<签名>
 ```
 
 用普通 `Bearer <access_token>` 会直接 `403 Signature invalid (101)`；模型目录也是
-加密的。实现方式：把参考实现（`dsh-our-free-model`，MIT）的
+加密的。实现方式：把参考实现（`dsh-our-free-model`，MIT，<https://github.com/Ebony-Vinyl/dsh-our-free-model>）的
 `qoder-wasm.ts` / `qoder-machine.ts` / `qoder-product.ts` / `qoder-envelope.ts` /
 `qoder.ts` 与 `qoder-auth-wasm.wasm`（298 KB）**原样**搬进 `src/vendor/qoder/`，
 本插件只写一层薄适配器（`src/adapters/qoder.ts`）。
+
+> 这份参考实现也是 Qoder 的**行为口径来源**（MIT，可放心照抄结论）：
+> 倍率怎么随错峰窗口变（`qoderDisplayName` / `promotionActiveNow`）、
+> uid 为什么必须单独存（`ensureUid`）—— 见 KNOWN-ISSUES #0i / #0j 与 MODELS.md §5.6。
+> 本地副本：`E:\AIProject\DeepSeekPlugin\.scratch\dsh-our-free-model\`
+> （**在仓库外**，不会被提交；需要时重新 clone 即可）。
 
 搬运时改了两处（都写进了文件注释）：
 

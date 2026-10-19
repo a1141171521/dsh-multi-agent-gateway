@@ -5,3 +5,6 @@ node_modules/
 *.safety
 *.tmp
 preview/
+# 构建锁（scripts/build.mjs 用排他创建，见那里的注释）。它只在构建期间存在，
+# 但被 Ctrl-C 掉时会残留 —— 不该进仓库。
+.build.lock

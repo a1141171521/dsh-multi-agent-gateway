@@ -21,7 +21,7 @@
  */
 
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, join, relative, resolve } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { stripTypeScriptTypes } from 'node:module'
 
@@ -29,6 +29,54 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const srcDir = join(root, 'src')
 const libDir = join(root, 'lib')
 const checkOnly = process.argv.includes('--check')
+
+/**
+ * 构建锁：**允许多个进程同时构建，但同一时刻只跑一个**。
+ *
+ * 为什么需要：`lib/` 是**全量**产物（40 个文件），而多个人/多个终端同时
+ * 改不同模块时都会跑构建。没有锁就会出现「A 刚写完 lib，B 用它自己那份
+ * 基于旧 src 的产物覆盖掉」—— 症状是**测试莫名其妙地过了或挂了**，
+ * 而且换一次运行结果就变（本仓库真的踩过）。
+ *
+ * 实现取「排他创建 + 过期抢占」：
+ *   · `wx` 打开成功 = 拿到锁；
+ *   · 已存在且**未过期** → 退避重试；
+ *   · 已存在但**超过 staleMs** → 认为持锁进程已死（被 Ctrl-C 掉），抢占。
+ *
+ * 崩溃后残留的锁最多让下一次构建等 `staleMs`，不会永久卡死。
+ */
+function acquireLock() {
+  const lockPath = join(root, '.build.lock')
+  const staleMs = 30_000
+  const deadline = Date.now() + 60_000
+  for (;;) {
+    try {
+      writeFileSync(lockPath, String(process.pid), { flag: 'wx' })
+      return () => rmSync(lockPath, { force: true })
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+      let ageMs = 0
+      try {
+        ageMs = Date.now() - statSync(lockPath).mtimeMs
+      } catch {
+        continue // 锁刚被别人释放 —— 直接重试
+      }
+      if (ageMs > staleMs) {
+        rmSync(lockPath, { force: true })
+        continue
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`等待构建锁超时（${lockPath} 被 pid=${readFileSync(lockPath, 'utf8').trim()} 持有）`)
+      }
+      // 同步退避：构建本身只跑一秒，不值得为它上异步。
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120)
+    }
+  }
+}
+
+// `--check` 不写文件，无需串行。
+const releaseLock = checkOnly ? () => {} : acquireLock()
+process.on('exit', () => releaseLock())
 
 /** 递归列出文件。 */
 function walk(dir) {
@@ -41,13 +89,25 @@ function walk(dir) {
   return out
 }
 
-/** 把一个 .ts 转成 .js。 */
+/**
+ * 把一个 .ts 转成 .js。
+ *
+ * ⚠️ **`sourceUrl` 必须是仓库相对路径**，不能传绝对路径。
+ * `stripTypeScriptTypes` 会把它写成产物末尾的 `//# sourceURL=` 注释，
+ * 传绝对路径就意味着 `lib/` 里嵌了**本机的绝对路径**（`D:\AI\…` / `E:\AIProject\…`）：
+ *   · 换一台机器 / 换一个盘符构建，40 个产物文件全变成「已修改」，
+ *     真实改动被这一行路径噪声淹没（本仓库真发生过，每轮都要手工 revert）；
+ *   · 多个人同时构建时互相覆盖，diff 里全是路径。
+ * 相对路径对 source map 的调试用途没有损失 —— 栈里显示 `src/core/cache.ts`
+ * 比显示某台机器的绝对路径更有用。
+ */
 function transpile(file) {
   const source = readFileSync(file, 'utf8')
+  const stableUrl = relative(root, file).split(sep).join('/')
   try {
-    return stripTypeScriptTypes(source, { mode: 'strip', sourceUrl: file })
+    return stripTypeScriptTypes(source, { mode: 'strip', sourceUrl: stableUrl })
   } catch (error) {
-    throw new Error(`${relative(root, file)} 含有不可擦除的 TypeScript 语法：${error.message}`)
+    throw new Error(`${stableUrl} 含有不可擦除的 TypeScript 语法：${error.message}`)
   }
 }
 
