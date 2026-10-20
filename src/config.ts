@@ -71,7 +71,15 @@ export const DEFAULT_VISIBLE_AGENTS: readonly string[] = [
   'opencode',
   'qoder',
   'qoder-cn',
-  'trae',
+  // ⚠️ `trae` **不在**这里 —— 用户 2026-10-20 明确要求「trae 没有实现，把 trae 直接隐藏掉」。
+  //
+  // TraeAdapter 本身是能跑的（`IMPLEMENTED_IDS` 里仍然有它），只是**从界面上藏起来**：
+  // 本机没有 Trae 账号、签到与模型调用一次真上游都没打过，
+  // 露出来只会让用户点到一个没验证过的东西。等真机验证过再把它加回这一行即可。
+  //
+  // 注意：这只影响**默认值**。用户若在 `cordis.patch.yml` 里显式写了
+  // `agents.trae.visible: true`，仍然会显示（`visible` 是 volatile 字段，
+  // 显式值优先于这里的默认）—— 那是刻意的，别把显式配置也一起压掉。
   'workbuddy',
   'workbuddy-intl',
 ]

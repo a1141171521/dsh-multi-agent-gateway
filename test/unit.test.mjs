@@ -74,6 +74,8 @@ import {
 } from '../lib/llm/adapter.js'
 import { builtinAdapters } from '../lib/adapters/index.js'
 import { SKELETON_IDS } from '../lib/adapters/skeletons.js'
+// `resolveConfig`：验证「哪些平台默认露出」这类**默认值**（Trae 的隐藏就是靠它）。
+import { resolveConfig } from '../lib/config.js'
 
 const silent = {
   debug() {},
@@ -373,6 +375,60 @@ test('translateChunk：思维链字段的四种写法都认', () => {
 test('translateChunk：坏 JSON 只返回空数组（不抛）', () => {
   assert.deepEqual(translateChunk('{ not json'), [])
   assert.deepEqual(translateChunk('[DONE]'), [])
+})
+
+/**
+ * ⚠️ 用户报障 2026-10-20：**Qoder CN 的模型发消息后没有回复，直接显示「已完成」**，
+ * 同一账号的 Qoder 平台正常。
+ *
+ * 根因：上游在 **HTTP 200** 的流里回业务错误
+ * `{"code":"400","message":"[FAIL]…Execution failed: null","statusCodeValue":400}`，
+ * 而 `translateChunk` 只认 `parsed.error` —— 这一帧**一个条件都不命中**，
+ * 被当成「合法但空的 chunk」丢掉，流随后照常 `finish(stop)`。
+ * 于是 DSH 收到「成功但零正文」，界面上就是「已完成，没有回复」。
+ *
+ * 危害比报错大：报错用户至少知道要重试，**静默成功会被当成模型真没话说**。
+ * 参考实现（`openai-compat.ts`）对同一形态有显式分支，我们移植时漏了。
+ */
+test('translateChunk：网关形态/信封剥离后的错误帧不能被静默丢掉（Qoder CN 报障）', () => {
+  // ① 信封剥离后的统一形态（`unwrapQoderEnvelopeStream` 产出这个）
+  const stripped = translateChunk(JSON.stringify({
+    code: '400',
+    message: '[FAIL]node:oa_qwen-plus-main msg:Execution failed: null',
+    type: 'model_error',
+  }))
+  assert.equal(stripped.length, 1, '必须产出恰好一个 error 事件，而不是空数组')
+  assert.equal(stripped[0].type, 'error')
+  assert.equal(stripped[0].failure.kind, 'server')
+  assert.match(stripped[0].failure.message, /Execution failed/, '上游原文必须透出来')
+
+  // ② 直连网关形态：没有 `type`，靠 `statusCodeValue >= 400`
+  const gateway = translateChunk(JSON.stringify({
+    statusCodeValue: 400,
+    message: 'bad request from gateway',
+  }))
+  assert.equal(gateway.length, 1)
+  assert.equal(gateway[0].type, 'error')
+  assert.equal(gateway[0].failure.status, 400, 'status 要带出来（诊断用）')
+
+  // ③ 带 stackTrace 也算错误
+  const withStack = translateChunk(JSON.stringify({ message: 'boom', stackTrace: 'at foo' }))
+  assert.equal(withStack.length, 1)
+  assert.equal(withStack[0].type, 'error')
+
+  // ④ ⚠️ 防过度修正：**正常帧绝不能被误判**。
+  //    上游的正常帧也带 `statusCodeValue`（信封里是 200）与 `message` 字段吗？
+  //    不 —— 正常帧是 `choices` 形状，下面两条钉住这个边界。
+  const normal = translateChunk(JSON.stringify({ choices: [{ delta: { content: '你好' } }] }))
+  assert.deepEqual(normal, [{ type: 'text', text: '你好' }], '正常正文不能被当成错误')
+
+  // ⑤ 只有 `message`、既无状态码也无 type/stackTrace 的帧**不算错误**
+  //    （那是上游的普通通知帧，误判会让正常对话中断）
+  assert.deepEqual(translateChunk(JSON.stringify({ message: 'hello' })), [])
+
+  // ⑥ issue IKJOZ8 不能回归：心跳帧（body:null → 'null'）仍要返回空数组
+  assert.deepEqual(translateChunk('null'), [])
+  assert.deepEqual(translateChunk('{}'), [])
 })
 
 test('translateChunk：usage 与 finish 都能出来', () => {
@@ -1047,6 +1103,44 @@ test('注册表：内置清单包含全部六个平台，且接口完整', () =>
     const check = validateAdapter(adapter)
     assert.equal(check.ok, true, `${adapter.id} 缺少 ${check.missing.join(',')}`)
   }
+})
+
+/**
+ * ⚠️ 用户 2026-10-20 要求：「trae 没有实现，把 trae 直接隐藏掉」。
+ *
+ * 注意「隐藏」与「删掉」是两件事，这条用例把**两边的边界**都钉住：
+ *   - `trae` 仍然在注册表里（协议层完好，将来验证过只需改一行默认值就能放出来）；
+ *   - 但它默认 `visible=false` + `enabled=false`，于是 `isAgentActive()` 为假
+ *     ⇒ 不注册 provider、不进模型选择器、设置页也不露出。
+ *
+ * ⚠️ 还要钉住「显式配置能覆盖默认值」：`visible` 是 volatile 字段，
+ * 用户在 `cordis.patch.yml` 里写了 `agents.trae.visible: true` 就该显示 ——
+ * 别把显式配置一起压掉（那是「默认值」与「强制值」的区别）。
+ */
+test('Trae 默认隐藏但不删除：协议层仍在，且显式配置可覆盖', () => {
+  const ids = builtinAdapters().map((adapter) => adapter.id)
+  const resolved = resolveConfig({}, { knownAgentIds: ids, defaultDataDir: 'x' })
+
+  // ① 默认隐藏：两个开关都是假的（`isAgentActive` 要求 enabled && visible）
+  assert.equal(resolved.agents.trae.visible, false, 'trae 默认必须不可见')
+  assert.equal(resolved.agents.trae.enabled, false, 'trae 默认必须不启用')
+  const active = (config, id) => config.agents[id].enabled === true && config.agents[id].visible === true
+  assert.equal(active(resolved, 'trae'), false, 'trae 不该活跃 —— 否则会注册一个空 provider 分组')
+
+  // ② 其余五个平台不受影响
+  for (const id of ['opencode', 'qoder', 'qoder-cn', 'workbuddy', 'workbuddy-intl']) {
+    assert.equal(active(resolved, id), true, `${id} 不该被连累`)
+  }
+
+  // ③ 协议层没删：仍在注册表里，接口仍然完整
+  assert.ok(ids.includes('trae'), 'trae 必须仍在注册表 —— 隐藏≠删除')
+
+  // ④ 显式配置覆盖默认值（默认值 ≠ 强制值）
+  const forced = resolveConfig(
+    { agents: { trae: { visible: true, enabled: true } } },
+    { knownAgentIds: ids, defaultDataDir: 'x' },
+  )
+  assert.equal(active(forced, 'trae'), true, '显式写 visible/enabled 时应当重新显示')
 })
 
 test('骨架：默认全部返回「上游不支持」，而不是抛错', async () => {
@@ -2541,9 +2635,12 @@ test('Qoder：倍率按错峰窗口推算；「免费」只认 price_factor=0', 
   const list = await adapter.getModelMetaList(qoderRecord('dt-fake-token'), {})
   assert.ok(list.length > 5, '兜底目录应当有多个模型')
   const byId = new Map(list.map((meta) => [meta.id, meta]))
-  // 无促销的模型直接用目录价
-  assert.equal(byId.get('auto')?.multiplier, 0.5, 'auto 的目录倍率是 0.5')
-  assert.equal(byId.get('auto')?.multiplierSource, 'qoder:catalog')
+  // ⚠️ 「无促销的模型直接用目录价」这条覆盖意图，**不能**再拿 `auto` 当样本 ——
+  // `auto` 是 Qoder 的智能路由**档位**（不是厂商模型），2026-10-20 起已不上报
+  // （见 `QODER_NON_VENDOR_MODEL_IDS`）。改用厂商模型 `mmodel`（MiniMax-M3，
+  // 目录价 0.2、无 promotion），覆盖意图完全不变。
+  assert.equal(byId.get('mmodel')?.multiplier, 0.2, 'mmodel 的目录倍率是 0.2')
+  assert.equal(byId.get('mmodel')?.multiplierSource, 'qoder:catalog')
   // qfmodel 的 price_factor 是 0（合法值）→ 真免费
   assert.equal(byId.get('qfmodel')?.multiplier, 0)
   assert.equal(byId.get('qfmodel')?.free, true)

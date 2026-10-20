@@ -27,6 +27,76 @@
  */
 
 /** 兜底模型目录中的一个条目（字段口径见下方 `QODER_FALLBACK_MODELS` 的注释）。 */
+/**
+ * **不是厂商模型**的目录条目 id（Qoder 自己的「档位 / 路由名」）。
+ *
+ * ## 为什么要有这个集合
+ *
+ * Qoder 目录把两类东西混在同一个 `chat` 场景里下发：
+ *
+ *   1. **具体厂商模型** —— `Qwen3.8-Max` / `DeepSeek-V4-Pro` / `Kimi-K3`…
+ *      （`name` 是「厂商 + 型号」）；
+ *   2. **档位（tier）与路由名** —— `auto` / `ultimate` / `performance` /
+ *      `efficient` / `smodel`(Sonus) / `cmodel`(Cantus)。
+ *      它们背后是「由 Qoder 按策略选模型」，**不对应任何一家厂商的模型**。
+ *
+ * 用户要求（2026-10-20）：「Sonus、Auto这些不是厂商的模型，直接排除掉」
+ * —— 档位名出现在 DSH 的模型选择器里会让人以为那是可直连的模型。
+ *
+ * ## 这批 id 的官方依据（**不是猜的**）
+ *
+ * Qoder 官方文档把「档位」与「具体模型」**分两张表**列，原文标题就是
+ * 「Choose a **tier**」与「Select a specific model」
+ * （<https://docs.qoder.com/user-guide/chat/model-tier-selector>）：
+ *
+ * | 官方档位 | 官方 Credit 倍率 | 本表 `priceFactor` | 本表 id |
+ * |---|---|---|---|
+ * | Auto (Smart Routing) | ~0.5× | 0.5 | `auto` |
+ * | Ultimate | ~2.0× | 2 | `ultimate` |
+ * | Fast（原 Performance） | 1.1× → 0.8× | 1.1 | `performance` |
+ * | Efficient | ~0.3×（限免期 0.0×） | 0.3 | `efficient` |
+ *
+ * 四条的倍率**逐条对上**，这就是它们属于「档位」而不是厂商模型的直接证据。
+ * `Performance` 更名为 `Fast` 见官方公告《Qoder Tier Upgrade: Performance
+ * Becomes Fast》（<https://docs.qoder.com/product-overview/fast-mode-announcement>，
+ * 原文：`Performance in the Qoder Desktop tier selector will be upgraded to Fast`）。
+ *
+ * `smodel`(Sonus) / `cmodel`(Cantus) 不在公开档位表里（它们是内部代号），
+ * 但判据同型：`name` 既无厂商也无型号，且官方的**具体模型**表里没有它们。
+ * 注意 CN 目录**根本没有**这 5 条（见 `QODER_CN_FALLBACK_MODELS` 的注释），
+ * 所以受影响的只有国际版那份表。
+ *
+ * ## ⚠️ 只用于「不上报」，**不要从表里物理删除条目**
+ *
+ * 这些 id 仍留在 {@link QoderFallbackModel} 表里，因为表还被
+ * `effectiveMultiplier` / `qoderEffortsOf` 等**按 id 查表**的路径使用。
+ * 物理删除会让「用户以前在配置里勾选过 `smodel`」变成**悬空引用**
+ * （配置留着 id、目录里查不到 → 界面上那个模型消失且无法解释）。
+ *
+ * 过滤只发生在 `QoderAdapter.getModelMetaList()`：**不进 DSH 模型选择器**，
+ * 但协议层照旧认识它们。
+ */
+export const QODER_NON_VENDOR_MODEL_IDS: readonly string[] = [
+  'auto', // Auto —— 智能路由档位
+  'ultimate', // Ultimate —— 专家级深度推理档位
+  'performance', // Performance —— 已更名为 Fast 的档位
+  'efficient', // Efficient —— 标准推理档位
+  'smodel', // Sonus —— 内部档位代号
+  'cmodel', // Cantus —— 内部档位代号
+]
+
+/** 上表的 Set 形式（查询用；`readonly string[]` 每次 `includes` 是 O(n)）。 */
+const NON_VENDOR_MODEL_ID_SET = new Set<string>(QODER_NON_VENDOR_MODEL_IDS)
+
+/**
+ * 该条目是不是**厂商模型**（`false` = 是 Qoder 自己的档位/路由名，不上报）。
+ *
+ * 口径：`name` 是不是「厂商 + 型号」。见 {@link QODER_NON_VENDOR_MODEL_IDS}。
+ */
+export function isVendorModel(id: string): boolean {
+  return !NON_VENDOR_MODEL_ID_SET.has(id)
+}
+
 export interface QoderFallbackModel {
   /** 模型目录 **key**（如 `qfmodel`）。
 
@@ -365,6 +435,12 @@ const QODER_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
   // 实际 8、`qmodel_38max` 写 0.5 实际 0.2），用户据此报障。
   // 改动本表时必须重新对照 catalog，不要凭印象填。
   //
+  // ⚠️ **本表前 6 条（`auto` / `ultimate` / `performance` / `efficient` /
+  // `smodel` / `cmodel`）不是厂商模型**，是 Qoder 自己的档位/路由名 ——
+  // 它们**留在表里**（协议层按 id 查表要用），但**不上报**给模型选择器，
+  // 由 `QODER_NON_VENDOR_MODEL_IDS` + `getModelMetaList()` 的过滤实现。
+  // 依据与理由见那个常量的注释。**不要为了「排除」而删掉这几行。**
+  //
   // 字段顺序：id, 展示名, 上下文, vl, reasoning, free, 倍率
   //
   // ⚠️ `contextWindow` 取官方档位表 `context_config` 的**最大档**，不是 `max_input_tokens`
@@ -481,6 +557,12 @@ const QODER_CN_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
   // ⚠️ 全部数值逐条对照本机 CN catalog-v6 的 chat 场景实解值（2026-09-27）。
   // 国际版曾因为「手工估值 + 单测只断言 id 列表」让价格漂移长期未被发现
   // （14 个模型有偏差，用户报障）。改本表必须重新跑探针对照。
+  //
+  // ⚠️ **本表只有 `auto` 一条是非厂商模型**（Qoder 的智能路由档位）——
+  // 另外 5 条档位（`ultimate` / `performance` / `efficient` / `smodel` /
+  // `cmodel`）CN 目录**本来就没有**，见下面的「不能沿用国际版那张表」。
+  // `auto` 同样**留在表里只做过滤**，理由见 `QODER_NON_VENDOR_MODEL_IDS`。
+  // ⇒ 两份表都要过滤：国际版要滤 6 条，CN 只需滤 1 条，但过滤逻辑是同一份。
   //
   // ⚠️ **`contextWindow` 取官方档位表 `context_config` 的最大档，不是 `max_input_tokens`。**
   //

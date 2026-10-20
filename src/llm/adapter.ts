@@ -288,6 +288,46 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
     }
 
     /**
+     * 本轮的**采样起点**。
+     *
+     * ⚠️ 必须在 `router.execute` **之前**取。原先它在 `router.execute` 之后
+     * （也就是「第一个事件已经拿到」之后）才取，于是两个字段一起失真：
+     *
+     *   - `ttftMs` 恒为 **0** —— 「等首字」的那一整段被排除在计时之外，
+     *     日志里「首字」那一列永远是 0；
+     *   - `durationMs` 只剩「首字之后」的耗时，比用户真实等待短一大截
+     *     （实测 Qoder `auto`：日志 679ms，真实 2044ms）。
+     *
+     * `computeTps` 用的是 `durationMs - ttftMs`（解码窗口），两者同步平移，
+     * 所以速度大致还对；但「耗时」与「首字」两列一直在骗人。
+     * 起点提前之后两者都回到真实口径，且 `computeTps` 的语义不变。
+     */
+    const startedAt = Date.now()
+
+    /**
+     * 当前模型的元数据 —— **倍率的唯一来源**（`ModelMeta.multiplier` / `free`）。
+     *
+     * ⚠️ 查不到**不是错误**，更**不能退化成 `multiplier: 0`**：
+     * 我们的口径里 `0` = **免费**（见 `formatMultiplier`）。模型不在上报列表里
+     * （用户没勾选）、目录还没拉到，都只是「**不知道**倍率」——
+     * 给「不知道」写一个 0，等于在日志里告诉用户「这一轮不要钱」。
+     * 所以查不到时采样里**不放这两个键**，让界面显示「未知倍率」。
+     *
+     * 查元数据本身包了 try/catch：它要读模型目录（可能打上游/读缓存），
+     * 读不到不该让整轮对话失败 —— 之前这条路径只在用户传了 `reasoningEffort`
+     * 时才会走到，现在无条件走，所以必须自己兜住。
+     */
+    let modelMeta: ModelMeta | undefined
+    try {
+      modelMeta = (await find(options.model))?.meta
+    } catch (error) {
+      deps.log.debug(
+        '读取模型元数据失败，本轮不记倍率',
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+
+    /**
      * 思考档位：把客户端选的**规范名**翻译成模型**真正声明过的** id。
      *
      * ## 为什么必须翻译而不是原样下发
@@ -434,8 +474,9 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
       },
     )
 
-    // ── 采样：把这一轮的耗时 / 首字 / token 记下来（成功失败都记） ──
-    const startedAt = Date.now()
+    // ── 采样：把这一轮的耗时 / 首字 / token / 倍率记下来（成功失败都记） ──
+    // ⚠️ `startedAt` 在 `router.execute` **之前**就取好了（见上面的说明），
+    //    这里绝不能再取一次 —— 那样「首字」会变回 0、耗时也短一截。
     let ttftMs: number | undefined
     let usage: TokenUsage | undefined
     let failureMessage: string | undefined
@@ -447,10 +488,42 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
       settled = true
       if (deps.onRequest === undefined) return
       const durationMs = Date.now() - startedAt
+      /**
+       * 倍率与「是否免费」。
+       *
+       * ⚠️ 约定是「**不知道就不写，不拿 0 冒充未知**」（见 `core/request-log.ts`）。
+       * 客户端 `multiplierTag()` 把 `undefined` 画成「未知倍率」、把 `0` 画成「免费」——
+       * 两者对用户是完全不同的结论，而「未知」与「免费」我们分得清，就必须分开写。
+       *
+       * 三条分支，覆盖全部情形：
+       *   - 拿到倍率 → 免不免费**是确定的**（`0` 就是免费），两个键一起写；
+       *   - 没倍率但上游明确标了免费 → 只写 `free: true`（「免费」说得出口）；
+       *   - 都没有 → **两个键都不写**，界面显示「未知倍率」。
+       *
+       * 最后一种就是用户报的那个「倍率为未知」：宁可显示未知，
+       * 也不能编一个 0 出来让用户以为这一轮不要钱。
+       */
+      const multiplier = modelMeta?.multiplier
+      const hasMultiplier = typeof multiplier === 'number' && Number.isFinite(multiplier)
+      // 与 `formatMultiplier` 同一口径：上游标了 `free`，或倍率恰好是 0，都算免费。
+      const free = modelMeta?.free === true || multiplier === 0
       const sample: Omit<RequestLogEntry, 'ts'> = {
         agentId: targetAgent,
         agentName: displayNameOf(),
         model: upstreamModel,
+        /**
+         * 展示名 —— 与 DSH 选择器里显示的那个名字一致（如 `Qwen3.8-Flash`）。
+         *
+         * ⚠️ **用户报障**：「请求日志的模型名全部都是 `qfmodel`，并不是真实选中的
+         * 模型名称」。查下来记录**是对的** —— `qfmodel` 就是上游目录 key、
+         * 也就是我们真正发出去的那个值；问题是它在界面上**根本不可见**
+         * （选择器里写的是 `Qwen3.8-Flash`）。两套词汇对不上，用户自然认为记错了。
+         *
+         * 所以两个都存：`model` 供排查（它才是发上游的那个值），
+         * `modelName` 供阅读。取不到展示名就**不写**这个键，界面退回显示 id ——
+         * 绝不拿 id 冒充名字（那正是这条报障的成因）。
+         */
+        ...(modelMeta?.name === undefined || modelMeta.name === '' ? {} : { modelName: modelMeta.name }),
         accountId,
         ok,
         durationMs,
@@ -458,6 +531,8 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
         ...(usage?.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
         ...(usage?.outputTokens === undefined ? {} : { outputTokens: usage.outputTokens }),
         ...(usage?.reasoningTokens === undefined ? {} : { reasoningTokens: usage.reasoningTokens }),
+        ...(hasMultiplier ? { multiplier } : {}),
+        ...(hasMultiplier || free ? { free } : {}),
         ...(failureMessage === undefined ? {} : { error: failureMessage }),
       }
       const tps = computeTps({
@@ -519,6 +594,17 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
      */
     let textBuf = ''
     let reasoningBuf = ''
+    /**
+     * 是否已经收到上游的 `finish`，以及它给的终止原因。
+     *
+     * ⚠️ 收到 finish **不等于**这一轮结束：usage 末帧排在它后面（见 `case 'finish'`）。
+     */
+    let finishSeen = false
+    let finishReason: string | undefined
+    /** finish 之后最多等到什么时候（毫秒时间戳）。 */
+    let drainUntil = 0
+    /** usage 是否已经透给 DSH（finish 前透的记 `true`，之后补发时也记）。 */
+    let usageYielded = false
     const toolBlocks = new Map<number, { block: number; id: string; name: string; args: string }>()
     /** 拿一个全新的块下标。 */
     const allocate = (): number => {
@@ -540,8 +626,93 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
         kind: toolBlocks.size > 0 ? 'tool-calls' : upstreamReason === 'length' ? 'max-tokens' : 'stop',
       },
     })
+    /**
+     * 关掉所有还开着的块，**幂等**（调用第二次什么也不发）。
+     *
+     * 抽出来是因为收尾路径变多了：`finish`、`error`、以及「流断了没给 finish」。
+     * 三处各写一遍的话，`finish` 之后再收到 `error`（drain 窗口内是可能的）
+     * 就会把同一个块关两次 —— DSH 侧收到两个 `block-end`，
+     * 而后一个是空正文，正好又踩「覆盖式赋值把正文冲掉」那条坑。
+     *
+     * 工具块照旧带上累积的 `name` / `arguments`，否则拼不回完整调用。
+     */
+    let blocksClosed = false
+    function* closeBlocks(): Generator<DshStreamChunk> {
+      if (blocksClosed) return
+      blocksClosed = true
+      for (const state of toolBlocks.values()) {
+        yield {
+          type: 'block-end',
+          index: state.block,
+          block: { type: 'tool-call', id: state.id, name: state.name, arguments: state.args },
+        }
+      }
+      if (textBlock >= 0) {
+        yield { type: 'block-end', index: textBlock, block: { type: 'text', text: textBuf } }
+      }
+      if (reasoningBlock >= 0) {
+        yield { type: 'block-end', index: reasoningBlock, block: { type: 'reasoning', text: reasoningBuf } }
+      }
+    }
+    const iterator = outcome.value.events[Symbol.asyncIterator]()
+    /** 超时哨兵（事件一定是对象，用唯一 symbol 不会撞）。 */
+    const TIMEOUT = Symbol('usage-drain-timeout')
+    /**
+     * 取下一个事件；`finish` 之后受 {@link USAGE_DRAIN_MS} 约束。
+     *
+     * ⚠️ 超时必须**在这里**判，不能写成循环体里的一句 `if (Date.now() > drainUntil)`：
+     * `for await` 卡在 `next()` 上时循环体根本不执行，那种写法对着
+     * 「发完 finish 就挂住连接」的上游会**永远等下去**（用户感知就是对话不结束）。
+     * 这里的 `Promise.race` 才是真正的上限。
+     *
+     * 返回 `undefined` 表示流已结束或等待超时 —— 两种情况后面走同一套收尾。
+     */
+    const nextEvent = async (): Promise<import('../core/types.js').StreamEvent | undefined> => {
+      if (!finishSeen) {
+        const next = await iterator.next()
+        return next.done === true ? undefined : next.value
+      }
+      const remaining = drainUntil - Date.now()
+      if (remaining <= 0) return undefined
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const pending = iterator.next()
+      // ⚠️ 超时先赢时，这个 promise 之后若失败就**没有人接**了 ——
+      // Node 默认把未处理的 rejection 当致命错误（崩进程）。这里先挂一个空的
+      // 处理函数兜住它；真正失败且**先赢**的情况仍会由下面的 `race` 正常抛出。
+      pending.catch(() => {})
+      try {
+        const result = await Promise.race([
+          pending,
+          new Promise<typeof TIMEOUT>((resolve) => {
+            timer = setTimeout(() => resolve(TIMEOUT), remaining)
+          }),
+        ])
+        if (result === TIMEOUT) {
+          // 尽力关掉上游流（`iterateSse` 的 `finally` 会释放 reader）。
+          // 只发不等：它要是不肯结束，我们也不能再搭进去一次等待。
+          try {
+            void iterator.return?.()?.catch?.(() => {})
+          } catch { /* 释放失败无所谓 */ }
+          return undefined
+        }
+        return result.done === true ? undefined : result.value
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
+    }
     try {
-      for await (const event of outcome.value.events) {
+      for (;;) {
+        const event = await nextEvent()
+        if (event === undefined) {
+          // 只在「确实没等到 usage」时记一条 —— 正常收到 usage 的情况不该刷日志。
+          if (finishSeen && usage === undefined) {
+            log.debug(
+              `finish 后没有收到 usage 帧（最多等了 ${USAGE_DRAIN_MS}ms）`,
+              `model=${upstreamModel}（该上游可能不支持 stream_options.include_usage，token 只能留空）`,
+            )
+          }
+          break
+        }
         // 首字延迟：第一段「用户能看见的内容」到达的时刻。
         // 思维链也算 —— 它同样是用户可见的等待结束点。
         if (ttftMs === undefined && (event.type === 'text' || event.type === 'reasoning' || event.type === 'tool_call')) {
@@ -590,38 +761,45 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
           }
           case 'usage': {
             usage = event.usage
-            yield { type: 'usage', usage: event.usage }
+            // finish **之前**到的 usage 照旧立刻透给 DSH；
+            // 之后的（Qoder 就是这种）留到循环结束后统一补发，见 `usageYielded`。
+            if (!finishSeen) {
+              usageYielded = true
+              yield { type: 'usage', usage: event.usage }
+            }
             break
           }
           case 'finish': {
+            // 可能重复到达（`iterateSse` 在 `[DONE]` 与流结束时会各补一次），
+            // 所以收尾动作只做一次。
+            if (finishSeen) break
+            finishSeen = true
+            finishReason = event.reason
+            /**
+             * ⚠️ **收到 finish 不能马上 return**（真实缺陷，用户报「输入/输出为 —」）。
+             *
+             * `stream_options.include_usage` 的 usage 末帧**排在 finish 之后**：
+             * 本机实测 Qoder CN `auto`（2026-10-20）的事件序列是
+             * `… #16 text → #17 finish → #18 usage`，usage 比 finish **晚 17ms**。
+             * 原先这里直接 `return`，于是 usage 永远读不到 ⇒ 采样里
+             * `inputTokens` / `outputTokens` / `tps` 三个字段永远缺席。
+             *
+             * 所以这里改成「**收尾但不结束**」：先把块关掉（用户看到的内容不受影响），
+             * 然后继续拉一小段，只为了等那一帧 usage。
+             *
+             * 等的代价通常是 **0ms** —— 上游发完 usage 紧接着就是 `[DONE]`
+             * 并关闭连接，循环自然结束。`USAGE_DRAIN_MS` 只是兜底上限，
+             * 防止某个上游发完 finish 却挂着连接不放，把用户的一轮对话拖住。
+             */
+            drainUntil = Date.now() + USAGE_DRAIN_MS
             // 关掉所有开着的块（工具块带上累积的 name/arguments，DSH 侧才拼得回完整调用）。
-            for (const state of toolBlocks.values()) {
-              yield {
-                type: 'block-end',
-                index: state.block,
-                block: { type: 'tool-call', id: state.id, name: state.name, arguments: state.args },
-              }
-            }
-            if (textBlock >= 0) {
-              yield { type: 'block-end', index: textBlock, block: { type: 'text', text: textBuf } }
-            }
-            if (reasoningBlock >= 0) {
-              yield { type: 'block-end', index: reasoningBlock, block: { type: 'reasoning', text: reasoningBuf } }
-            }
-            // 上游给了终止事件 —— 正常收尾。这里必须结算采样，
-            // 因为下面马上 `return`，走不到函数底部那次 settle。
-            settle(true)
-            yield finishChunk(event.reason)
-            return
+            // 用户看到的内容到这里就完整了；下面再等只是为采样收 usage。
+            yield* closeBlocks()
+            break
           }
           case 'error': {
             // 这里同样要带上已流出的正文 —— 报错也不能把用户已经看到的话吞掉。
-            if (textBlock >= 0) {
-              yield { type: 'block-end', index: textBlock, block: { type: 'text', text: textBuf } }
-            }
-            if (reasoningBlock >= 0) {
-              yield { type: 'block-end', index: reasoningBlock, block: { type: 'reasoning', text: reasoningBuf } }
-            }
+            yield* closeBlocks()
             failureMessage = event.failure.message
             settle(false)
             yield {
@@ -649,10 +827,31 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
       }
       return
     }
-    // 上游流没给终止 —— 兜一个，DSH 侧才能收尾。
-    // 有工具调用时这里也必须是 `tool-calls`，否则又是「工具不执行 + 死循环」。
+    /**
+     * 收尾并结算采样。
+     *
+     * ⚠️ **顺序不能反**：先走完上面的循环（把 finish 之后那帧 usage 收进来），
+     * 再 `settle()`。原先是在 `case 'finish'` 里立刻 `settle()` 后 `return`，
+     * 于是 usage 永远来不及进采样 —— 这正是用户看到的「输入/输出为 —」。
+     *
+     * `settle()` 自己在内部去重（`settled`），这里调用是安全的：
+     * 无论走的是「正常收到 finish」「上游没给终止」还是「drain 超时」，
+     * 都只会写一条日志。
+     */
+    // 上游**没给 finish** 就断了（真适配器走 `iterateSse` 时不会出现 —— 它总会补一个
+    // finish；这里防的是自定义/未来适配器）：块还开着，必须补 `block-end`。
+    // 漏掉它的后果与「block-end 传空串」是同一类：DSH 侧拼不回完整正文 ——
+    // 用户已经看到的字会被丢掉一截。已收到 finish 的情况由 `closeBlocks` 的幂等挡掉。
+    yield* closeBlocks()
     settle(true)
-    yield finishChunk()
+    // finish 之后才到的 usage：补发给 DSH（DSH 侧靠它显示 token 用量）。
+    if (usage !== undefined && !usageYielded) {
+      usageYielded = true
+      yield { type: 'usage', usage }
+    }
+    // 收到过 finish 就照它报（`tool-calls` / `max-tokens` 的判定在 finishChunk 里）；
+    // 没收到过（上游流直接断）则兜一个，DSH 侧才能收尾。
+    yield finishChunk(finishReason)
   }
 
   return {
@@ -713,6 +912,30 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
     },
   }
 }
+
+/**
+ * 收到上游 `finish` 之后，最多再等多久来收那一帧 usage（毫秒）。
+ *
+ * ## 为什么需要「等」
+ *
+ * `stream_options.include_usage` 的 usage 末帧**排在 finish 之后**。
+ * 本机实测 Qoder CN `auto`（2026-10-20）的事件序列：
+ *
+ * ```
+ * … #16 text「你好」 → #17 finish(stop) → #18 usage{input:15, output:54}
+ * ```
+ *
+ * usage 比 finish 晚 **17ms**。若收到 finish 就 `return`，这一帧永远读不到，
+ * 采样里 `inputTokens` / `outputTokens` / `tps` 就全空 —— 用户看到的
+ * 「输入、输出、速度为 —」正是这么来的。
+ *
+ * ## 为什么上限是 250ms
+ *
+ * 正常上游发完 usage 紧接着就 `[DONE]` 并关闭连接，循环自然结束，**一秒都不等**。
+ * 这个上限只兜「发完 finish 却挂着连接不放」的上游；250ms 相对实测的 17ms
+ * 有十几倍余量，又短到用户完全感觉不到。
+ */
+const USAGE_DRAIN_MS = 250
 
 /** DSH 的 `GenerateOptions.messages` → OpenAI 兼容 messages。 */
 export function toOpenAiMessages(options: DshGenerateOptions): Array<Record<string, unknown>> {

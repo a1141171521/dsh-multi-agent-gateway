@@ -153,7 +153,7 @@ export function registerTools(deps: ToolDeps): Array<() => void> {
         const input = (args ?? {}) as Record<string, unknown>
         const agentId = typeof input.agentId === 'string' ? input.agentId : undefined
         if (input.refresh === true) {
-          return { ok: true, data: await runtime.refreshQuotas(agentId) }
+          return { ok: true, data: await runtime.refreshQuotas({ agentId }) }
         }
         return { ok: true, data: runtime.snapshotQuotas(agentId) }
       },

@@ -32,7 +32,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { BuddyAdapter, BUDDY_CN, BUDDY_INTL, capabilitiesFor } from '../../lib/adapters/buddy.js'
+import { BuddyAdapter, BUDDY_CN, BUDDY_INTL, capabilitiesFor, parseModelsFromConfig } from '../../lib/adapters/buddy.js'
 import {
   CHECKIN_ACTIVITY_STATUS_PATH,
   DAILY_CHECKIN_PATH,
@@ -45,6 +45,17 @@ import {
   parseCreditPackage,
   roundCredits,
 } from '../../lib/adapters/buddy-credits.js'
+import {
+  formatCreditsRate,
+  normalizeCreditsRate,
+  normalizeDiscountedRate,
+  parseModelPromotions,
+} from '../../lib/vendor/buddy/buddy-rate.js'
+import {
+  decideReasoningEffort,
+  isDeepSeekModel,
+  parseReasoningFields,
+} from '../../lib/vendor/buddy/buddy-reasoning.js'
 
 // ───────────────────────────── 假 ctx ─────────────────────────────
 
@@ -831,4 +842,1255 @@ test('所有业务端点都是 POST + 空对象体（实测口径）', async () 
     calls.map((c) => c.url.replace('https://copilot.tencent.com', '')),
     [CHECKIN_ACTIVITY_STATUS_PATH, USER_RESOURCE_PATH],
   )
+})
+
+// ═══════════════════════ task-10：登录（四步） ═══════════════════════
+//
+// 用户报障：「workbuddy 授权登录后，并没有加入账号进来。WorkBuddy International 也是同样的问题」。
+//
+// ## 根因（本文件就是在钉住它）
+//
+// 上游 `/v2/plugin/auth/token` 回的是 **camelCase**（`accessToken` / `refreshToken`
+// / `expiresIn`）—— 参考实现 `buddy.ts:331-344` 的 `parseTokenData` 读的就是这些，
+// 且带一条 e2e 实证（2026-09-11）。我们原来读的是 **snake_case `data.access_token`**
+// （那个形状只出现在**落盘后的凭据**里，不是响应形状）⇒ 恒为 undefined
+// ⇒ 恒判「还没检测到登录」⇒ **授权完成也永远 pending，账号永远加不进来**。
+//
+// ## fixture 出处
+//
+// | fixture | 出处 |
+// |---|---|
+// | token 响应的 **camelCase** 字段名（`accessToken`/`refreshToken`/`expiresIn`） | 参考 `buddy.ts:331-344` + 该处 e2e 实证注释（2026-09-11） |
+// | account 响应的字段名（`uid`/`nickname`/`enterpriseId`/`type`） | 参考 `buddy.ts:353-362` 的 `parseAccountData`（抓包字段名） |
+// | `{"code":11217,"msg":"11217:login ing...","requestId":"…"}` + **HTTP 200** | **Lead 本机真打实测**（`.scratch/probe-buddy-intl-token.mjs`，本文件作者复跑确认） |
+// | `code: 12151` = 账户信息尚未完成 | 参考 `buddy.ts:69` 的 `CODE_ACCOUNT_NOT_READY` |
+// | 国际版追加 `version` + `loginSessionId` | 参考 `buddy-oauth.ts:538-551` 的 `decorateLoginUrl` + `product.ts:405-406` |
+// | 昵称在 JWT 里而不在 account 响应里 | 参考 `buddy.ts:196-207` 的 `jwtNickname` + `buddy.ts:347-351` 的注释（e2e 实证） |
+
+/** 用假 `ctx.fetch` 驱动登录流程；按 URL 子串路由，**记录每次调用**。 */
+function loginCtx(routes, { now = 1_760_000_000_000 } = {}) {
+  const calls = []
+  const ctx = {
+    config: { upstream: { apiBaseUrl: '' }, requestTimeoutMs: 5_000 },
+    log: { debug() {}, info() {}, warn() {}, error() {}, child() { return this } },
+    http: async () => jsonResult({ code: 0, data: {} }),
+    fetch: async (url, init = {}) => {
+      const text = String(url)
+      calls.push({ url: text, method: init.method ?? 'GET', headers: init.headers ?? {} })
+      for (const [needle, handler] of Object.entries(routes)) {
+        if (text.includes(needle)) {
+          const spec = typeof handler === 'function' ? handler(text, init) : handler
+          return new Response(typeof spec.body === 'string' ? spec.body : JSON.stringify(spec.body ?? {}), {
+            status: spec.status ?? 200,
+            headers: { 'content-type': 'application/json' },
+          })
+        }
+      }
+      return new Response(JSON.stringify({ code: 404, msg: `未预期的端点：${text}` }), { status: 404 })
+    },
+    cache: { get: () => undefined, set() {}, delete() {}, keys: () => [] },
+    now: () => now,
+  }
+  return { ctx, calls }
+}
+
+/** 造一个**带合法载荷**的 JWT（不验签，只为让昵称/uid 回退链可测）。 */
+function fakeJwt(payload) {
+  const enc = (obj) => Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url')
+  return `${enc({ alg: 'none' })}.${enc(payload)}.sig`
+}
+
+/** 一个正常的 auth/state 响应。 */
+const stateRoute = { state: 'fixture-state', authUrl: 'https://www.workbuddy.ai/login?platform=workbuddy-ai&state=fixture-state' }
+
+// ─────────────────── ① beginLogin：URL 装饰 ───────────────────
+
+test('★ 国际版登录 URL 追加 version + loginSessionId', async () => {
+  const { ctx } = loginCtx({ '/auth/state': { body: { code: 0, data: stateRoute } } })
+  const start = await INTL.beginLogin(ctx)
+
+  const url = new URL(start.authUrl)
+  assert.equal(url.searchParams.get('version'), '5.5.2', '国际版必须带 version')
+  assert.ok((url.searchParams.get('loginSessionId') ?? '').length > 0, '必须带 loginSessionId')
+  // 每次新 UUID（参考实现：实测无校验语义，每次生成新值均可）
+  assert.match(url.searchParams.get('loginSessionId'), /^[0-9a-f-]{36}$/i, '应当是 UUID 形态')
+})
+
+test('★ 国内版登录 URL **不**追加任何参数', async () => {
+  const { ctx } = loginCtx({
+    '/auth/state': { body: { code: 0, data: { state: 's', authUrl: 'https://copilot.tencent.com/login?platform=ide&state=s' } } },
+  })
+  const start = await CN.beginLogin(ctx)
+
+  assert.equal(start.authUrl, 'https://copilot.tencent.com/login?platform=ide&state=s', '必须原样返回')
+  const url = new URL(start.authUrl)
+  assert.equal(url.searchParams.get('version'), null)
+  assert.equal(url.searchParams.get('loginSessionId'), null)
+  assert.equal(url.searchParams.has('loginSessionId'), false)
+})
+
+test('★ 装饰 URL 时 state / platform / 路径都不变（防重建 URL）', async () => {
+  // 参考实现明确要求：「只追加参数，不得重建 URL」——
+  // platform/state/路径全部来自服务端下发的 authUrl。
+  const authUrl = 'https://www.workbuddy.ai/login?platform=workbuddy-ai&state=abc-123&extra=keepme'
+  const { ctx } = loginCtx({ '/auth/state': { body: { code: 0, data: { state: 'abc-123', authUrl } } } })
+  const start = await INTL.beginLogin(ctx)
+
+  const before = new URL(authUrl)
+  const after = new URL(start.authUrl)
+  assert.equal(after.origin, before.origin, 'origin 不变')
+  assert.equal(after.pathname, before.pathname, '路径不变')
+  assert.equal(after.searchParams.get('state'), 'abc-123', 'state 不变')
+  assert.equal(after.searchParams.get('platform'), 'workbuddy-ai', 'platform 不变')
+  assert.equal(after.searchParams.get('extra'), 'keepme', '**原有的其它参数也必须保留**')
+  // 只多了两个参数
+  assert.equal(after.searchParams.size, before.searchParams.size + 2)
+})
+
+test('beginLogin 返回的 state 是**上游原始值**，不被装饰影响', async () => {
+  const { ctx } = loginCtx({ '/auth/state': { body: { code: 0, data: stateRoute } } })
+  const start = await INTL.beginLogin(ctx)
+  assert.equal(start.state, 'fixture-state', 'state 原样保留，后续两步用它')
+  assert.equal(typeof start.state, 'string', '必须是字符串（宿主原样存下来）')
+})
+
+test('登录 URL 每次都是新的 loginSessionId（不复用）', async () => {
+  const mk = () => loginCtx({ '/auth/state': { body: { code: 0, data: stateRoute } } })
+  const a = await INTL.beginLogin(mk().ctx)
+  const b = await INTL.beginLogin(mk().ctx)
+  const idOf = (u) => new URL(u).searchParams.get('loginSessionId')
+  assert.notEqual(idOf(a.authUrl), idOf(b.authUrl), '两次登录的会话 id 必须不同')
+})
+
+// ─────────────────── ② pollLogin：显式判 code ───────────────────
+
+test('★ HTTP 200 + code 11217 → pending（不是 failed、更不是 ready）', async () => {
+  // Lead 本机真打实测的原始响应，**HTTP 200**（不是非 200！）：
+  //   {"code":11217,"msg":"11217:login ing...","requestId":"…"}
+  // 旧实现只在非 200 时才读 code，靠 unwrapData 返回 null 的副作用恰好判对 —— 很脆。
+  const { ctx } = loginCtx({
+    '/auth/token': { status: 200, body: { code: 11217, msg: '11217:login ing...', requestId: 'r-1' } },
+  })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+
+  assert.equal(poll.status, 'pending', '11217 = 用户还没授权，正常中间态')
+  assert.equal(poll.credentials, undefined, 'pending 绝不能带凭证')
+  assert.match(poll.message, /还没检测到登录/)
+})
+
+test('★ HTTP 200 + code 非 0 且非 11217 → failed（不静默 pending）', async () => {
+  // 静默 pending 会让用户对着「一直在等」干等到会话过期，还以为是自己没登录成功。
+  const { ctx } = loginCtx({
+    '/auth/token': { status: 200, body: { code: 40001, msg: 'invalid state' } },
+  })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+
+  assert.equal(poll.status, 'failed')
+  assert.match(poll.message, /40001/, '必须把业务码带出来')
+  assert.match(poll.message, /invalid state/, '把上游原文带出来，别吞错')
+})
+
+test('code 11217 在**非 200** 时同样判 pending（与 HTTP 状态解耦）', async () => {
+  const { ctx } = loginCtx({
+    '/auth/token': { status: 503, body: { code: 11217, msg: 'login ing' } },
+  })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+  assert.equal(poll.status, 'pending', '业务码说了算，不看 HTTP 状态')
+})
+
+test('未授权时**绝不**返回 ready（否则会加进一个空 token 的账号）', async () => {
+  // 这是用户报障的直接防线：加进一个没有 token 的账号，看起来就是「没加进来」。
+  const cases = [
+    { code: 11217, msg: 'login ing' },
+    { code: 0, data: null },
+    { code: 0 },
+  ]
+  for (const body of cases) {
+    const { ctx } = loginCtx({ '/auth/token': { body } })
+    const poll = await INTL.pollLogin('fixture-state', ctx)
+    assert.notEqual(poll.status, 'ready', `响应 ${JSON.stringify(body)} 不该判定为 ready`)
+    assert.equal(poll.credentials, undefined)
+  }
+})
+
+test('auth/token 返回数据但没有 token 字段 → failed（形状变了要说出来）', async () => {
+  // 旧实现在这里判 pending —— 那会让「响应结构变了」伪装成「用户没登录成功」。
+  const { ctx } = loginCtx({ '/auth/token': { body: { code: 0, data: { somethingElse: 1 } } } })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+  assert.equal(poll.status, 'failed')
+  assert.match(poll.message, /没有 access token 字段/)
+})
+
+test('登录会话状态丢失 → failed 且不发请求', async () => {
+  const { ctx, calls } = loginCtx({})
+  for (const bad of ['', undefined, null, {}, { state: 42 }]) {
+    const poll = await INTL.pollLogin(bad, ctx)
+    assert.equal(poll.status, 'failed', `${JSON.stringify(bad)} 该判 failed`)
+  }
+  assert.equal(calls.length, 0, '状态都没有，不该发任何请求')
+})
+
+test('pollLogin 的 state 参数是字符串或对象都认（宿主两种都存过）', async () => {
+  const routes = {
+    '/auth/token': { body: { code: 0, data: { accessToken: 'tok', refreshToken: 'ref' } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u1' } } },
+  }
+  const asString = await INTL.pollLogin('fixture-state', loginCtx(routes).ctx)
+  const asObject = await INTL.pollLogin({ state: 'fixture-state' }, loginCtx(routes).ctx)
+  assert.equal(asString.status, 'ready')
+  assert.equal(asObject.status, 'ready')
+})
+
+// ─────────────────── ③ getAccount + 凭证组装 ───────────────────
+
+test('★ token 就绪 → 调 getAccount → ready 且凭证完整', async () => {
+  const jwt = fakeJwt({ nickname: '张三', sub: 'jwt-sub-1', iat: 1_700_000_000, exp: 1_800_000_000 })
+  const { ctx, calls } = loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: jwt, refreshToken: 'ref-tok', expiresIn: 7200, tokenType: 'Bearer' } } },
+    '/login/account': { body: { code: 0, data: { uid: 'uid-1', nickname: '昵称', enterpriseId: 'ent-1', type: 'personal' } } },
+  })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+
+  assert.equal(poll.status, 'ready')
+  assert.equal(poll.message, '登录成功')
+
+  // ★ 核心：getAccount **被调用了**（我们的旧实现完全没有这一步）
+  const accountCalls = calls.filter((c) => c.url.includes('/v2/plugin/login/account'))
+  assert.equal(accountCalls.length, 1, 'token 就绪后必须再问一次 login/account')
+  assert.ok(accountCalls[0].url.includes('state=fixture-state'), 'account 请求必须带 state')
+  assert.equal(accountCalls[0].headers.authorization, `Bearer ${jwt}`, 'account 请求必须带 Bearer token')
+  assert.equal(accountCalls[0].headers['x-domain'], 'www.workbuddy.ai')
+  assert.equal(accountCalls[0].headers['x-no-user-id'], 'true')
+  assert.equal(accountCalls[0].headers['x-no-enterprise-id'], 'true')
+
+  // 账号信息进了最终 credentials
+  const cred = poll.credentials
+  assert.equal(cred.token, jwt)
+  assert.equal(cred.refreshToken, 'ref-tok')
+  assert.equal(cred.uid, 'uid-1', '★ 账号信息（uid）必须进凭据')
+  assert.equal(cred.enterpriseId, 'ent-1', '★ 企业 id 必须进凭据')
+  assert.equal(cred.accountType, 'personal')
+  assert.equal(cred.nickname, '昵称')
+  // expiresIn 7200s 以 JWT.iat 为基准换算（实测上游只给相对秒数）
+  assert.equal(cred.expiresAt, 1_700_000_000 * 1000 + 7200 * 1000)
+})
+
+test('★ token 走 camelCase（上游真实形状）—— 这是本次报障的根因', async () => {
+  // 参考实现 parseTokenData 读 accessToken/refreshToken（e2e 实证 2026-09-11）。
+  // 旧实现读 data.access_token ⇒ 恒 undefined ⇒ 恒 pending ⇒ 账号加不进来。
+  const { ctx } = loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: 'camel-token', refreshToken: 'camel-refresh' } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u1' } } },
+  })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+
+  assert.equal(poll.status, 'ready', '★ camelCase 必须被认出来，否则就是用户报的那个 bug')
+  assert.equal(poll.credentials.token, 'camel-token')
+  assert.equal(poll.credentials.refreshToken, 'camel-refresh')
+})
+
+test('snake_case 也认（防御：万一某产品线回蛇形）', async () => {
+  const { ctx } = loginCtx({
+    '/auth/token': { body: { code: 0, data: { access_token: 'snake-token', refresh_token: 'snake-refresh' } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u1' } } },
+  })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+  assert.equal(poll.status, 'ready')
+  assert.equal(poll.credentials.token, 'snake-token')
+})
+
+test('两种命名同时出现时以 camelCase 为准（它才是被实证过的）', async () => {
+  const { ctx } = loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: 'camel-wins', access_token: 'snake-loses' } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u1' } } },
+  })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+  assert.equal(poll.credentials.token, 'camel-wins')
+})
+
+test('account 未就绪（code 12151）→ pending，**不**返回 ready', async () => {
+  // 账号信息（uid/企业）只有 login/account 有；拿不到就建不出完整账号 ⇒ 不能 ready。
+  const { ctx } = loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: 'tok' } } },
+    '/login/account': { body: { code: 12151, msg: '12151:account not ready' } },
+  })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+  assert.equal(poll.status, 'pending')
+  assert.equal(poll.credentials, undefined)
+  assert.match(poll.message, /刷新登录状态/, '要告诉用户再点一次，而不是让他重新登录')
+})
+
+test('account 端点真失败（非 12151 的非 0 码）→ failed', async () => {
+  const { ctx } = loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: 'tok' } } },
+    '/login/account': { body: { code: 50000, msg: 'boom' } },
+  })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+  assert.equal(poll.status, 'failed')
+  assert.match(poll.message, /50000/)
+})
+
+test('account 返回 200 但缺 data → pending（别谎报成功）', async () => {
+  const { ctx } = loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: 'tok' } } },
+    '/login/account': { body: { code: 0 } },
+  })
+  const poll = await INTL.pollLogin('fixture-state', ctx)
+  assert.equal(poll.status, 'pending')
+  assert.equal(poll.credentials, undefined)
+})
+
+test('昵称回退链：account.nickname → JWT.nickname → preferred_username', async () => {
+  // 参考实现 e2e 实证：login/account 的 nickname **常为空**，真昵称在 JWT 里。
+  const fromAccount = await INTL.pollLogin('s', loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: fakeJwt({ nickname: 'jwt-name' }) } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u', nickname: 'account-name' } } },
+  }).ctx)
+  assert.equal(fromAccount.credentials.nickname, 'account-name', 'account 有就用它')
+
+  const fromJwt = await INTL.pollLogin('s', loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: fakeJwt({ nickname: 'jwt-name' }) } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u' } } },
+  }).ctx)
+  assert.equal(fromJwt.credentials.nickname, 'jwt-name', 'account 没有就回退 JWT')
+
+  const fromPreferred = await INTL.pollLogin('s', loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: fakeJwt({ preferred_username: 'pref' }) } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u' } } },
+  }).ctx)
+  assert.equal(fromPreferred.credentials.nickname, 'pref')
+})
+
+test('uid 回退链：account.uid → JWT.sub', async () => {
+  const { ctx } = loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: fakeJwt({ sub: 'from-jwt-sub' }) } } },
+    '/login/account': { body: { code: 0, data: { nickname: 'n' } } },
+  })
+  const poll = await INTL.pollLogin('s', ctx)
+  assert.equal(poll.credentials.uid, 'from-jwt-sub', 'account 没 uid 就回退 JWT.sub')
+})
+
+test('过期时间回退链：expiresIn → JWT.exp（上游通常只给相对秒数）', async () => {
+  // 参考实现实证：auth/token **不返回** expiresAt，只给 expiresIn。
+  const jwt = fakeJwt({ iat: 1_700_000_000, exp: 1_800_000_000 })
+  const { ctx } = loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: jwt, expiresIn: 3600 } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u' } } },
+  })
+  const poll = await INTL.pollLogin('s', ctx)
+  assert.equal(poll.credentials.expiresAt, 1_700_000_000 * 1000 + 3600 * 1000, 'expiresIn 以 JWT.iat 为基准')
+
+  // 没有 expiresIn 时回退到 JWT.exp（否则 UI 显示「有效期未知」）
+  const noRelative = await INTL.pollLogin('s', loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: jwt } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u' } } },
+  }).ctx)
+  assert.equal(noRelative.credentials.expiresAt, 1_800_000_000 * 1000)
+})
+
+test('ready 时给出账号标签（昵称优先，其次 uid）', async () => {
+  const withNick = await INTL.pollLogin('s', loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: fakeJwt({}) } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u-1', nickname: '我的号' } } },
+  }).ctx)
+  assert.equal(withNick.label, '我的号', '有昵称就用昵称做标签')
+
+  const uidOnly = await INTL.pollLogin('s', loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: fakeJwt({}) } } },
+    '/login/account': { body: { code: 0, data: { uid: 'u-2' } } },
+  }).ctx)
+  assert.equal(uidOnly.label, 'u-2', '没有昵称就用 uid')
+})
+
+test('凭据里**不含**空串字段（不要把 uid: "" 落盘）', async () => {
+  const { ctx } = loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: fakeJwt({}) } } },
+    '/login/account': { body: { code: 0, data: {} } },
+  })
+  const poll = await INTL.pollLogin('s', ctx)
+  assert.equal(poll.status, 'ready')
+  for (const [k, v] of Object.entries(poll.credentials)) {
+    assert.notEqual(v, '', `字段 ${k} 不该是空串（应整个省略）`)
+  }
+  assert.equal(poll.credentials.refreshToken, undefined, '没有 refresh token 就不放这个键')
+})
+
+test('国内版登录流程与 gather 步骤完全一致（只差 URL 装饰）', async () => {
+  const { ctx, calls } = loginCtx({
+    '/auth/state': { body: { code: 0, data: { state: 'cn-state', authUrl: 'https://copilot.tencent.com/login?platform=ide&state=cn-state' } } },
+    '/auth/token': { body: { code: 0, data: { accessToken: 'cn-tok', refreshToken: 'cn-ref' } } },
+    '/login/account': { body: { code: 0, data: { uid: 'cn-uid' } } },
+  })
+  const start = await CN.beginLogin(ctx)
+  const poll = await CN.pollLogin(start.state, ctx)
+
+  assert.equal(poll.status, 'ready', '国内版同样要走完 getAccount')
+  assert.equal(poll.credentials.uid, 'cn-uid')
+  assert.equal(calls.filter((c) => c.url.includes('/login/account')).length, 1)
+  assert.ok(calls.every((c) => !c.url.includes('loginSessionId')), '国内版请求里不该出现会话参数')
+})
+
+test('网络抖动时 token 步骤回 pending（一次失败不判死整个会话）', async () => {
+  const ctx = loginCtx({}).ctx
+  ctx.fetch = async () => { throw new Error('socket hang up') }
+  const poll = await INTL.pollLogin('s', ctx)
+  assert.equal(poll.status, 'pending', '用户再点一次就好，不该让他重新发起登录')
+  assert.match(poll.message, /socket hang up/, '原始报错要带出来（硬规则 4：不许吞错）')
+})
+
+test('token 已拿到但 account 网络失败 → pending（别让用户重来一遍登录）', async () => {
+  let accountAttempted = false
+  const ctx = loginCtx({
+    '/auth/token': { body: { code: 0, data: { accessToken: 'tok' } } },
+  }).ctx
+  const bare = ctx.fetch
+  ctx.fetch = async (url, init) => {
+    if (String(url).includes('/login/account')) {
+      accountAttempted = true
+      throw new Error('ECONNRESET')
+    }
+    return bare(url, init)
+  }
+  const poll = await INTL.pollLogin('s', ctx)
+  assert.equal(accountAttempted, true, 'account 步骤确实被执行了')
+  assert.equal(poll.status, 'pending')
+  assert.equal(poll.credentials, undefined)
+})
+
+// ═════════════════ task-11：11128 渠道校验 + 模型倍率 ═════════════════
+//
+// 用户报障两条：
+//   1. 国际版调用模型失败 `{"code":11128,"msg":"request illegal"}` +「channel verification」
+//   2. workbuddy 与国际版拉取的模型，**倍率全是未知**
+//
+// ## ⚠️ 11128 有**两个互不相干的子原因**（这条是本次最重要的认知）
+//
+// 修好第一个之前，两个原因的报错文案是**同一句笼统话**，根本分不出来；
+// 修好之后 `msg` 才变成**具体的**，第二个才暴露。实测（真实账号）：
+//
+// | 消息形态 | 结果 |
+// |---|---|
+// | 首条是 user，且缺会话头 | ✗ 400 11128（笼统的 channel verification） |
+// | 首条是 user，会话头齐 | ✗ 400 11128 msg=**"first message is not system prompt"** |
+// | 首条是 system，会话头齐 | ✓ 200 |
+//
+// ⇒ **同一个错误码在修掉第一层之前会掩盖第二层。**
+//
+// ## fixture 出处
+//
+// | fixture | 出处 |
+// |---|---|
+// | 三个会话头名与「只对国际版加」 | 参考 `buddy-adapter.ts:1792-1796`；A/B 实验（Lead，真实账号） |
+// | 补最小 system（`'You are a helpful assistant.'`） | 参考 `buddy-adapter.ts:1350-1352` + `account-probe.ts:92-123`（`PROBE_SYSTEM`） |
+// | `credits` 实测原值（`"x0.34 credits"` / `"x0.00"` / `""`） | 本机真打 `/v3/config`（workbuddy-intl，2026-10-20） |
+// | `modelPromotions` 原始结构（`"0x"` + `factor:0` + `validUntil`） | 同上，本机真打（`.scratch/probe-buddy-promotions-raw.mjs`） |
+
+/** 只跑 `requestChatStream` 的假 ctx：记下请求体与头，回一段最小 SSE。 */
+function chatCtx(sseBody = 'data: {"choices":[{"delta":{"content":"收到"}}]}\n\ndata: [DONE]\n\n') {
+  const calls = []
+  const ctx = {
+    config: { upstream: { apiBaseUrl: '' }, requestTimeoutMs: 5_000 },
+    log: { debug() {}, info() {}, warn() {}, error() {}, child() { return this } },
+    http: async () => jsonResult({ code: 0, data: {} }),
+    fetch: async (url, init = {}) => {
+      calls.push({ url: String(url), headers: init.headers ?? {}, body: init.body })
+      return new Response(sseBody, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    },
+    // ⚠️ 用**真的** KV 存储（不是空壳）：思考档位要靠 `ctx.cache` 在
+    // 「拉目录」与「发请求」之间传递，空壳会让所有档位判定退化成「能力未知」。
+    cache: (() => {
+      const store = new Map()
+      return {
+        get: (key) => store.get(key),
+        set: (key, value) => { store.set(key, value) },
+        delete: (key) => { store.delete(key) },
+        keys: () => [...store.keys()],
+      }
+    })(),
+    now: () => 1_760_000_000_000,
+  }
+  return { ctx, calls }
+}
+
+/**
+ * 把「某模型声明了什么档位」塞进 `ctx.cache` —— 模拟「先拉过模型目录」这个前提。
+ *
+ * 为什么不能省：请求侧的 `effortsOf()` 只读缓存（它拉不到目录）。
+ * 不 seed 就等于**目录从没拉过**（能力未知），那是另一条分支。
+ *
+ * key 必须与 `BuddyAdapter.reasoningCacheKey()` 一致（`buddy:reasoning:<agentId>`）。
+ */
+async function seedReasoning(ctx, table, agentId = 'workbuddy-intl') {
+  const normalized = {}
+  for (const [id, raw] of Object.entries(table)) {
+    const fields = parseReasoningFields({ reasoning: raw })
+    normalized[id] = {
+      ...(fields.supportedEfforts === undefined ? {} : { supported: fields.supportedEfforts }),
+      ...(fields.defaultEffort === undefined ? {} : { defaultEffort: fields.defaultEffort }),
+      ...(fields.singleEffort === undefined ? {} : { singleEffort: fields.singleEffort }),
+    }
+  }
+  ctx.cache.set(`buddy:reasoning:${agentId}`, normalized)
+}
+
+/** 跑一次 chat，把流消费完（否则 fetch 不会被触发）。 */
+async function drainChat(adapter, ctx, messages, record = account(), model = 'default-model', reasoningEffort) {
+  const events = []
+  for await (const event of adapter.requestChatStream(
+    {
+      model,
+      messages,
+      ...(reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort }),
+    },
+    record,
+    ctx,
+    new AbortController().signal,
+  )) {
+    events.push(event)
+  }
+  return events
+}
+
+// ─────────────────── 缺陷 A：三个会话头 ───────────────────
+
+test('★ 国际版对话请求带齐三个 conversation 头', async () => {
+  // 缺任一个都过不了上游渠道校验（400 + 11128）。A/B 实测：只加 X-Conversation-ID 仍 400。
+  const { ctx, calls } = chatCtx()
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }])
+
+  const headers = calls[0].headers
+  assert.ok(headers['x-conversation-id'], '必须有 X-Conversation-ID')
+  assert.ok(headers['x-conversation-message-id'], '必须有 X-Conversation-Message-ID')
+  assert.ok(headers['x-conversation-request-id'], '必须有 X-Conversation-Request-ID')
+  // 三个都要有值（空串也算缺）
+  for (const name of ['x-conversation-id', 'x-conversation-message-id', 'x-conversation-request-id']) {
+    assert.ok(String(headers[name]).length > 0, `${name} 不能是空值`)
+  }
+})
+
+test('★ 国内版对话请求**不带** conversation 头（照参考实现只加国际版）', async () => {
+  const { ctx, calls } = chatCtx()
+  await drainChat(CN, ctx, [{ role: 'user', content: 'hi' }])
+
+  const headers = calls[0].headers
+  assert.equal(headers['x-conversation-id'], undefined)
+  assert.equal(headers['x-conversation-message-id'], undefined)
+  assert.equal(headers['x-conversation-request-id'], undefined)
+  // 身份头仍然照发（这些两个产品都要）
+  assert.equal(headers['x-product-code'], 'codebuddy')
+})
+
+test('★ conversation 头名与参考实现逐字一致（大小写不敏感地比）', async () => {
+  // 上游按头名精确匹配，写错一个字母就是 400 + 11128。
+  const { ctx, calls } = chatCtx()
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }])
+  const names = Object.keys(calls[0].headers).map((n) => n.toLowerCase())
+  for (const required of ['x-conversation-id', 'x-conversation-message-id', 'x-conversation-request-id']) {
+    assert.ok(names.includes(required), `缺少 ${required}（实际：${names.join(', ')}）`)
+  }
+})
+
+test('sessionId 按账号稳定：同一账号两次请求相同，不同账号不同', async () => {
+  // ⚠️ sessionId 同时是**前缀缓存的 key**（参考实现实测：带与不带它，
+  // `prompt_cache_hit_tokens` 从 7808 变 0，费用差约 17 倍）。
+  // 所以它必须**稳定** —— 每次请求新值等于彻底放弃缓存。
+  const { ctx, calls } = chatCtx()
+  const rec = account()
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'a' }], rec)
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'b' }], rec)
+  assert.equal(calls[0].headers['x-conversation-id'], calls[1].headers['x-conversation-id'], '同账号必须一致')
+
+  const other = { ...rec, id: 'workbuddy:other' }
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'c' }], other)
+  assert.notEqual(calls[0].headers['x-conversation-id'], calls[2].headers['x-conversation-id'], '不同账号必须不同')
+})
+
+test('messageId / requestId 每次请求都是新值（session 复用、后两个不复用）', async () => {
+  const { ctx, calls } = chatCtx()
+  const rec = account()
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'a' }], rec)
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'b' }], rec)
+
+  assert.notEqual(calls[0].headers['x-conversation-message-id'], calls[1].headers['x-conversation-message-id'])
+  assert.notEqual(calls[0].headers['x-conversation-request-id'], calls[1].headers['x-conversation-request-id'])
+  // UUID 形态（参考实现用 crypto.randomUUID()）
+  assert.match(calls[0].headers['x-conversation-message-id'], /^[0-9a-f-]{36}$/i)
+})
+
+// ─────────────────── 缺陷 A2：首条必须是 system ───────────────────
+
+test('★ 国际版：首条不是 system 时自动补一条（否则 400 11128）', async () => {
+  // `src/llm/adapter.ts` 的 toOpenAiMessages() **只在 system 非空时**才 unshift，
+  // 所以 system 为空时 wire 上首条就是 user ⇒ 必踩
+  // `11128 msg="first message is not system prompt"`。
+  // 参考实现在适配器内部兜了同一层（buddy-adapter.ts:1350-1352）。
+  const { ctx, calls } = chatCtx()
+  await drainChat(INTL, ctx, [{ role: 'user', content: '只回答两个字：收到' }])
+
+  const body = JSON.parse(String(calls[0].body))
+  assert.equal(body.messages[0].role, 'system', '★ wire 上首条必须是 system')
+  assert.equal(body.messages[0].content, 'You are a helpful assistant.', '用参考实现验证过的那句')
+  assert.equal(body.messages[1].role, 'user', '原来的 user 消息必须保留在后')
+  assert.equal(body.messages.length, 2, '只补一条')
+})
+
+test('★ 国内版：首条不是 system 时**不补**（无此硬要求）', async () => {
+  const { ctx, calls } = chatCtx()
+  await drainChat(CN, ctx, [{ role: 'user', content: 'hi' }])
+  const body = JSON.parse(String(calls[0].body))
+  assert.equal(body.messages[0].role, 'user', '国内版不该被加料')
+  assert.equal(body.messages.length, 1)
+})
+
+test('★ 已有 system 时原样保留，不覆盖也不追加第二条', async () => {
+  const { ctx, calls } = chatCtx()
+  await drainChat(INTL, ctx, [
+    { role: 'system', content: 'DSH 的真实提示词' },
+    { role: 'user', content: 'hi' },
+  ])
+  const body = JSON.parse(String(calls[0].body))
+  assert.equal(body.messages[0].content, 'DSH 的真实提示词', '★ 用户的 system 不能被替换')
+  assert.equal(body.messages.length, 2, '不该出现第二条 system')
+})
+
+test('补 system 对空消息列表也安全（不抛错）', async () => {
+  const { ctx, calls } = chatCtx()
+  await drainChat(INTL, ctx, [])
+  const body = JSON.parse(String(calls[0].body))
+  assert.equal(body.messages[0].role, 'system', '空列表也要补上首条 system')
+  assert.equal(body.messages.length, 1)
+})
+
+test('补 system 不改变其它请求字段（model / stream / stream_options）', async () => {
+  const { ctx, calls } = chatCtx()
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }])
+  const body = JSON.parse(String(calls[0].body))
+  assert.equal(body.model, 'default-model')
+  assert.equal(body.stream, true)
+  assert.deepEqual(body.stream_options, { include_usage: true })
+})
+
+// ─────────────────── 缺陷 B：倍率解析（纯函数） ───────────────────
+
+test('★ normalizeCreditsRate：认 x 前缀写法（上游 models[].credits 的真实形态）', () => {
+  // 实测原值（2026-10-20，workbuddy-intl /v3/config）
+  assert.equal(normalizeCreditsRate('x0.29')?.value, 0.29)
+  assert.equal(normalizeCreditsRate('x0.29')?.text, 'x0.29')
+  assert.equal(normalizeCreditsRate('x3.31 credits')?.value, 3.31, '★ 带单位后缀也要能解析')
+  assert.equal(normalizeCreditsRate('x0.34 credits')?.value, 0.34)
+  assert.equal(normalizeCreditsRate('x6.67')?.value, 6.67, '整数部分多位')
+  assert.equal(normalizeCreditsRate('X0.29')?.value, 0.29, '大小写不敏感')
+  assert.equal(normalizeCreditsRate('  x0.29  ')?.value, 0.29, '两侧空白要容忍')
+})
+
+test('★ "x0.00" 是 0 = 免费（合法值，不能当成缺失）', () => {
+  // 这是三条硬要求里的第 2 条：0 与 undefined 语义完全不同。
+  const rate = normalizeCreditsRate('x0.00')
+  assert.notEqual(rate, undefined)
+  assert.equal(rate.value, 0)
+  assert.equal(rate.text, 'x0.00')
+  assert.equal(normalizeCreditsRate('x0')?.value, 0)
+})
+
+test('★ "" / 缺失 / 非法值 → undefined（绝不回退成 x1）', () => {
+  // 三条硬要求的第 1、3 条：编造倍率比不显示更糟。
+  assert.equal(normalizeCreditsRate(''), undefined)
+  assert.equal(normalizeCreditsRate('   '), undefined)
+  assert.equal(normalizeCreditsRate(undefined), undefined)
+  assert.equal(normalizeCreditsRate(null), undefined)
+  assert.equal(normalizeCreditsRate(0.29), undefined, '数字不是上游形态，不猜')
+  assert.equal(normalizeCreditsRate('credits'), undefined)
+  assert.equal(normalizeCreditsRate('x'), undefined, 'x 后面没数字')
+  assert.equal(normalizeCreditsRate('xabc'), undefined)
+  // ★ 关键：绝不能是 1（那等于谎称「标准倍率」）
+  for (const bad of ['', 'nope', undefined, 'x']) {
+    assert.notEqual(normalizeCreditsRate(bad)?.value, 1, `${String(bad)} 解析不出，不能回退成 1`)
+  }
+})
+
+test('★ normalizeDiscountedRate：促销是 **x 在后** 的写法（两套写法必须都认）', () => {
+  // 实测：模型 credits 是 "x0.29"（x 在前），促销 discountedCredits 是 "0.50x"（x 在后）。
+  // 参考实现注释原文：早期只认前缀，导致**促销价全部解析失败且静默丢失**。
+  assert.equal(normalizeDiscountedRate('0.50x')?.value, 0.5, 'x 在后')
+  assert.equal(normalizeDiscountedRate('0.15x')?.value, 0.15)
+  assert.equal(normalizeDiscountedRate('0x')?.value, 0, '已结束占位，解析出 0 由调用方排除')
+  // 两个入口**都接受两种写法**（对上游互换写法更鲁棒）
+  assert.equal(normalizeDiscountedRate('x0.29')?.value, 0.29, '促销入口也认前缀')
+  assert.equal(normalizeCreditsRate('0.50x')?.value, 0.5, '模型入口也认后缀')
+  assert.equal(normalizeDiscountedRate(''), undefined)
+})
+
+// ─────────────────── 缺陷 B：促销（活动价） ───────────────────
+
+test('parseModelPromotions：取未过期的折扣，按 modelIds 关联', () => {
+  const now = new Date('2026-10-20T12:00:00+08:00')
+  const promos = parseModelPromotions(
+    {
+      modelPromotions: [
+        {
+          enabled: true,
+          priority: 50,
+          discount: { discountedCredits: '0.15x', factor: 0.15 },
+          modelIds: ['glm-5.2'],
+          schedule: { validFrom: '2026-10-01T00:00:00+08:00', validUntil: '2026-11-01T00:00:00+08:00' },
+        },
+      ],
+    },
+    now,
+  )
+  assert.equal(promos.get('glm-5.2')?.value, 0.15)
+})
+
+test('parseModelPromotions：有效期已过 / 未到 / enabled:false 都跳过', () => {
+  const now = new Date('2026-10-20T12:00:00+08:00')
+  const mk = (extra) => ({
+    modelPromotions: [
+      { enabled: true, discount: { discountedCredits: '0.15x', factor: 0.15 }, modelIds: ['m'], ...extra },
+    ],
+  })
+  // 已过
+  assert.equal(parseModelPromotions(mk({ schedule: { validUntil: '2026-10-01T00:00:00+08:00' } }), now).size, 0)
+  // 未到
+  assert.equal(parseModelPromotions(mk({ schedule: { validFrom: '2026-12-01T00:00:00+08:00' } }), now).size, 0)
+  // 停用
+  assert.equal(parseModelPromotions(mk({ enabled: false }), now).size, 0)
+  // 都没问题 → 生效
+  assert.equal(parseModelPromotions(mk({}), now).size, 1)
+})
+
+test('parseModelPromotions：同模型多条活动取 priority 最高者', () => {
+  const now = new Date('2026-10-20T12:00:00+08:00')
+  const promos = parseModelPromotions(
+    {
+      modelPromotions: [
+        { enabled: true, priority: 10, discount: { discountedCredits: '0.90x', factor: 0.9 }, modelIds: ['m'] },
+        { enabled: true, priority: 200, discount: { discountedCredits: '0.10x', factor: 0.1 }, modelIds: ['m'] },
+        { enabled: true, priority: 50, discount: { discountedCredits: '0.50x', factor: 0.5 }, modelIds: ['m'] },
+      ],
+    },
+    now,
+  )
+  assert.equal(promos.get('m')?.value, 0.1, '取 priority 200 那条')
+})
+
+test('★ parseModelPromotions：factor:0 + 有窗口 = 免费（不是「已结束」）', () => {
+  // 参考实现实测 hy4-preview 的夜间活动就是 {discountedCredits:"0x", factor:0}
+  // —— 它**真的免费**。早期实现把 0x 当哨兵丢弃，于是「夜间免费」永远不显示
+  // （用户报障「hy4 preview 夜间 0，现在显示 0.29」）。真正的「已结束」由有效期表达。
+  const now = new Date('2026-10-20T12:00:00+08:00')
+  const promos = parseModelPromotions(
+    {
+      modelPromotions: [
+        {
+          enabled: true,
+          discount: { discountedCredits: '0x', displayMode: 'replace', factor: 0 },
+          modelIds: ['hy3'],
+          schedule: { timezone: 'Asia/Shanghai', validFrom: '2026-07-06T00:00:00+08:00', validUntil: '2026-11-01T00:00:00+08:00' },
+        },
+      ],
+    },
+    now,
+  )
+  assert.equal(promos.get('hy3')?.value, 0, '★ factor:0 是免费')
+  assert.equal(promos.get('hy3')?.text, '免费', '语义是一句断言，不是「倍率 0」这个数字')
+})
+
+test('parseModelPromotions：无时间窗口的 factor:0 视为「已结束」占位，跳过', () => {
+  // 防御：免费额度必然是限时的，没有窗口的 0x 更可能是遗留占位（参考实现同款口径）。
+  const now = new Date('2026-10-20T12:00:00+08:00')
+  const promos = parseModelPromotions(
+    { modelPromotions: [{ enabled: true, discount: { discountedCredits: '0x', factor: 0 }, modelIds: ['m'] }] },
+    now,
+  )
+  assert.equal(promos.size, 0)
+})
+
+test('parseModelPromotions：每日时段（含跨零点）按此刻判定', () => {
+  const schedule = { daily: [{ start: '23:00', end: '7:50' }], timezone: 'Asia/Shanghai' }
+  const mk = () => ({
+    modelPromotions: [
+      { enabled: true, discount: { discountedCredits: '0.50x', factor: 0.5 }, modelIds: ['glm-5.2'], schedule },
+    ],
+  })
+  // 北京时间 02:00 落在 23:00–7:50 内（跨零点）
+  assert.equal(parseModelPromotions(mk(), new Date('2026-10-20T02:00:00+08:00')).size, 1)
+  // 北京时间 12:00 不在窗口内
+  assert.equal(parseModelPromotions(mk(), new Date('2026-10-20T12:00:00+08:00')).size, 0)
+})
+
+test('parseModelPromotions：结构不符时返回空 Map（不抛错）', () => {
+  assert.equal(parseModelPromotions({}).size, 0)
+  assert.equal(parseModelPromotions({ modelPromotions: 'nope' }).size, 0)
+  assert.equal(parseModelPromotions({ modelPromotions: [null, 'x', 42] }).size, 0)
+})
+
+test('formatCreditsRate：有促销时保留「原价→促销价」两段', () => {
+  // ⚠️ 促销是**活动价**，不能把原价丢掉 —— 只显示促销价会让用户按折扣预期、
+  // 实际按原价计费时无从对账。
+  const rate = { value: 0.29, text: 'x0.29' }
+  const discounted = { value: 0.15, text: 'x0.15' }
+  assert.equal(formatCreditsRate(rate, discounted), 'x0.29→x0.15')
+  assert.equal(formatCreditsRate(rate, undefined), 'x0.29', '无促销时只显示原价')
+  assert.equal(formatCreditsRate(undefined, discounted), 'x0.15', '只有促销时显示促销价')
+  assert.equal(formatCreditsRate(undefined, undefined), undefined, '都没有 = 未知，不要编')
+})
+
+// ─────────────────── 缺陷 B：真实 /v3/config → multiplier ───────────────────
+
+test('★ parseModelsFromConfig：用真实 /v3/config 的 credits 值逐条解析倍率', () => {
+  // fixture 的 credits 值**逐条取自本机真打**（2026-10-20，workbuddy-intl，HTTP 200，
+  // `data.models` 28 条）。见 `.scratch/probe-buddy-promotions-raw.mjs` 的输出。
+  const body = {
+    data: {
+      agents: [{ name: 'cli', models: ['fast-model', 'primary-model', 'hy4-preview', 'hy3', 'default-model', 'deepseek-v4.1-flash'] }],
+      models: [
+        { id: 'default-model', name: 'Auto', credits: '' },                    // 空串 = 未知
+        { id: 'fast-model', name: 'Fast', credits: 'x0.34 credits' },          // 带单位后缀
+        { id: 'primary-model', name: 'Primary', credits: 'x3.31 credits' },
+        { id: 'hy4-preview', name: 'Hy4 preview', credits: 'x0.29' },
+        { id: 'hy3', name: 'Hy3', credits: 'x0.00' },                          // 0 = 免费
+        { id: 'deepseek-v4.1-flash', name: 'DeepSeek', credits: 'x0.00' },
+      ],
+    },
+  }
+  const byId = new Map(parseModelsFromConfig(body).map((m) => [m.id, m]))
+
+  assert.equal(byId.get('fast-model').multiplier, 0.34)
+  assert.equal(byId.get('fast-model').multiplierSource, 'buddy:config')
+  assert.equal(byId.get('primary-model').multiplier, 3.31)
+  assert.equal(byId.get('hy4-preview').multiplier, 0.29)
+  assert.equal(byId.get('hy3').multiplier, 0, '★ x0.00 是 0，不是 undefined')
+  assert.equal(byId.get('hy3').free, true, '★ 0 要同时标 free')
+  assert.equal(byId.get('deepseek-v4.1-flash').multiplier, 0)
+  assert.equal(byId.get('deepseek-v4.1-flash').free, true)
+
+  // ★ 空串 = 未知：**不放 multiplier 键**（不是 0、也不是 1）
+  const auto = byId.get('default-model')
+  assert.equal(auto.multiplier, undefined, '★ credits="" 必须解析成「未知」')
+  assert.equal(auto.free, undefined)
+  assert.equal(auto.multiplierSource, undefined, '未知时不该声称有来源')
+  assert.ok(!('multiplier' in auto), '未知时连键都不该有')
+})
+
+test('★ parseModelsFromConfig：解析不出时绝不给 1（编造倍率比不显示更糟）', () => {
+  const list = parseModelsFromConfig({
+    data: {
+      models: [
+        { id: 'a', credits: 'garbage' },
+        { id: 'b', credits: 'x' },
+        { id: 'c' },                      // 字段缺失
+        { id: 'd', credits: 0.5 },        // 数字不是上游形态
+      ],
+    },
+  })
+  for (const meta of list) {
+    assert.equal(meta.multiplier, undefined, `${meta.id} 不该有倍率`)
+    assert.notEqual(meta.multiplier, 1, `${meta.id} 绝不能回退成 ×1`)
+    assert.notEqual(meta.multiplier, 0, `${meta.id} 也不能被当成免费`)
+  }
+})
+
+test('parseModelsFromConfig：促销生效时 multiplier 用促销价、description 保留原价', () => {
+  // ⚠️ 方向不能反：拿原价当 multiplier 会让打了折的模型显示成原价。
+  const body = {
+    data: {
+      agents: [{ name: 'cli', models: ['glm-5.2'] }],
+      models: [{ id: 'glm-5.2', name: 'GLM-5.2', credits: 'x0.59' }],
+      modelPromotions: [
+        {
+          enabled: true,
+          priority: 100,
+          discount: { discountedCredits: '0.15x', displayMode: 'strikethrough', factor: 0.15 },
+          modelIds: ['glm-5.2'],
+          schedule: { validFrom: '2026-10-01T00:00:00+08:00', validUntil: '2026-11-01T00:00:00+08:00' },
+        },
+      ],
+    },
+  }
+  const meta = parseModelsFromConfig(body).find((m) => m.id === 'glm-5.2')
+  // 系统的「现在」落在或不在窗口内都取决于运行时刻，所以断言两种自洽结果之一
+  const inWindow = Date.now() >= Date.parse('2026-10-01T00:00:00+08:00')
+    && Date.now() < Date.parse('2026-11-01T00:00:00+08:00')
+  if (inWindow) {
+    assert.equal(meta.multiplier, 0.15, '★ 生效价 = 促销价')
+    assert.equal(meta.description, '倍率 x0.59→x0.15', '★ 原价必须保留在描述里')
+  } else {
+    assert.equal(meta.multiplier, 0.59, '窗口外回到原价')
+    assert.equal(meta.description, undefined, '无促销时不写冗余描述')
+  }
+})
+
+test('parseModelsFromConfig：促销价与原价相同时不写 description（免费→免费是噪音）', () => {
+  // 实测（2026-10-20）：hy3 / deepseek-v4.1-flash / step-5-preview 的 credits 本来就是
+  // "x0.00"（免费），活动又给一个 factor:0 的免费 ⇒ 文案会拼成 `x0.00→免费`，
+  // 「免费→免费」信息量为零。
+  const body = {
+    data: {
+      agents: [{ name: 'cli', models: ['hy3'] }],
+      models: [{ id: 'hy3', name: 'Hy3', credits: 'x0.00' }],
+      modelPromotions: [
+        {
+          enabled: true,
+          priority: 200,
+          discount: { discountedCredits: '0x', displayMode: 'replace', factor: 0 },
+          modelIds: ['hy3'],
+          schedule: { timezone: 'Asia/Shanghai', validFrom: '2026-07-06T00:00:00+08:00', validUntil: '2026-11-01T00:00:00+08:00' },
+        },
+      ],
+    },
+  }
+  const meta = parseModelsFromConfig(body).find((m) => m.id === 'hy3')
+  assert.equal(meta.multiplier, 0, '仍然是免费')
+  assert.equal(meta.free, true)
+  assert.equal(meta.description, undefined, '★ 免费→免费 不该产生描述')
+})
+
+test('parseModelsFromConfig：无促销时不写冗余 description', () => {
+  // 倍率本身已经渲染成 `(×0.34)`，再写一句「倍率 x0.34」是噪音、还撑长选择器行。
+  const list = parseModelsFromConfig({
+    data: { models: [{ id: 'fast-model', name: 'Fast', credits: 'x0.34 credits' }] },
+  })
+  assert.equal(list[0].multiplier, 0.34)
+  assert.equal(list[0].description, undefined)
+})
+
+test('parseModelsFromConfig：既有字段（窗口 / 图片 / 推理）不受倍率改动影响', () => {
+  const list = parseModelsFromConfig({
+    data: {
+      models: [{
+        id: 'hy3', name: 'Hy3', maxInputTokens: 192000, supportsImages: true,
+        reasoning: {}, credits: 'x0.00',
+      }],
+    },
+  })
+  const meta = list[0]
+  assert.equal(meta.contextWindow, 192000)
+  assert.deepEqual(meta.inputModalities, ['text', 'image'])
+  assert.equal(meta.reasoning, true)
+  assert.equal(meta.multiplier, 0)
+})
+
+// ═════════════════ task-12：思考档位（reasoning.supportedEfforts） ═════════════════
+//
+// 用户问：「为什么 workbuddy 的 deepseek 模型不能调整思考等级呢？qoder 的就可以呢」
+//
+// 查下来是**两件事叠在一起**：
+//   ① 我们漏读了 `data.models[].reasoning.supportedEfforts` —— 影响 **19 个**模型（真 bug）；
+//   ② 用户恰好试到的 DeepSeek 那两条，**上游本来就锁死单档**（没有档位行是**正确**行为）。
+//
+// ## fixture 出处（**全部来自本机真打**，2026-10-20，workbuddy-intl，HTTP 200）
+//
+// 见 `.scratch/probe-buddy-efforts-dump.mjs` 的输出：`data.models` 共 28 条，
+// **19 条有 `supportedEfforts`、9 条没有**。下面用到的每一组值都是照抄的。
+//
+// | 形态 | 真实样本 |
+// |---|---|
+// | 有档位 | `hy3:["low","high"]` / `gpt-5.6-sol:["low","medium","high","xhigh","max"]` / `minimax-m3.1-flash`（default=`max`）|
+// | **无**档位（DeepSeek 真实形状） | `{"effort":"high","summary":"auto"}` + `onlyReasoning:true` |
+
+/** 真上游的 reasoning 字段逐条出处：见文件头表格。 */
+const REAL_EFFORTS = {
+  'hy4-preview': { supportedEfforts: ['high'], defaultEffort: 'high' },
+  hy3: { supportedEfforts: ['low', 'high'], defaultEffort: 'high' },
+  'kimi-k2.8-preview': { supportedEfforts: ['low', 'high', 'max'], defaultEffort: 'high' },
+  'gpt-5.6-sol': { supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'high' },
+  'glm-5.2': { supportedEfforts: ['high', 'xhigh'], defaultEffort: 'high' },
+  'minimax-m3.1-flash': { supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'max' },
+  'gemini-3.8-flash': { supportedEfforts: ['low', 'medium', 'high'], defaultEffort: 'medium' },
+}
+
+/** ★ DeepSeek 两条的**真实形状**：只有单一 effort，没有 supportedEfforts。 */
+const REAL_DEEPSEEK = { effort: 'high', summary: 'auto' }
+
+// ─────────────────── 读能力：有档位 / 没有档位 ───────────────────
+
+test('★ 有 supportedEfforts → 报出 reasoningEfforts（逐条对上真上游）', () => {
+  const body = {
+    data: {
+      models: Object.entries(REAL_EFFORTS).map(([id, r]) => ({
+        id, name: id, credits: 'x0.29',
+        reasoning: { ...r },
+      })),
+    },
+  }
+  const byId = new Map(parseModelsFromConfig(body).map((m) => [m.id, m]))
+
+  assert.deepEqual(byId.get('hy3').reasoningEfforts, ['low', 'high'], 'hy3 真值')
+  assert.deepEqual(byId.get('hy4-preview').reasoningEfforts, ['high'])
+  assert.deepEqual(byId.get('kimi-k2.8-preview').reasoningEfforts, ['low', 'high', 'max'])
+  assert.deepEqual(byId.get('gpt-5.6-sol').reasoningEfforts, ['low', 'medium', 'high', 'xhigh', 'max'])
+  assert.deepEqual(byId.get('glm-5.2').reasoningEfforts, ['high', 'xhigh'])
+  assert.deepEqual(byId.get('gemini-3.8-flash').reasoningEfforts, ['low', 'medium', 'high'])
+
+  // defaultEffort 有则报
+  assert.equal(byId.get('hy3').defaultReasoningEffort, 'high')
+  assert.equal(byId.get('minimax-m3.1-flash').defaultReasoningEffort, 'max', '真值不是 high')
+  assert.equal(byId.get('gemini-3.8-flash').defaultReasoningEffort, 'medium')
+})
+
+test('★ 防回归：没有 supportedEfforts 的模型（DeepSeek 真实形状）→ **不报** reasoningEfforts', () => {
+  // 这是本任务最重要的一条。上游**只对真正支持多等级的模型**下发 supportedEfforts；
+  // 只有单一 effort 的模型此处缺省 ⇒ **不暴露等级选择器**。
+  // 给它编一组档位就是谎报能力：用户选了、上游 400，而他无从知道是插件编的。
+  const list = parseModelsFromConfig({
+    data: {
+      models: [
+        { id: 'deepseek-v4.1-flash', name: 'DeepSeek', credits: 'x0.00', onlyReasoning: true, reasoning: { ...REAL_DEEPSEEK } },
+        { id: 'deepseek-v4.1-flash-sg', name: 'DeepSeek SG', credits: 'x0.03', onlyReasoning: true, reasoning: { ...REAL_DEEPSEEK } },
+      ],
+    },
+  })
+  for (const meta of list) {
+    assert.equal(meta.reasoningEfforts, undefined, `${meta.id} 绝不能有档位（上游没声明）`)
+    assert.ok(!('reasoningEfforts' in meta), `${meta.id} 连键都不该有`)
+    // ★ 核心层的判据是「数组且非空」，两者都保证不出档位行
+    assert.equal(Array.isArray(meta.reasoningEfforts) && meta.reasoningEfforts.length > 0, false)
+  }
+})
+
+test('★ 防回归：绝不给没声明的模型编一组「看起来合理」的档位', () => {
+  // 反面清单：任何常见的「通用档位」都不该出现在没声明的模型上。
+  const meta = parseModelsFromConfig({
+    data: { models: [{ id: 'deepseek-v4.1-flash', reasoning: { ...REAL_DEEPSEEK } }] },
+  })[0]
+  for (const invented of [['low', 'high'], ['low', 'medium', 'high'], ['low', 'high', 'max'], ['none', 'low', 'high']]) {
+    assert.notDeepEqual(meta.reasoningEfforts, invented, `不该编出 ${invented.join('/')}`)
+  }
+})
+
+test('supportedEfforts: [] （空数组）→ 视同没有，不出档位行', () => {
+  const list = parseModelsFromConfig({
+    data: { models: [{ id: 'x', reasoning: { supportedEfforts: [], defaultEffort: 'high' } }] },
+  })
+  assert.equal(list[0].reasoningEfforts, undefined, '空数组 = 没有可枚举档位')
+  // ⚠️ defaultEffort 单独存在也**不足以**出档位行 —— 核心层只看 reasoningEfforts。
+  // 这与 DeepSeek 的处境一致：它有一个默认 effort，但仍不该有档位行。
+  assert.equal(list[0].defaultReasoningEffort, 'high', '声明了还是要如实带出')
+})
+
+test('supportedEfforts 里混入非字符串 / 空串 → 过滤掉；全被过滤则不出档位行', () => {
+  // 上游偶尔会混进 null / 空串，直接喂给核心层会在选择器里出现空行。
+  const mixed = parseModelsFromConfig({
+    data: { models: [{ id: 'a', reasoning: { supportedEfforts: ['low', null, '', 'high', 42] } }] },
+  })[0]
+  assert.deepEqual(mixed.reasoningEfforts, ['low', 'high'], '只留非空字符串')
+
+  const allJunk = parseModelsFromConfig({
+    data: { models: [{ id: 'b', reasoning: { supportedEfforts: [null, '', 42] } }] },
+  })[0]
+  assert.equal(allJunk.reasoningEfforts, undefined, '过滤后为空 ⇒ 视同没有')
+})
+
+test('reasoning 字段类型不对时不抛错、不出档位行', () => {
+  const list = parseModelsFromConfig({
+    data: {
+      models: [
+        { id: 'a', reasoning: null },
+        { id: 'b', reasoning: 'high' },
+        { id: 'c', reasoning: { supportedEfforts: 'low' } },   // 不是数组
+        { id: 'd', reasoning: { defaultEffort: '' } },          // 空串
+        { id: 'e' },                                            // 完全没有
+      ],
+    },
+  })
+  for (const meta of list) assert.equal(meta.reasoningEfforts, undefined, `${meta.id}`)
+  assert.equal(list.find((m) => m.id === 'd').defaultReasoningEffort, undefined, '空串不当声明')
+})
+
+test('defaultEffort 缺省 → 不报 defaultReasoningEffort（不猜）', () => {
+  const list = parseModelsFromConfig({
+    data: { models: [{ id: 'a', reasoning: { supportedEfforts: ['low', 'high'] } }] },
+  })
+  assert.deepEqual(list[0].reasoningEfforts, ['low', 'high'])
+  assert.equal(list[0].defaultReasoningEffort, undefined, '上游没给默认档就别编')
+})
+
+test('★ 真上游规模：19 条有档位 / 9 条没有（用真实 id 清单核对）', () => {
+  // 本机真打（2026-10-20）的完整清单。这条用例的作用是**锁住「19」这个数字**：
+  // 修复前是 0（我们完全没读这个字段），任务书期望 19。
+  const withEfforts = Object.keys(REAL_EFFORTS)
+  const withoutEfforts = [
+    'default-model', 'fast-model', 'balanced-model', 'primary-model',
+    'deepseek-v4.1-flash', 'deepseek-v4.1-flash-sg',
+    'gemini-3.5-flash', 'kimi-k3', 'kimi-k2.6',
+  ]
+  const body = {
+    data: {
+      models: [
+        ...withEfforts.map((id) => ({ id, reasoning: { ...REAL_EFFORTS[id] } })),
+        ...withoutEfforts.map((id) => ({
+          id,
+          reasoning: id === 'default-model' ? undefined : { ...REAL_DEEPSEEK },
+        })),
+      ],
+    },
+  }
+  const list = parseModelsFromConfig(body)
+  const rows = list.filter((m) => Array.isArray(m.reasoningEfforts) && m.reasoningEfforts.length > 0)
+  assert.equal(rows.length, withEfforts.length, `有档位的应恰好 ${withEfforts.length} 条`)
+  for (const id of withoutEfforts) {
+    const meta = list.find((m) => m.id === id)
+    assert.equal(meta.reasoningEfforts, undefined, `${id} 不该有档位行`)
+  }
+})
+
+// ─────────────────── 请求侧：决定发什么 ───────────────────
+
+test('★ decideReasoningEffort：选了模型支持的档 → 下发', () => {
+  const d = decideReasoningEffort({ requested: 'low', supported: ['low', 'high'], isDeepSeek: false })
+  assert.equal(d.effort, 'low')
+  assert.equal(d.thinking, false)
+})
+
+test('★ decideReasoningEffort：选了**不支持**的档 → 不下发（否则上游 400）', () => {
+  const d = decideReasoningEffort({ requested: 'max', supported: ['low', 'high'], isDeepSeek: false })
+  assert.equal(d.effort, undefined, 'hy3 只声明 [low,high]，max 发出去会 400')
+  assert.equal(d.thinking, false)
+})
+
+test('★ decideReasoningEffort：能力未知（supported===undefined）→ 原样放行', () => {
+  // 与核心层口径一致：`undefined` = 我们不知道该模型接受什么 ⇒ 拦下来等于
+  // 把调用方的显式选择静默丢掉。`[]` 才是「确认没有档位」。
+  const d = decideReasoningEffort({ requested: 'xhigh', isDeepSeek: false })
+  assert.equal(d.effort, 'xhigh')
+})
+
+test('★ decideReasoningEffort：DeepSeek 没选档 → 必须补一个 + 带 thinking', () => {
+  // 三站点实测：裸请求/只带 thinking → `reasoning_content` 恒为 0；
+  // **`reasoning_effort` 才是开关**。所以 DeepSeek 必须有一个档位。
+  const d = decideReasoningEffort({ isDeepSeek: true, singleEffort: 'high' })
+  assert.equal(d.effort, 'high', '★ 用上游自己声明的单一档，不是我们猜的')
+  assert.equal(d.thinking, true)
+})
+
+test('★ decideReasoningEffort：DeepSeek 的档位回退顺序', () => {
+  // 上游默认档 → 上游单一档 → high（在支持集内）→ 支持集首个
+  assert.equal(decideReasoningEffort({ isDeepSeek: true, defaultEffort: 'medium', supported: ['low', 'medium'] }).effort, 'medium')
+  assert.equal(decideReasoningEffort({ isDeepSeek: true, singleEffort: 'xhigh' }).effort, 'xhigh')
+  assert.equal(decideReasoningEffort({ isDeepSeek: true, supported: ['low', 'high', 'max'] }).effort, 'high')
+  assert.equal(decideReasoningEffort({ isDeepSeek: true, supported: ['low', 'medium'] }).effort, 'low', '没有 high 就取最低支持档')
+})
+
+test('★ decideReasoningEffort：绝不臆造模型未声明的档位', () => {
+  // 拿不到任何档位信息时：带 thinking（对齐官方客户端），但**不发档位**。
+  const d = decideReasoningEffort({ isDeepSeek: true })
+  assert.equal(d.effort, undefined, '★ 编一个档位就可能被服务端 400')
+  assert.equal(d.thinking, true)
+})
+
+test('★ decideReasoningEffort：thinking **只对 DeepSeek** 加', () => {
+  // glm / kimi 等走各自的 thinkingFormat，不需要这个开关（参考实现同款）。
+  assert.equal(decideReasoningEffort({ isDeepSeek: false, supported: ['low', 'high'] }).thinking, false)
+  assert.equal(decideReasoningEffort({ isDeepSeek: false }).thinking, false)
+  assert.equal(decideReasoningEffort({ isDeepSeek: true }).thinking, true)
+})
+
+test('★ decideReasoningEffort：DeepSeek 声明了档位时也照常校验所选的档', () => {
+  // 若某天上游给 DeepSeek 也下发 supportedEfforts，所选不被支持时仍不该原样发；
+  // 但 DeepSeek 会落到兜底（补一个合法档），不是「什么都不发」。
+  const d = decideReasoningEffort({ requested: 'ultra', supported: ['low', 'high'], isDeepSeek: true })
+  assert.equal(d.effort, 'high', '回退到合法档而不是发非法的 ultra')
+})
+
+test('★ decideReasoningEffort：上游默认档若不在支持集内 → 视为未声明，继续回退', () => {
+  // 远端数据可能自相矛盾（声明了 default 却不在 supported 里）。
+  const d = decideReasoningEffort({ isDeepSeek: true, defaultEffort: 'ultra', supported: ['low', 'high'] })
+  assert.equal(d.effort, 'high', '不采信矛盾的默认档，回退到 high')
+})
+
+test('isDeepSeekModel：按 id 前缀判定（与参考实现同款）', () => {
+  assert.equal(isDeepSeekModel('deepseek-v4.1-flash'), true)
+  assert.equal(isDeepSeekModel('deepseek-v4.1-flash-sg'), true)
+  assert.equal(isDeepSeekModel('DeepSeek-V4-Pro'), true, '大小写不敏感')
+  assert.equal(isDeepSeekModel('  deepseek-x  '), true, '两侧空白要容忍')
+  assert.equal(isDeepSeekModel('my-deepseek'), false, '必须**前缀**命中')
+  assert.equal(isDeepSeekModel('gpt-5.6-sol'), false)
+  assert.equal(isDeepSeekModel(''), false)
+})
+
+test('parseReasoningFields：字段名与参考实现 parseModelMeta 逐条对齐', () => {
+  // 有档位
+  assert.deepEqual(parseReasoningFields({ reasoning: { supportedEfforts: ['low', 'high'], defaultEffort: 'high' } }), {
+    supportedEfforts: ['low', 'high'], defaultEffort: 'high',
+  })
+  // 只有单一 effort（DeepSeek 真实形状）
+  assert.deepEqual(parseReasoningFields({ reasoning: { ...REAL_DEEPSEEK } }), { singleEffort: 'high' })
+  // 什么都没有
+  assert.deepEqual(parseReasoningFields({}), {})
+  assert.deepEqual(parseReasoningFields(undefined), {})
+  assert.deepEqual(parseReasoningFields({ reasoning: null }), {})
+})
+
+// ─────────────────── 请求侧：wire 上真的发了什么 ───────────────────
+
+test('★ wire：国际版 + 已声明的档位 → 请求体带 reasoning_effort', async () => {
+  const { ctx, calls } = chatCtx()
+  // 先拉一次目录填缓存（生产里的真实顺序）
+  await seedReasoning(ctx, { hy3: { supportedEfforts: ['low', 'high'], defaultEffort: 'high' } })
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }], account(), 'hy3', 'low')
+
+  const body = JSON.parse(String(calls.at(-1).body))
+  assert.equal(body.reasoning_effort, 'low')
+})
+
+test('★ wire：选了**不支持**的档 → 请求体**不带** reasoning_effort', async () => {
+  const { ctx, calls } = chatCtx()
+  await seedReasoning(ctx, { hy3: { supportedEfforts: ['low', 'high'], defaultEffort: 'high' } })
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }], account(), 'hy3', 'max')
+
+  const body = JSON.parse(String(calls.at(-1).body))
+  assert.equal(body.reasoning_effort, undefined, '★ 发没声明过的档上游会 400')
+  assert.ok(!('reasoning_effort' in body))
+})
+
+test('★ wire：DeepSeek 未选档 → 补一个档位 **且** 带 thinking', async () => {
+  // 三站点实测：只带 thinking 不生效、只带 effort 才是开关；DeepSeek 没有档位
+  // 就等于「不思考」。所以这里两者都必须有。
+  const { ctx, calls } = chatCtx()
+  await seedReasoning(ctx, { 'deepseek-v4.1-flash': { effort: 'high', summary: 'auto' } })
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }], account(), 'deepseek-v4.1-flash')
+
+  const body = JSON.parse(String(calls.at(-1).body))
+  assert.equal(body.reasoning_effort, 'high', '★ 用上游声明的单一档')
+  assert.deepEqual(body.thinking, { type: 'enabled' }, '★ DeepSeek 必须带 thinking')
+})
+
+test('★ wire：非 DeepSeek 不带 thinking', async () => {
+  const { ctx, calls } = chatCtx()
+  await seedReasoning(ctx, { hy3: { supportedEfforts: ['low', 'high'] } })
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }], account(), 'hy3', 'low')
+
+  const body = JSON.parse(String(calls.at(-1).body))
+  assert.equal(body.thinking, undefined)
+})
+
+test('★ wire：核心层塞了一个不被支持的档位时，必须被清掉（不能留在 body 里）', async () => {
+  // 核心层在「拿不到我们的档位声明」时会**原样放行**用户请求的档位。
+  // 我们这里重新算过之后，若不把旧值删掉，spread 会把它留在 body 里 → 400。
+  const { ctx, calls } = chatCtx()
+  await seedReasoning(ctx, { hy3: { supportedEfforts: ['low', 'high'] } })
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }], account(), 'hy3', 'ultra')
+
+  const body = JSON.parse(String(calls.at(-1).body))
+  assert.equal(body.reasoning_effort, undefined, '★ 不能让不受支持的旧值漏出去')
+})
+
+test('★ wire：目录没拉到（缓存空）→ 原样放行请求的档位（不静默丢弃）', async () => {
+  const { ctx, calls } = chatCtx()
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }], account(), 'hy3', 'low')
+
+  const body = JSON.parse(String(calls.at(-1).body))
+  assert.equal(body.reasoning_effort, 'low', '能力未知时拦下来等于丢掉用户的显式选择')
+})
+
+test('★ wire：档位判定不改变其它请求字段', async () => {
+  const { ctx, calls } = chatCtx()
+  await seedReasoning(ctx, { hy3: { supportedEfforts: ['low', 'high'] } })
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }], account(), 'hy3', 'low')
+
+  const body = JSON.parse(String(calls.at(-1).body))
+  assert.equal(body.model, 'hy3')
+  assert.equal(body.stream, true)
+  assert.deepEqual(body.stream_options, { include_usage: true })
+  assert.equal(body.messages[0].role, 'system', '补 system 的守卫仍在')
 })

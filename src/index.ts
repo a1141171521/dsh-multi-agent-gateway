@@ -364,7 +364,10 @@ export function apply(ctx: ApplyContext, config: PluginConfig = {}): PluginHandl
         ...(input?.force === true ? { force: true } : {}),
       }),
     refreshQuota: (input) =>
-      runtime.refreshQuotas(typeof input?.agentId === 'string' ? input.agentId : undefined),
+      runtime.refreshQuotas({
+        ...(typeof input?.agentId === 'string' ? { agentId: input.agentId } : {}),
+        ...(typeof input?.accountId === 'string' ? { accountId: input.accountId } : {}),
+      }),
     runTasks: (input) =>
       runtime.runTasks({
         ...(typeof input?.agentId === 'string' ? { agentId: input.agentId } : {}),

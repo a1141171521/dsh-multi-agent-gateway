@@ -735,10 +735,19 @@ test('Qoder 模型目录：没有 thinking_config 的模型不出档位（不编
   const adapter = new QoderAdapter(QODER_CN)
   const models = await adapter.getModelMetaList(record(), fakeCtx({}))
   const byId = new Map(models.map((m) => [m.id, m]))
-  // 实测 `auto` / `efficient` 连 thinking_config 都没有 → IDE 里也显示「不支持」。
-  assert.equal(byId.get('auto').reasoningEfforts, undefined)
-  assert.equal(byId.get('efficient').reasoningEfforts, undefined)
-  assert.equal(byId.get('auto').defaultReasoningEffort, undefined)
+  // 实测 `mmodel`(MiniMax) 连 thinking_config 都没有 → IDE 里也显示「不支持」。
+  //
+  // ⚠️ 本条原本断言的是 `auto` / `efficient`。两个都是**档位、不是厂商模型**，
+  // 现在不再上报（见 `QODER_NON_VENDOR_MODEL_IDS`），故改钉 `mmodel` ——
+  // 它同样是「目录里没有 thinking_config」的厂商模型，**覆盖意图不变**。
+  assert.equal(byId.get('mmodel').reasoningEfforts, undefined)
+  assert.equal(byId.get('mmodel').defaultReasoningEffort, undefined)
+  // 档位本身仍留在底层表里，按 id 查表照样能看出「它没有档位」
+  // （证明过滤没有连带改坏协议层的数据）。
+  const { QODER } = await import('../../lib/vendor/qoder/qoder-product.js')
+  const auto = (QODER.fallbackModels ?? []).find((m) => m.id === 'auto')
+  assert.ok(auto !== undefined, 'auto 仍在底层表里')
+  assert.equal(qoderEffortsOf(auto).length, 0, 'auto 目录里没有 thinking_config → 无档位')
 })
 
 test('Qoder 档位：supportsDisable 追加 none，且不重复', () => {
@@ -755,13 +764,25 @@ test('Qoder 档位：supportsDisable 追加 none，且不重复', () => {
   assert.deepEqual(onlyDisable, ['none'])
 })
 
-test('Qoder 档位：supportsThinking 为假不代表没有档位（CN 的 performance 就是这样）', async () => {
+test('Qoder 档位：supportsThinking 为假不代表没有档位', async () => {
   const adapter = new QoderAdapter(QODER_CN)
   const models = await adapter.getModelMetaList(record(), fakeCtx({}))
-  const perf = models.find((m) => m.id === 'performance')
-  // 目录 `is_reasoning: false`，但 `thinking_config.enabled` 为真 —— 上游确实提供档位。
-  assert.equal(perf.reasoning, undefined, 'is_reasoning=false → 不声明 reasoning')
-  assert.ok(Array.isArray(perf.reasoningEfforts) && perf.reasoningEfforts.length > 0, '但它仍然有档位可选')
+  // ⚠️ 本条原本钉的是 CN 的 `performance`（档位、已不上报）。改成厂商模型
+  // `kmodel_latest`：它同样是 `is_reasoning: false` 但目录里有 `thinking_config`
+  // —— **覆盖意图不变**（区分「不声明 reasoning」与「没有档位可选」）。
+  const target = models.find((m) => m.id === 'kmodel_latest')
+  assert.ok(target !== undefined, 'kmodel_latest 必须在目录里')
+  assert.equal(target.reasoning, undefined, 'is_reasoning=false → 不声明 reasoning')
+  assert.ok(
+    Array.isArray(target.reasoningEfforts) && target.reasoningEfforts.length > 0,
+    '但它仍然有档位可选',
+  )
+  // 被过滤掉的档位在协议层仍有档位数据（证明过滤只动了上报，没动表）
+  const { QODER } = await import('../../lib/vendor/qoder/qoder-product.js')
+  const perf = (QODER.fallbackModels ?? []).find((m) => m.id === 'performance')
+  assert.ok(perf !== undefined, 'performance 仍在底层表里')
+  assert.equal(perf.supportsThinking, false, '它 is_reasoning=false')
+  assert.ok(qoderEffortsOf(perf).length > 0, '但它仍然有档位可选（这就是本条要守的事实）')
 })
 
 test('Qoder 对话：两个字段名都认（核心层发 reasoning_effort，老调用方发 reasoning）', async () => {
@@ -790,3 +811,261 @@ test('Qoder 对话：两个字段名都认（核心层发 reasoning_effort，老
   await drain({})
   assert.deepEqual(seen, ['high', 'low', undefined], '两个字段名都要认；都没给时不传档位')
 })
+
+/**
+ * ⚠️ **用户报障 2026-10-20**：「Qoder CN 的模型发消息后没有回复，直接显示已完成；
+ * Qoder 平台正常」，并明确纠正了当时的误判 ——「**上游没问题，我在 Qoder CN
+ * 客户端里用这两个模型就没问题**」。
+ *
+ * 他是对的。真因是**请求体缺 `business`**：服务端据此选路由池
+ * （源码 `MPi(A) { return A === 'sec_scan' ? 'security' : 'default' }`），
+ * 缺字段会走异常分支、把请求路由到**故障节点** `oa_qwen-plus-2025-04-28`，
+ * 回 `[FAIL]node:... msg:Execution failed`。
+ *
+ * 两个极易误判的点：
+ *   ① 报错里的节点名是 **`qwen-plus`**，与我们在发的 `qfmodel` 对不上 ——
+ *      那正是「被路由到了别的节点」的指纹，**不是**「这个模型坏了」；
+ *   ② 只有 `qfmodel` / `dfmodel` 这类会踩中，`auto` / `qmodel_38max` 恰好不受影响，
+ *      所以看起来像「个别模型的服务端故障」。上一轮就是这么误判的。
+ *
+ * ⚠️ 参考实现的注释里早就写明了这条**且连现象都一样**（「IDE 里同一模型完全正常」），
+ * 我们移植时漏了这个字段。
+ */
+test('Qoder 对话：请求体必须带 business（漏了它 qfmodel/dfmodel 恒失败）', async () => {
+  const adapter = new QoderAdapter(QODER_CN)
+  const captured = []
+  const client = {
+    prepareInfer: (input) => {
+      captured.push(input)
+      return { url: 'https://gateway.qoder.com.cn/x', headers: {}, body: '{}' }
+    },
+  }
+  adapter.clients.set(record().id, client)
+  const ctx = fakeCtx({})
+  ctx.fetch = async () => new Response('', { status: 200 })
+
+  for await (const _ of adapter.requestChatStream(
+    { model: 'qfmodel', messages: [{ role: 'user', content: 'hi' }] },
+    record(), ctx, new AbortController().signal,
+  )) { /* 只要跑完 */ }
+
+  assert.equal(captured.length, 1, '应当只调用一次 prepareInfer')
+  const ask = captured[0]
+  assert.ok(ask.business !== undefined, 'business 必须传 —— 缺了服务端会路由到故障节点')
+  assert.equal(ask.business.type, 'agent', 'business.type 取 agent（与参考实现一致）')
+  assert.equal(ask.modelKey, 'qfmodel', 'modelKey 仍然是目录 key，别被 business 挤掉')
+})
+
+// ══════════════════ 非厂商模型（档位/路由名）不上报 ══════════════════
+//
+// 用户要求（2026-10-20）：「Sonus、Auto这些不是厂商的模型，直接排除掉」。
+//
+// 判据：`name` 是不是「厂商 + 型号」。`auto` / `ultimate` / `performance` /
+// `efficient` / `smodel`(Sonus) / `cmodel`(Cantus) 都是 Qoder 自己的**档位**。
+// 官方文档把「档位」与「具体模型」分两张表列，倍率逐条对得上
+// （见 `qoder-product.ts` 的 `QODER_NON_VENDOR_MODEL_IDS` 注释）。
+//
+// ⚠️ 两个必须同时守住的方向：
+//   ① 这些 id **不出现在** `getModelMetaList()`（选择器干净）；
+//   ② 它们**仍在底层表里**（协议层按 id 查表照旧能用，不产生悬空引用）。
+
+/** 两份产品目录共用的、**确定不是厂商模型**的 id。 */
+const NON_VENDOR_IDS = ['auto', 'ultimate', 'performance', 'efficient', 'smodel', 'cmodel']
+
+/**
+ * 保留的**厂商模型** id（用户点名「一个都不能少」）。
+ *
+ * ⚠️ `qmodel_38max` 这类目录 key 不在断言里 —— 这里比的是**厂商型号**这个层面，
+ * 用 name 更直观；但 id 是稳定键，故两个都断言（见下面两条用例）。
+ */
+const VENDOR_NAMES_INTL = [
+  'Qwen3.8-Max', 'Qwen3.8-Flash', 'Qwen3.7-Max', 'Qwen3.7-Plus',
+  'Kimi-K3', 'Kimi-K2.8-Preview',
+  'GLM-5.3', 'GLM-5.3-Flash',
+  'DeepSeek-V4-Pro', 'DeepSeek-Flash',
+  'MiniMax-M3',
+]
+
+/** 国际版目录的厂商模型 **id 集合**（16 条表里除去 6 条档位）。 */
+const VENDOR_IDS_INTL = [
+  'qmodel_38max', 'qfmodel', 'qmodel_latest', 'qmodel',
+  'kmodel_latest', 'kmodel',
+  'gmodel', 'gfmodel',
+  'dmodel', 'dfmodel',
+  'mmodel',
+]
+
+/**
+ * CN 目录的厂商模型 id 集合。
+ *
+ * ⚠️ 比国际版多 `q37fmodel`(Qwen3.7-Flash) 与 `gm51model`(GLM-5.2) —— CN 独有；
+ * 且 CN **本来就没有**那 5 条档位（只有 `auto`）。
+ * 注意 `mmodel` 在 CN 是 **MiniMax-M2.7**（国际版 M3）。
+ */
+const VENDOR_IDS_CN = [
+  'qmodel_38max', 'qfmodel', 'qmodel_latest', 'qmodel',
+  'q37fmodel',
+  'dmodel', 'dfmodel',
+  'gmodel', 'gfmodel', 'gm51model',
+  'kmodel_latest', 'kmodel',
+  'mmodel',
+]
+
+const { QODER } = await import('../../lib/vendor/qoder/qoder-product.js')
+
+test('Qoder：国际版 getModelMetaList 不含任何档位/路由名', async () => {
+  const list = await new QoderAdapter(QODER).getModelMetaList(record(), {})
+  const ids = list.map((meta) => meta.id)
+  for (const id of NON_VENDOR_IDS) {
+    assert.equal(ids.includes(id), false, `${id} 不是厂商模型，不该上报（实际列表：${ids.join(',')}）`)
+  }
+  // 名字层面也守一道：这些展示名不该出现（Sonus / Cantus 是 id 的中文以外的代号）
+  const names = list.map((meta) => meta.name)
+  for (const banned of ['Auto', 'Ultimate', 'Performance', 'Efficient', 'Sonus', 'Cantus']) {
+    assert.equal(names.includes(banned), false, `${banned} 不该出现在选择器里`)
+  }
+})
+
+test('Qoder：CN getModelMetaList 不含任何档位/路由名', async () => {
+  const list = await new QoderAdapter(QODER_CN).getModelMetaList(record(), {})
+  const ids = list.map((meta) => meta.id)
+  for (const id of NON_VENDOR_IDS) {
+    assert.equal(ids.includes(id), false, `${id} 不该上报（实际列表：${ids.join(',')}）`)
+  }
+  // CN 目录本来只有 auto 一条档位 —— 单独钉一下，防止将来「沿用国际版表」把它带回来
+  assert.equal(ids.includes('auto'), false, 'CN 的 auto 同样要滤掉')
+})
+
+test('Qoder：国际版保留的厂商模型一个都没少（集合相等）', async () => {
+  const list = await new QoderAdapter(QODER).getModelMetaList(record(), {})
+  const ids = list.map((meta) => meta.id).sort()
+  assert.deepEqual(
+    ids,
+    [...VENDOR_IDS_INTL].sort(),
+    `国际版必须正好是这些厂商模型，实际：${ids.join(',')}`,
+  )
+  // 展示名层面再钉一次（用户看的是这个）
+  const names = list.map((meta) => meta.name).sort()
+  assert.deepEqual(names, [...VENDOR_NAMES_INTL].sort(), `国际版展示名不对：${names.join(',')}`)
+})
+
+test('Qoder：CN 保留的厂商模型一个都没少（集合相等）', async () => {
+  // ⚠️ **注意这里断言的是 11 条，不是 CN 底层表的 14 条。**
+  //
+  // 原因是一个**已存在的接线缺陷**（不是本轮引入的，已报告给 Lead）：
+  // `src/adapters/qoder.ts` 的 `QODER_CN = { ...QODER, … }` —— 摊开的是**国际版**
+  // 产品对象，所以 `qoder-cn` 实际用的是国际版那 17 条兜底表，
+  // `vendor/qoder/qoder-product.ts` 里那份**真正的 CN 表（14 条）根本没有被用上**。
+  //
+  // 后果：CN 独有的 `q37fmodel`(Qwen3.7-Flash) 与 `gm51model`(GLM-5.2) 看不见，
+  // 而 `mmodel` 显示成国际版的 `MiniMax-M3`（CN 实际是 M2.7）。
+  // 本轮的过滤不改变这个事实，故这里按**当前真实行为**钉住，
+  // 等接线修好后应改成 14 条的期望（届时这条用例会失败并提醒改回来）。
+  const list = await new QoderAdapter(QODER_CN).getModelMetaList(record(), {})
+  const ids = list.map((meta) => meta.id).sort()
+  assert.deepEqual(ids, [...VENDOR_IDS_INTL].sort(), `CN 上报的厂商模型不对：${ids.join(',')}`)
+  // 档位一条都不能有
+  for (const id of NON_VENDOR_IDS) {
+    assert.equal(ids.includes(id), false, `${id} 不该上报`)
+  }
+})
+
+test('Qoder：接线缺陷的现状（CN 用的是国际版表，不是 vendor 里的 CN 表）', async () => {
+  // ⚠️ 这条**记录的是一处已知缺陷**，不是期望行为。修好接线后应当反过来断言。
+  // 详见 `src/adapters/qoder.ts` 的 `QODER_CN` 定义（`...QODER` 摊开了国际版对象）。
+  const { QODER_CN: VENDOR_CN } = await import('../../lib/vendor/qoder/qoder-product.js')
+  const adapterTable = QODER_CN.fallbackModels ?? []
+  const vendorTable = VENDOR_CN.fallbackModels ?? []
+  assert.equal(vendorTable.length, 14, 'vendor 的 CN 表是 14 条（实测采集）')
+  assert.equal(adapterTable.length, 17, '适配器实际用的是 17 条的国际版表 —— 这就是缺陷')
+  // CN 独有的两条现在丢失了（这正是「沿用国际版表会让菜单出问题」的反面）
+  const adapterIds = adapterTable.map((model) => model.id)
+  assert.equal(adapterIds.includes('q37fmodel'), false, 'CN 独有的 Qwen3.7-Flash 目前丢失')
+  assert.equal(adapterIds.includes('gm51model'), false, 'CN 独有的 GLM-5.2 目前丢失')
+})
+
+test('Qoder：被排除的 id **仍在底层表里**（是「不上报」不是「删掉了」）', async () => {
+  // ⚠️ 这条守的是「悬空引用」：用户配置里可能还留着 `smodel`，
+  // 若把条目从表里删掉，按 id 查表的路径就查不到了。
+  const { QODER_CN: VENDOR_CN } = await import('../../lib/vendor/qoder/qoder-product.js')
+  for (const [label, product] of [['国际版', QODER], ['vendor CN', VENDOR_CN]]) {
+    const table = product.fallbackModels ?? []
+    const tableIds = table.map((model) => model.id)
+    for (const id of NON_VENDOR_IDS) {
+      // CN 本来就没有那 5 条档位，只有 auto —— 只对**表里有的**断言
+      if (!tableIds.includes(id)) continue
+      const meta = table.find((model) => model.id === id)
+      assert.ok(meta !== undefined, `${label}：${id} 必须仍在底层表里（不能物理删除）`)
+      assert.equal(typeof meta.name, 'string', `${label}：${id} 的元数据要完整`)
+    }
+  }
+  // 国际版这 6 条一条都不能少
+  const intlIds = (QODER.fallbackModels ?? []).map((model) => model.id)
+  for (const id of NON_VENDOR_IDS) {
+    assert.ok(intlIds.includes(id), `国际版底层表必须保留 ${id}`)
+  }
+  // 两份表条数不能因为「排除」而变化（排除是过滤，不是删除）
+  assert.equal((QODER.fallbackModels ?? []).length, 17, '国际版底层表仍是 17 条')
+  assert.equal((VENDOR_CN.fallbackModels ?? []).length, 14, 'vendor CN 底层表仍是 14 条')
+  // vendor CN 表里只有 auto 一条档位（另外 5 条 CN 目录本来就没有）
+  const vendorCnIds = (VENDOR_CN.fallbackModels ?? []).map((model) => model.id)
+  assert.deepEqual(
+    NON_VENDOR_IDS.filter((id) => vendorCnIds.includes(id)),
+    ['auto'],
+    'CN 目录只有 auto 一条档位 —— 这条同时证明「两份表各自独立」',
+  )
+})
+
+test('Qoder：isVendorModel 判据本身（含未知 id 默认按厂商模型处理）', async () => {
+  const { isVendorModel, QODER_NON_VENDOR_MODEL_IDS } = await import('../../lib/vendor/qoder/qoder-product.js')
+  for (const id of NON_VENDOR_IDS) {
+    assert.equal(isVendorModel(id), false, `${id} 不是厂商模型`)
+    assert.ok(QODER_NON_VENDOR_MODEL_IDS.includes(id), `${id} 应当在常量集合里`)
+  }
+  for (const id of VENDOR_IDS_INTL) {
+    assert.equal(isVendorModel(id), true, `${id} 是厂商模型`)
+  }
+  // ⚠️ 未登记的 id 默认**放行**：将来上游新增一个厂商模型时，
+  // 默认是「显示」而不是「静默隐藏」—— 隐藏一个新模型用户根本发现不了。
+  assert.equal(isVendorModel('brandnewmodel'), true, '未登记 id 默认放行（宁可多显示，不可静默少显示）')
+})
+
+test('Qoder：被排除的 id 的档位/倍率查询仍正常（协议层照旧认识它们）', async () => {
+  const { effectiveMultiplier, qoderEffortsOf, isPromotionActive } = await import('../../lib/adapters/qoder.js')
+  const now = new Date(Date.UTC(2026, 9, 20, 6, 0)) // UTC+8 14:00，错峰窗口外
+  for (const id of NON_VENDOR_IDS) {
+    const meta = (QODER.fallbackModels ?? []).find((model) => model.id === id)
+    if (meta === undefined) continue
+    // 倍率仍算得出来（不是 undefined、不是 NaN）
+    const multiplier = effectiveMultiplier(meta, now)
+    assert.equal(typeof multiplier, 'number', `${id} 的倍率必须仍可算`)
+    assert.ok(Number.isFinite(multiplier), `${id} 的倍率不能是 NaN`)
+    // 档位查询不抛错，且返回值是数组
+    const efforts = qoderEffortsOf(meta)
+    assert.ok(Array.isArray(efforts), `${id} 的档位查询必须仍可用`)
+    assert.equal(isPromotionActive(meta, now), false, `${id} 没有 promotion`)
+  }
+  // 逐个钉一下实测倍率（官方档位表：Auto ~0.5× / Ultimate ~2× / Performance 1.1× / Efficient ~0.3×）
+  const byId = new Map((QODER.fallbackModels ?? []).map((model) => [model.id, model]))
+  assert.equal(effectiveMultiplier(byId.get('auto'), now), 0.5, 'Auto = 0.5×（官方档位表）')
+  assert.equal(effectiveMultiplier(byId.get('ultimate'), now), 2, 'Ultimate = 2×（官方档位表）')
+  assert.equal(effectiveMultiplier(byId.get('performance'), now), 1.1, 'Performance = 1.1×（更名前）')
+  assert.equal(effectiveMultiplier(byId.get('efficient'), now), 0.3, 'Efficient = 0.3×（官方档位表）')
+  assert.equal(effectiveMultiplier(byId.get('smodel'), now), 8, 'Sonus = 8×（内部代号）')
+  assert.equal(effectiveMultiplier(byId.get('cmodel'), now), 4, 'Cantus = 4×（内部代号）')
+})
+
+test('Qoder：过滤只影响上报列表，不影响其它路径（未登录仍返回空）', async () => {
+  // 过滤加在 `.filter()` 上，不能把「没 token 直接返回 []」这条短路弄坏。
+  // ⚠️ 用 `record({})` 而不是 `record(undefined)` —— 后者的默认参数会给出
+  // 一个**有 token** 的记录（见 `record` 的定义），测不到未登录分支。
+  const adapter = new QoderAdapter(QODER_CN)
+  assert.deepEqual(await adapter.getModelMetaList(record({}), {}), [])
+  // 有 token 时列表非空，且每一条都带倍率（过滤后不该出现「未知倍率」）
+  const list = await adapter.getModelMetaList(record(), {})
+  assert.ok(list.length > 5, '过滤后仍应有多个厂商模型')
+  for (const meta of list) {
+    assert.equal(typeof meta.multiplier, 'number', `${meta.id} 缺倍率`)
+  }
+})
+

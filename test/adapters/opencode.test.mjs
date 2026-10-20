@@ -234,12 +234,35 @@ async function sentEffortFor(meta, reasoningEffort) {
     labelWithAgent: false,
     accounts: { markOk() {}, markFailure() {}, health: () => ({ failures: 0 }) },
     router: {
-      execute: async (_agent, run) => ({
-        ok: true,
-        accountId: 'opencode:anonymous',
-        attempts: [],
-        value: await run({ id: 'opencode:anonymous' }),
-      }),
+      /**
+       * ⚠️ 假 router 必须**复刻真 router 的两层包装**，否则这个 fixture 是假的。
+       *
+       * 真链路（`src/llm/adapter.ts` 的 `pump`）读的是 `outcome.value.events`：
+       *   · `run()`（回调）自己就返回 `{ ok, value: { events } }` —— 它在内部
+       *     已经把流包成了 `events`；
+       *   · `router.execute` 再包一层 `{ ok, accountId, attempts, value }`
+       *     （见 `src/core/router.ts:305` 的 `return { ok: true, value: outcome.value, … }`）。
+       *
+       * 早先这里的 `value: await run(…)` 把 `run()` 的**整个返回对象**又塞回
+       * `value`，于是 `outcome.value.events` 变成 `undefined`，测试里读到
+       * `Cannot read properties of undefined (reading 'Symbol(Symbol.asyncIterator)')`。
+       *
+       * 这条 fixture 错了一直没暴露，是因为旧 `pump` 把迭代器的获取放在
+       * `try` 里，那个 TypeError 被 catch 当成「上游报错」，测试只断言
+       * 「发出了什么 effort」，没看结果 —— **假通过**。2026-10-20 改成
+       * 「收尾但不结束」时迭代器挪到 try 外，才把它顶出来。
+       * 所以这里必须**真的解开一层**：`run()` 返回 `{ok, value:{events}}`，
+       * 我们要把 `value`（也就是 `{events}`）交给 router 的 `value`。
+       */
+      execute: async (_agent, run) => {
+        const inner = await run({ id: 'opencode:anonymous' })
+        return {
+          ok: true,
+          accountId: 'opencode:anonymous',
+          attempts: [],
+          value: inner.value,
+        }
+      },
     },
     adapterOf: () => ({
       async *requestChatStream(payload) {

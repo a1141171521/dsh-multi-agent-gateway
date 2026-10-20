@@ -48,9 +48,21 @@
  * （`test/adapters/buddy.test.mjs`，用假 ctx 记录每次调用）。
  */
 
+import { createHash, randomUUID } from 'node:crypto'
 import { BaseAdapter } from './base.js'
 import { iterateSse } from '../core/sse.js'
 import { unsupportedReason } from './messages.js'
+import {
+  formatCreditsRate,
+  normalizeCreditsRate,
+  normalizeDiscountedRate,
+  parseModelPromotions,
+} from '../vendor/buddy/buddy-rate.js'
+import {
+  decideReasoningEffort,
+  isDeepSeekModel,
+  parseReasoningFields,
+} from '../vendor/buddy/buddy-reasoning.js'
 import {
   CHECKIN_ACTIVITY_STATUS_PATH,
   DAILY_CHECKIN_PATH,
@@ -62,6 +74,19 @@ import {
   parseCreditBalance,
 } from './buddy-credits.js'
 import type { BuddyClaimOutcome } from './buddy-credits.js'
+import {
+  CODE_ACCOUNT_NOT_READY,
+  CODE_TOKEN_NOT_READY,
+  LOGIN_ACCOUNT_PATH,
+  accountLabelOf,
+  buildCredentials,
+  decorateLoginUrl,
+  parseAccountPayload,
+  parseTokenPayload,
+  responseCode,
+  responseData,
+  responseMessage,
+} from '../vendor/buddy/buddy-login.js'
 import type { LoginPollResult, LoginStartResult } from '../core/login.js'
 import type {
   AccountRecord,
@@ -102,6 +127,29 @@ export interface BuddyProduct {
    * 必填强制每个产品显式回答这个问题。
    */
   hasDailyCheckin: boolean
+  /**
+   * 登录 URL 是否需要追加 `version` 与 `loginSessionId`。
+   *
+   * 国际版 `true`（对齐 workbuddy-desktop 的认证配置），国内版 `false`。
+   * 参考实现 `product.ts:405` 同名字段。
+   *
+   * ⚠️ 追加的是**会话参数**：缺了它，用户点开的登录页与服务端这一轮的
+   * `state` 对不上会话 —— 表现就是「授权完成回来仍是 pending」。
+   */
+  appendSessionParams: boolean
+  /** 追加到登录 URL 的版本号（`appendSessionParams` 为 true 时使用）。 */
+  pluginVersion?: string
+  /**
+   * 对话请求是否必须带**三个会话头**（`X-Conversation-ID` / `-Message-ID` / `-Request-ID`）。
+   *
+   * 只有国际版需要。**缺任一个都过不了上游的渠道校验**，报
+   * `{"code":11128,"msg":"request illegal"}` + 「This call failed channel verification」。
+   *
+   * ⚠️ **与 `appendSessionParams` 是两件不同的事**，别合并：
+   * 那个管「登录 URL 追加参数」，这个管「对话请求头」。两者当前恰好都只对国际版为
+   * true，但语义无关 —— 合并成一个字段会让第三个产品出现时必然写错一个。
+   */
+  requiresConversationHeaders: boolean
 }
 
 const UA_INTL = 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2'
@@ -116,6 +164,16 @@ const UA_CN = 'WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2'
  */
 const BUDDY_DEPLOYMENT_TYPE = 'SaaS'
 
+/**
+ * 国际版缺失 system 时补的最小可用 system。
+ *
+ * 出处：参考实现的 `account-probe.ts:123`（`PROBE_SYSTEM`），注释说明它「对齐
+ * `tests/e2e/buddy-pool-probe.e2e.spec.ts` 与 `scripts/verify-max-tokens.mjs`
+ * 里已被验证可用的同一句」。国际版网关只要求 `messages[0].role === 'system'`，
+ * **不校验内容** —— 所以选最小、最中性的这句，不要夹带任何业务指令。
+ */
+const BUDDY_MINIMAL_SYSTEM = 'You are a helpful assistant.'
+
 /** 国内版（copilot.tencent.com）。 */
 export const BUDDY_CN: BuddyProduct = {
   agentId: 'workbuddy',
@@ -129,6 +187,10 @@ export const BUDDY_CN: BuddyProduct = {
   userAgent: 'CodeBuddyIDE/1.106.1',
   userAgentByModelFamily: [],
   hasDailyCheckin: true,
+  // 国内版不追加会话参数（参考实现 product.ts:282 `appendSessionParams: false`）。
+  appendSessionParams: false,
+  // 国内版不需要三个会话头（参考实现只对 product.id === 'workbuddy' 加）。
+  requiresConversationHeaders: false,
 }
 
 /** 国际版（www.workbuddy.ai）。 */
@@ -153,6 +215,11 @@ export const BUDDY_INTL: BuddyProduct = {
   ],
   // 国际版内核里没有签到接口（只有 get-dosage-notify 用量通知）⇒ 不发请求。
   hasDailyCheckin: false,
+  // 国际版**必须**追加会话参数（参考实现 product.ts:405-406）。
+  appendSessionParams: true,
+  pluginVersion: '5.5.2',
+  // ⚠️ 国际版**必须**带三个 conversation 头，否则 400 + code 11128「渠道校验」。
+  requiresConversationHeaders: true,
 }
 
 export const BUDDY_PRODUCTS: readonly BuddyProduct[] = [BUDDY_CN, BUDDY_INTL]
@@ -269,11 +336,43 @@ export function parseModelsFromConfig(body: unknown): ModelMeta[] {
     }
   }
 
+  // 促销（活动价）按模型 id 索引。⚠️ **只取此刻生效的**：`modelPromotions` 里
+  // 有时间窗口（`schedule` / `validFrom` / `validUntil`）与 `enabled` 两类过滤，
+  // 全交给 `parseModelPromotions`（参考实现逐条实测换来的）。
+  const promotions = parseModelPromotions(record)
+
   return ids.map((id) => {
     const meta = metaById.get(id) ?? {}
     const contextWindow = typeof meta.maxInputTokens === 'number' ? meta.maxInputTokens : undefined
     const images = meta.supportsImages === true
     const name = typeof meta.name === 'string' && meta.name !== '' ? meta.name : id
+
+    // 倍率：`data.models[].credits`（实测 `"x0.29"` / `"x0.34 credits"` / `"x0.00"`）。
+    //
+    // ⚠️ **解析不出就是 `undefined`（不放 `multiplier` 键），绝不回退成 1** ——
+    //    核心层的口径是 `undefined` = 未知（UI 显示「未知倍率」）、`0` = 免费，
+    //    两者不能混。编造倍率比不显示更糟（参考实现注释原文）。
+    const rate = normalizeCreditsRate(meta.credits)
+    const discounted = promotions.get(id)
+    // 展示文案保留「原价→促销价」两段（见 formatCreditsRate 的说明）。
+    const rateText = formatCreditsRate(rate, discounted)
+
+    // 生效价（用户**实际会付**的那个）：有促销就用促销价，否则用原价。
+    // ⚠️ 方向不能反 —— 拿原价当 `multiplier` 会让打了折的模型显示成原价，
+    //    用户按原价预期、实际按折扣计费时反而以为「倍率不准」。
+    const effective = discounted ?? rate
+
+    // 思考档位：`data.models[].reasoning.supportedEfforts` / `defaultEffort`。
+    //
+    // ⚠️ **只在 `supportedEfforts` 真的下发时才报 `reasoningEfforts`** ——
+    // 这是本字段唯一正确的用法。实测（2026-10-20，国际版 `/v3/config` 28 条）：
+    // **19 条有它、9 条没有**。没有的那 9 条（含用户问的 `deepseek-v4.1-flash`
+    // 与 `-sg`，它们只有 `{"effort":"high","summary":"auto"}`）**必须继续没有档位行**：
+    // 参考实现注释明说该字段「只在模型真正支持多等级时下发」，
+    // 给它编一组（哪怕看起来合理）就是**谎报能力** —— 用户选了、上游 400，
+    // 而他无从知道那是插件编的。核心层 `efforts.length > 0` 的判据正是为此设计。
+    const reasoning = parseReasoningFields(meta)
+
     return {
       id,
       name,
@@ -282,13 +381,93 @@ export function parseModelsFromConfig(body: unknown): ModelMeta[] {
       ...(contextWindow === undefined ? {} : { contextWindow }),
       ...(images ? { inputModalities: ['text', 'image'] as ('text' | 'image')[] } : {}),
       ...(meta.reasoning === undefined ? {} : { reasoning: true }),
+      ...(reasoning.supportedEfforts === undefined ? {} : { reasoningEfforts: reasoning.supportedEfforts }),
+      ...(reasoning.defaultEffort === undefined ? {} : { defaultReasoningEffort: reasoning.defaultEffort }),
+      ...(effective === undefined
+        ? {}
+        : {
+            multiplier: effective.value,
+            // `0` = 免费。用 `free` 标出来，让核心层的 `formatMultiplier`
+            // 与倍率无关地也能显示「免费」（它的判据是 `free === true || multiplier === 0`）。
+            ...(effective.value === 0 ? { free: true } : {}),
+            multiplierSource: 'buddy:config',
+          }),
+      // ⚠️ **只在促销真的改变了价格时**才写 description。
+      //
+      // 两个都要排除的噪音情形：
+      //   1. 无促销 —— 倍率本身已经渲染成 `(×0.34)`，再写「倍率 x0.34」纯属噪音；
+      //   2. **促销后价格与促销前相同** —— 实测（2026-10-20）`hy3` / `deepseek-v4.1-flash`
+      //      / `step-5-preview` 的 `credits` 本来就是 `"x0.00"`（免费），而活动又给
+      //      一个 `factor: 0` 的免费，于是文案拼成 `x0.00→免费` —— 「免费→免费」，
+      //      信息量为零，还会让用户以为漏看了什么。
+      //
+      // 有**实质**促销时则必须写：界面只显示一个促销价，用户无从判断这是不是活动价、
+      // 也无从对账（原价丢了就核不出来）。
+      ...(discounted !== undefined && rateText !== undefined && discounted.value !== rate?.value
+        ? { description: `倍率 ${rateText}` }
+        : {}),
     }
   })
 }
 
-/** 一次请求要带的头（凭证 + 身份归因）。 */
-export function buddyHeaders(product: BuddyProduct, token: string, modelId: string): Record<string, string> {
-  return {
+/**
+ * 一次请求要带的头（凭证 + 身份归因 + 会话）。
+ *
+ * ## ⚠️ 三个会话头：国际版的**渠道校验**门槛（真实缺陷，2026-10-20）
+ *
+ * 用户报障原文：`{"code":11128,"msg":"request illegal"}` +
+ * 「This call failed channel verification, possibly because it was not sent from
+ * an offici[al channel]」。
+ *
+ * 上游把它伪装成「内容被拦截」，但**决定性 A/B 实验**（真实 workbuddy-intl 账号，
+ * 只差请求头）证明它是**渠道校验**：
+ *
+ * | 请求头 | 结果 |
+ * |---|---|
+ * | 只有下面那 10 个身份头 | ✗ HTTP 400 `code=11128` |
+ * | ＋`X-Conversation-ID` | ✗ HTTP 400 `code=11128` |
+ * | ＋**三个**会话头 | ✓ **HTTP 200** |
+ *
+ * 即**必须同时带齐三个**，缺任一个都不行。参考实现（`buddy-adapter.ts:1792-1796`）
+ * 也只对国际版加。
+ *
+ * ## ⚠️ `11128` 有**两个互不相干的子原因**，修好头只是解决了第一个
+ *
+ * 这一点很容易看漏，因为**修头之前两个原因的报错文案是同一句笼统话**
+ * （"Request blocked…channel verification"），**根本分不出来**；修好之后
+ * `msg` 才变成**具体**的，第二个子原因才暴露出来。实测（真实账号，headers 齐）：
+ *
+ * | 消息形态 | 结果 |
+ * |---|---|
+ * | ① 首条是 **user**（不带 system） | ✗ `11128` msg=**"first message is not system prompt"** |
+ * | ② 首条是 system（中性） | ✓ HTTP 200，正文正常 |
+ * | ③ system 里含内容指纹句 | ✗ `11128` msg=**"Illegal API invocation from an unapproved channel"** |
+ * | ④ 指纹句放在 **user** 里 | ✓ HTTP 200（印证参考实现：**只拦 system**） |
+ *
+ * 于是：
+ *   1. **缺三个会话头** → 本函数修（渠道校验）；
+ *   2. **首条不是 system**（仅国际版硬要求）→ 见 {@link BuddyAdapter.requestChatStream}
+ *      里的补 system 逻辑；
+ *   3. **内容指纹** → **我们不需要处理**：DSH 的提示词不含该句，实测 200。
+ *      参考实现确实有一层「内容指纹剥离」，但那是**另一回事**，别顺手搬进来
+ *      （会给上游加没人验证过的行为）。
+ *
+ * ⚠️ **顺序依赖很值得留**：同一个错误码在修掉第一层之前会**掩盖**第二层。
+ * 排查这类「一个码多个原因」的缺陷时，先把**结构性**的那层（头/参数）
+ * 修掉并重新测量，再去解释文案 —— 否则会拿着被掩盖的文案去猜内容。
+ *
+ * @param sessionId - 会话标识。同一次会话内**稳定**（换了它前缀缓存会失效，
+ *   但更重要的是保持「一次对话一个 id」的语义）。见 {@link BuddyAdapter} 的字段说明。
+ * @param messageId - 本条消息的 id（每次调用**新值**）。
+ * @param requestId - 本次请求的 id（每次调用**新值**）。
+ */
+export function buddyHeaders(
+  product: BuddyProduct,
+  token: string,
+  modelId: string,
+  session?: { sessionId: string; messageId: string; requestId: string },
+): Record<string, string> {
+  const headers: Record<string, string> = {
     authorization: `Bearer ${token}`,
     accept: 'text/event-stream',
     'content-type': 'application/json',
@@ -301,6 +480,13 @@ export function buddyHeaders(product: BuddyProduct, token: string, modelId: stri
     'x-ide-version': product.clientVersion,
     'user-agent': userAgentFor(product, modelId),
   }
+  // 三个会话头**只对需要它的产品加**（国内版加了无用，照参考实现不加以免扩大差异面）。
+  if (product.requiresConversationHeaders && session !== undefined) {
+    headers['x-conversation-id'] = session.sessionId
+    headers['x-conversation-message-id'] = session.messageId
+    headers['x-conversation-request-id'] = session.requestId
+  }
+  return headers
 }
 
 /** 从 `{code, data, message}` 信封里取 data。 */
@@ -319,40 +505,6 @@ function summarize(body: unknown): string {
     return text.length > 200 ? `${text.slice(0, 200)}…` : text
   } catch {
     return ''
-  }
-}
-
-/** `expires_in` / `expiresAt` / `expires_at` 都认；解析不出返回 undefined。 */
-function parseExpiresAt(data: Record<string, unknown>): number | undefined {
-  for (const key of ['expiresAt', 'expires_at']) {
-    const value = data[key]
-    if (typeof value === 'string' && value !== '') {
-      if (/^\d+$/.test(value)) {
-        const number = Number(value)
-        return number > 1_000_000_000_000 ? number : number * 1000
-      }
-      const parsed = Date.parse(value)
-      if (!Number.isNaN(parsed)) return parsed
-    }
-  }
-  for (const key of ['expiresIn', 'expires_in']) {
-    const value = data[key]
-    if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Date.now() + value * 1000
-  }
-  return undefined
-}
-
-/** 从 JWT 的 `exp` 读过期时刻（不验签，只用于展示与续期调度）。 */
-function jwtExpiryMs(token: string): number | undefined {
-  const parts = token.split('.')
-  if (parts.length < 2) return undefined
-  try {
-    const payload: unknown = JSON.parse(Buffer.from(parts[1] ?? '', 'base64url').toString('utf8'))
-    if (typeof payload !== 'object' || payload === null) return undefined
-    const exp = (payload as { exp?: unknown }).exp
-    return typeof exp === 'number' && Number.isFinite(exp) ? exp * 1000 : undefined
-  } catch {
-    return undefined
   }
 }
 
@@ -399,6 +551,144 @@ export class BuddyAdapter extends BaseAdapter {
       implemented: true,
     })
     this.product = product
+  }
+
+  /**
+   * 三个会话头用的会话标识（`X-Conversation-ID` / 前缀缓存 key）。
+   *
+   * ## 为什么按账号**确定性派生**，而不是随机 / 落盘
+   *
+   * 参考实现是「进程启动时 `crypto.randomUUID()` 一次，整个进程复用」。
+   * 我们不能照抄这个「一次」的粒度，因为参考实现一个进程只服务**一个**凭据，
+   * 而我们一个适配器实例服务**多个账号**：
+   *
+   *   - **随机 + 每次请求新值** —— 不行：这个 id 同时是前缀缓存的 key
+   *     （参考实现把它作为 `prompt_cache_key` 下发，实测同一段 8k 前缀：
+   *     不带 → `prompt_cache_hit_tokens=0`、`credit=0.34`；带 → `hit_tokens=7808`、
+   *     `credit=0.02`，**费用差约 17 倍**）。每次新值等于**彻底放弃缓存**。
+   *   - **随机 + 进程内稳定** —— 可行，但重启后变化；且多账号共用一个实例时
+   *     会把不同账号的会话混成同一个 key（前缀缓存是**按账号**隔离的，
+   *     共用 key 没有正确性问题，但让缓存命中统计失去意义）。
+   *   - **按账号派生（选它）** —— 同一账号每次重启得到同一个 id（`sha256(agentId:accountId)`
+   *     取前段），于是前缀缓存跨重启也能命中；不同账号天然不同。
+   *     仓库里已有同款先例：`src/adapters/qoder.ts` 的 `machineIdOf(accountId)`。
+   *
+   * 不需要落盘（它是**纯函数**，没有迁移/清理问题），也不需要存进凭据。
+   *
+   * ⚠️ 与 qoder 的 `machineIdOf` 一样**只取哈希前 32 位十六进制**：这个值会进
+   * 请求头，不需要也不应该带上任何可反推账号的信息。
+   */
+  private sessionIdOf(record: AccountRecord): string {
+    const hex = createHash('sha256').update(`buddy:${this.product.agentId}:${record.id}`).digest('hex')
+    return hex.slice(0, 32)
+  }
+
+  /** 思考档位在 `ctx.cache` 里的键（**按产品**隔离：两个产品的模型池不同）。 */
+  private reasoningCacheKey(): string {
+    return `buddy:reasoning:${this.product.agentId}`
+  }
+
+  /**
+   * 把 `/v3/config` 里每个模型的思考字段存进缓存，供请求侧查。
+   *
+   * 为什么需要缓存：请求侧（`requestChatStream`）只看得到 `payload.model`，
+   * **拉不到模型目录**（那是一次额外的上游请求，不能每个 chat 都打一遍）。
+   * 而「能不能发 `reasoning_effort`」必须知道该模型声明了什么 ——
+   * 发它没声明过的值上游会 **400**。
+   *
+   * ⚠️ 缓存**缺失**时的行为是「放行」而不是「拦下」，见 {@link effortsOf}。
+   */
+  private cacheReasoning(ctx: AdapterContext, body: unknown): void {
+    const data = (body as { data?: unknown } | null | undefined)?.data
+    const models = (data as { models?: unknown } | null | undefined)?.models
+    if (!Array.isArray(models)) return
+    const table: Record<string, { supported?: string[]; defaultEffort?: string; singleEffort?: string }> = {}
+    for (const item of models) {
+      if (typeof item !== 'object' || item === null) continue
+      const entry = item as Record<string, unknown>
+      const id = entry.id
+      if (typeof id !== 'string' || id === '') continue
+      const fields = parseReasoningFields(entry)
+      // 三条都缺就别存 —— 存一个空对象等于「确认该模型没有档位」，
+      // 而事实可能是「上游这条目录里没写」。区分见 effortsOf 的说明。
+      if (fields.supportedEfforts === undefined && fields.defaultEffort === undefined && fields.singleEffort === undefined) {
+        continue
+      }
+      table[id] = {
+        ...(fields.supportedEfforts === undefined ? {} : { supported: fields.supportedEfforts }),
+        ...(fields.defaultEffort === undefined ? {} : { defaultEffort: fields.defaultEffort }),
+        ...(fields.singleEffort === undefined ? {} : { singleEffort: fields.singleEffort }),
+      }
+    }
+    // TTL 与模型目录缓存同量级（5 分钟）：上游改档位不是高频事件，
+    // 但也不能永久缓存（新模型上线后要能自己好）。
+    ctx.cache.set(this.reasoningCacheKey(), table, 5 * 60_000)
+  }
+
+  /**
+   * 查某模型声明了什么档位（`undefined` = **不知道**）。
+   *
+   * ⚠️ **两种「没有」必须分开**（与 `decideReasoningEffort` 的 `supported` 同款口径）：
+   *   - 缓存里**根本没有这个模型**（目录没拉到 / 还没拉过 / 新模型）⇒ 返回 `undefined`
+   *     ⇒ 调用方**放行**用户请求的档位。拦下来等于把用户的显式选择静默丢掉，
+   *     而我们其实只是「不知道」。
+   *   - 缓存里有这个模型、但它**没有** `supported` 字段 ⇒ 返回 `[]`
+   *     ⇒ 调用方**不下发**请求的档位（上游对该字段会校验，发没声明过的值 = 400）。
+   */
+  private effortsOf(ctx: AdapterContext, modelId: string): { supported?: readonly string[]; defaultEffort?: string; singleEffort?: string } | undefined {
+    const table = ctx.cache.get<Record<string, { supported?: string[]; defaultEffort?: string; singleEffort?: string }>>(
+      this.reasoningCacheKey(),
+    )
+    if (table === undefined) return undefined
+    const entry = table[modelId]
+    if (entry === undefined) return undefined
+    return {
+      supported: entry.supported ?? [],
+      ...(entry.defaultEffort === undefined ? {} : { defaultEffort: entry.defaultEffort }),
+      ...(entry.singleEffort === undefined ? {} : { singleEffort: entry.singleEffort }),
+    }
+  }
+
+  /**
+   * 保证 `messages[0]` 是 `system`（**仅国际版**）。
+   *
+   * ## 为什么需要它（真实缺陷，`11128` 的第二个子原因）
+   *
+   * WorkBuddy 国际版网关**强制要求首条消息是 `role:'system'`**，否则：
+   * ```
+   * HTTP 400  {"code":11128,"msg":"first message is not system prompt"}
+   * ```
+   * 而 `displayMsg` 把它**伪装成安全策略拦截**（「请求被安全策略拦截，请稍后重试
+   * 或联系支持」）—— 与真实的限流/可用性**毫无关系**，极易误判。
+   *
+   * ## 为什么会在我们这里踩到
+   *
+   * `src/llm/adapter.ts` 的 `toOpenAiMessages()` **只在 `options.system` 非空时**
+   * 才 unshift 一条 system。DSH 有时不带 system（或 system 为空串），
+   * 于是 wire 上首条就是 `user` ⇒ **必踩这个 400**。
+   *
+   * 参考实现在**适配器内部**兜了同一层（`buddy-adapter.ts:1350-1352`）：
+   * ```ts
+   * if (this.product.id === 'workbuddy' && (messages.length === 0 || messages[0].role !== 'system')) {
+   *   messages.unshift({ role: 'system', content: 'You are a helpful assistant.' })
+   * }
+   * ```
+   *
+   * ⚠️ 三条与参考实现逐条对齐的口径：
+   *   1. **只对国际版**补（`requiresConversationHeaders` 的产品）。参考实现实测
+   *      `copilot.tencent.com`（国内版）无此要求 —— 无 system 也 200。
+   *   2. **只在首条不是 system 时**补；**已有 system 原样保留**（不覆盖、不追加第二条）。
+   *   3. 内容用最小可用句 `'You are a helpful assistant.'` —— 这句在参考实现的
+   *      e2e 与多个脚本里被反复验证可用（见 `account-probe.ts:123` 的 `PROBE_SYSTEM`）。
+   *
+   * ⚠️ **不要顺手把「内容指纹剥离」也搬进来**：参考实现里确实有那一层，
+   * 但实测 DSH 的提示词不含指纹句（200 正常），搬进来只会给上游加没人验证过的行为。
+   */
+  private withLeadingSystem(messages: ChatRequest['messages']): ChatRequest['messages'] {
+    if (!this.product.requiresConversationHeaders) return messages
+    const first = messages[0]
+    if (first !== undefined && first.role === 'system') return messages
+    return [{ role: 'system', content: BUDDY_MINIMAL_SYSTEM }, ...messages]
   }
 
   /** 端点：配置里填了 `apiBaseUrl` 就用它（接自有反代），否则用内置产品地址。 */
@@ -499,6 +789,10 @@ export class BuddyAdapter extends BaseAdapter {
       if (response.ok) {
         const body: unknown = await response.json()
         parsed = parseModelsFromConfig(body)
+        // 顺手把「每个模型声明了什么档位」缓存起来 —— 请求侧要用它决定发不发
+        // `reasoning_effort`（发模型没声明过的值会 400）。
+        // 见 `effortsOf()` 的说明：拿不到缓存时**放行**而不是拦下。
+        this.cacheReasoning(ctx, body)
       } else {
         ctx.log.debug(`/v3/config 返回 ${response.status}，回退内置模型表`)
       }
@@ -754,16 +1048,28 @@ export class BuddyAdapter extends BaseAdapter {
     }
   }
 
-  // ── 登录（external-link-v2 轮询式） ────────────────────────────────
+  // ── 登录（external-link-v2 轮询式，**四步**） ──────────────────────
   //
-  // 流程（参考实现 buddy-oauth.ts，MIT）：
+  // 完整流程（参考实现 buddy-oauth.ts 的 `runBuddyLoginFlow`，MIT）：
+  //
   //   ① POST /v2/plugin/auth/state?platform=<platform> → {state, authUrl}
-  //   ② 用户在浏览器打开 authUrl 完成登录
-  //   ③ GET  /v2/plugin/auth/token?state=<state> → token（未完成时 error code 11217）
+  //   ② decorateLoginUrl：国际版给 authUrl 追加 version + loginSessionId
+  //   ③ 用户在浏览器打开 authUrl 完成登录
+  //   ④ GET  /v2/plugin/auth/token?state=<state>     → token
+  //   ⑤ GET  /v2/plugin/login/account?state=<state>  → 账号信息（uid/企业/类型）
+  //   ⑥ buildCredentials：token + account 合成凭据
   //
-  // 宿主只在用户点「刷新登录状态」时问一次 ③，所以这里**不起定时器**。
+  // ⚠️ **我们原先只做了 ①③④，缺 ②⑤⑥** —— 那正是「授权完却没加进账号」的成因：
+  //    - 缺 ②：国际版用户点开的登录页缺会话参数；
+  //    - 缺 ⑤：账号信息（uid/企业）从来没被取过；
+  //    - 更致命的是 ④ 的**字段名读错**（见 `vendor/buddy/buddy-login.ts` 的文件头：
+  //      上游回 camelCase `accessToken`，我们读的是 snake_case `access_token`）
+  //      ⇒ 恒判「还没检测到登录」，永远 pending。
+  //
+  // 宿主的分工：`beginLogin` 只负责 ①②；③④⑤ 都在 `pollLogin` 里做（用户点一次
+  // 「刷新登录状态」就问一轮）。**不起定时器** —— 关掉页面后还在后台打上游是浪费。
 
-  /** ① 拿 authUrl 与 state。 */
+  /** ① 拿 authUrl 与 state，② 按产品装饰 URL。 */
   async beginLogin(ctx: AdapterContext): Promise<LoginStartResult> {
     const url = `${this.baseUrl(ctx)}/v2/plugin/auth/state?platform=${encodeURIComponent(this.product.platform)}`
     const send = ctx.fetch ?? fetch
@@ -786,23 +1092,81 @@ export class BuddyAdapter extends BaseAdapter {
     }
     const data = unwrapData(body)
     const state = typeof data?.state === 'string' ? data.state : ''
-    const authUrl = typeof data?.authUrl === 'string' ? data.authUrl : ''
-    if (state === '' || authUrl === '') throw new Error('auth/state 响应缺少 state / authUrl')
+    const rawAuthUrl = typeof data?.authUrl === 'string' ? data.authUrl : ''
+    if (state === '' || rawAuthUrl === '') throw new Error('auth/state 响应缺少 state / authUrl')
+
+    // ② 装饰登录 URL。⚠️ **返回装饰后的 URL**（用户点的是它，不是原始的），
+    //    但 `state` 原样保留 —— 后续两步用的是 state，与 URL 装饰无关。
+    const authUrl = decorateLoginUrl(rawAuthUrl, this.product)
+    if (authUrl !== rawAuthUrl) {
+      // 只记「追加了参数」这件事，**不要把完整 authUrl 写进日志**：它带着 state，
+      // 等同于一次性的登录凭据。
+      ctx.log.info(`[${this.name}] 登录链接已追加会话参数（version / loginSessionId）`)
+    }
     ctx.log.info(`[${this.name}] 已生成登录链接，请在浏览器打开`)
     // 5 分钟：与参考实现的登录超时一致
     return { authUrl, expiresInSec: 300, state }
   }
 
   /**
-   * ③ 问一次 token。
+   * ④ 问一次 token，⑤ 拿到就问一次 account，⑥ 合成凭据。
    *
-   * `11217` = token 尚未就绪（用户还没登录完），属正常中间态。
+   * ## 为什么这一步要做三件事而不是一件
+   *
+   * 上游把「登录完成」拆成两个端点，且**账号信息（uid/企业）只在第二个端点里**。
+   * 只调第一个就返回 ready 的话，账号能建起来但**没有 uid** —— 而 uid 是后续
+   * 请求要带 `X-User-Id` 的来源。所以必须两步都走完才回 ready。
+   *
+   * ## 判据（重要，别退回旧写法）
+   *
+   * 上游用 **HTTP 200 + `body.code`** 报「还没好」（实测：
+   * `{"code":11217,"msg":"11217:login ing..."}`）。所以**不能只看 HTTP 状态**，
+   * 也不能靠「`data` 取不到 ⇒ 就当 pending」这种副作用 —— 那会在
+   * 「响应形状变了」「换成非 200」时静默错判。这里**显式**判 `code`：
+   *   - `11217` ⇒ pending（用户还没授权，正常中间态）
+   *   - 其他非 0 ⇒ **failed**（别静默 pending 到超时，用户会以为是自己的问题）
    */
   async pollLogin(state: unknown, ctx: AdapterContext): Promise<LoginPollResult> {
-    // `state` 可能是字符串（beginLogin 里直接返回上游的 state）也可能是对象
-    const session = state as { state?: string } | string | undefined
-    const key = typeof session === 'string' ? session : typeof session?.state === 'string' ? session.state : ''
+    const key = this.loginStateOf(state)
     if (key === '') return { status: 'failed', message: '登录会话状态丢失，请重新发起' }
+
+    // ④ token
+    const tokenStep = await this.fetchLoginToken(key, ctx)
+    if (tokenStep.status !== 'ok') return tokenStep.result
+
+    // ⑤ account（拿不到就**不返回 ready** —— 见下面 12151 的说明）
+    const accountStep = await this.fetchLoginAccount(key, tokenStep.token.accessToken, ctx)
+    if (accountStep.status !== 'ok') return accountStep.result
+
+    // ⑥ 合成凭据。走到这里 accessToken 必然非空（上面已挡过），
+    //    所以**绝不会**加进一个空 token 的账号。
+    const credentials = buildCredentials(tokenStep.token, accountStep.account)
+    const label = accountLabelOf(credentials)
+    return {
+      status: 'ready',
+      message: '登录成功',
+      credentials,
+      ...(label === '' ? {} : { label }),
+    }
+  }
+
+  /** 从宿主存下来的 `state` 里取出这一轮的 session key。 */
+  private loginStateOf(state: unknown): string {
+    if (typeof state === 'string') return state
+    const session = state as { state?: unknown } | undefined
+    return typeof session?.state === 'string' ? session.state : ''
+  }
+
+  /**
+   * ④ `GET /v2/plugin/auth/token?state=`。
+   *
+   * 未就绪（`code: 11217`）与网络抖动都算 `pending` —— 用户点一次问一次，
+   * 不该因为一次网络失败就把整个登录会话判死。但**业务码非 0 且非 11217 是 failed**。
+   */
+  private async fetchLoginToken(
+    key: string,
+    ctx: AdapterContext,
+  ): Promise<{ status: 'ok'; token: ReturnType<typeof parseTokenPayload> } | { status: 'stop'; result: LoginPollResult }> {
     const url = `${this.baseUrl(ctx)}/v2/plugin/auth/token?state=${encodeURIComponent(key)}`
     const send = ctx.fetch ?? fetch
     let response: Response
@@ -812,30 +1176,119 @@ export class BuddyAdapter extends BaseAdapter {
         headers: { 'x-no-authorization': 'true', 'user-agent': this.product.userAgent },
       })
     } catch (error) {
-      return { status: 'pending', message: `网络错误，稍后再试：${error instanceof Error ? error.message : String(error)}` }
+      return {
+        status: 'stop',
+        result: { status: 'pending', message: `网络错误，稍后再试：${error instanceof Error ? error.message : String(error)}` },
+      }
     }
     const body: unknown = await response.json().catch(() => null)
-    if (response.status !== 200) {
-      const code = Number((body as { code?: unknown } | null)?.code)
-      // 11217：token 尚未就绪，继续等用户
-      if (code === 11217) return { status: 'pending', message: '还没检测到登录，请先在浏览器完成登录' }
-      return { status: 'failed', message: `auth/token HTTP ${response.status}：${summarize(body)}` }
+
+    // ⚠️ **先判业务码，不论 HTTP 状态**：上游用 200 + code 报「还没好」（实测）。
+    const code = responseCode(body)
+    if (code === CODE_TOKEN_NOT_READY) {
+      return { status: 'stop', result: { status: 'pending', message: '还没检测到登录，请先在浏览器完成登录' } }
     }
-    const data = unwrapData(body)
-    if (data === null) return { status: 'pending', message: '还没检测到登录，请先在浏览器完成登录' }
-    const accessToken = typeof data.access_token === 'string' ? data.access_token : ''
-    if (accessToken === '') return { status: 'pending', message: '还没检测到登录，请先在浏览器完成登录' }
-    const refreshToken = typeof data.refresh_token === 'string' ? data.refresh_token : ''
-    const expiresAt = parseExpiresAt(data) ?? jwtExpiryMs(accessToken)
-    return {
-      status: 'ready',
-      message: '登录成功',
-      credentials: {
-        token: accessToken,
-        ...(refreshToken === '' ? {} : { refreshToken }),
-        ...(expiresAt === undefined ? {} : { expiresAt }),
-      },
+    if (code !== 0) {
+      // 其他非 0 业务码 = 真失败。静默 pending 会让用户对着「一直在等」干等到超时。
+      return {
+        status: 'stop',
+        result: {
+          status: 'failed',
+          message: `auth/token 失败（HTTP ${response.status}，code ${code}）：${responseMessage(body) || summarize(body)}`,
+        },
+      }
     }
+    // 非 2xx 且没有业务码：传输层问题，报失败并带上状态码（别伪装成 pending）。
+    if (!response.ok) {
+      return {
+        status: 'stop',
+        result: { status: 'failed', message: `auth/token HTTP ${response.status}：${summarize(body)}` },
+      }
+    }
+    // 200 且 code 为 0（或压根没有 code 字段）：看 data。
+    const data = responseData(body)
+    if (data === null) {
+      return { status: 'stop', result: { status: 'pending', message: '还没检测到登录，请先在浏览器完成登录' } }
+    }
+    const token = parseTokenPayload(data, ctx.now())
+    if (token.accessToken === '') {
+      // ⚠️ 形状不符（既没有 camelCase 也没有 snake_case 的 token 字段）——
+      // 报 failed 而不是 pending：一直 pending 会让人以为是自己没登录成功，
+      // 真因是响应结构变了，必须让这句话浮出来。
+      return {
+        status: 'stop',
+        result: {
+          status: 'failed',
+          message: `auth/token 已返回数据但没有 access token 字段（响应结构可能变了）：${summarize(data)}`,
+        },
+      }
+    }
+    return { status: 'ok', token }
+  }
+
+  /**
+   * ⑤ `GET /v2/plugin/login/account?state=`。
+   *
+   * 头族照参考实现 `getAccount`（`buddy-oauth.ts:246-265`）：
+   * `X-Domain` 取 **token 下发的 domain 优先**（该值是服务端**本次刚下发**的权威值，
+   * 不是跨产品迁移后会过期的历史快照 —— 与 `creditsHeaders` 那里「以产品为准」的
+   * 方向**故意不同**，差异只在兜底取谁），加 Bearer token 与两个 `X-No-*` 头。
+   *
+   * ⚠️ **拿不到账号就不返回 ready**：账号信息（uid/企业）只有这里有，
+   * 缺了它建出来的账号没有 uid，后续请求带不上 `X-User-Id`。
+   * `12151`（账户信息尚未完成）是**正常中间态** ⇒ pending。
+   */
+  private async fetchLoginAccount(
+    key: string,
+    accessToken: string,
+    ctx: AdapterContext,
+  ): Promise<{ status: 'ok'; account: ReturnType<typeof parseAccountPayload> } | { status: 'stop'; result: LoginPollResult }> {
+    const url = `${this.baseUrl(ctx)}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(key)}`
+    const send = ctx.fetch ?? fetch
+    let response: Response
+    try {
+      response = await send(url, {
+        method: 'GET',
+        headers: {
+          'x-domain': this.product.apiDomain,
+          authorization: `Bearer ${accessToken}`,
+          'x-no-user-id': 'true',
+          'x-no-enterprise-id': 'true',
+          'user-agent': this.product.userAgent,
+        },
+      })
+    } catch (error) {
+      // token 已经拿到了，别因为一次网络抖动让用户重来一遍登录。
+      return {
+        status: 'stop',
+        result: { status: 'pending', message: `已登录，但读取账号信息时网络出错，请再点一次「刷新登录状态」：${error instanceof Error ? error.message : String(error)}` },
+      }
+    }
+    const body: unknown = await response.json().catch(() => null)
+    const code = responseCode(body)
+    if (code === CODE_ACCOUNT_NOT_READY) {
+      return { status: 'stop', result: { status: 'pending', message: '已登录，正在读取账号信息，请再点一次「刷新登录状态」' } }
+    }
+    if (code !== 0) {
+      return {
+        status: 'stop',
+        result: {
+          status: 'failed',
+          message: `读取账号信息失败（HTTP ${response.status}，code ${code}）：${responseMessage(body) || summarize(body)}`,
+        },
+      }
+    }
+    if (!response.ok) {
+      return {
+        status: 'stop',
+        result: { status: 'failed', message: `读取账号信息失败（HTTP ${response.status}）：${summarize(body)}` },
+      }
+    }
+    const data = responseData(body)
+    if (data === null) {
+      return { status: 'stop', result: { status: 'pending', message: '已登录，正在读取账号信息，请再点一次「刷新登录状态」' } }
+    }
+    return { status: 'ok', account: parseAccountPayload(data) }
   }
 
   /** 校验：能拿到 `/v3/config` 200 就算凭证可用。 */
@@ -874,12 +1327,40 @@ export class BuddyAdapter extends BaseAdapter {
       return
     }
     const url = `${this.baseUrl(ctx)}/v2/chat/completions`
+    // 思考档位 / DeepSeek 的 thinking 开关。
+    //
+    // ⚠️ 这一段是**修「模型不思考」的关键**（参考实现三站点实测，2026-09）：
+    //   - 裸请求（无 `reasoning_effort`）→ `reasoning_content` **恒为 0**；
+    //   - 仅 `thinking:{type:'enabled'}` → **仍为 0**（该字段单独无效）；
+    //   - 仅 `reasoning_effort` → 返回思考；两者都带 → 返回思考。
+    //   即 **`reasoning_effort` 才是开关**，`thinking` 保留是为对齐官方客户端出站形态。
+    //
+    // 而 `reasoning_effort` 又**只发模型声明过的值**（否则服务端 400），
+    // 全部判定收在 `decideReasoningEffort` 里（纯函数，可单测）。
+    const declaredReasoning = this.effortsOf(ctx, payload.model)
+    const reasoning = decideReasoningEffort({
+      requested: typeof payload.reasoning_effort === 'string' ? payload.reasoning_effort : undefined,
+      ...(declaredReasoning === undefined ? {} : { supported: declaredReasoning.supported }),
+      ...(declaredReasoning?.defaultEffort === undefined ? {} : { defaultEffort: declaredReasoning.defaultEffort }),
+      ...(declaredReasoning?.singleEffort === undefined ? {} : { singleEffort: declaredReasoning.singleEffort }),
+      isDeepSeek: isDeepSeekModel(payload.model),
+    })
+    ctx.log.debug(`[${this.name}] 思考档位：${reasoning.reason}`, `model=${payload.model}`)
+
     const body: Record<string, unknown> = {
       ...payload,
       model: payload.model,
+      messages: this.withLeadingSystem(payload.messages),
       stream: true,
       stream_options: { include_usage: true },
+      // `reasoning_effort` 覆盖 payload 里那个（核心层可能带了不可移植的原始值）。
+      ...(reasoning.effort === undefined ? {} : { reasoning_effort: reasoning.effort }),
+      ...(reasoning.thinking ? { thinking: { type: 'enabled' } } : {}),
     }
+    // ⚠️ 核心层可能塞了一个**模型不支持**的 `reasoning_effort`（例如它拿不到我们的
+    // 档位声明时原样放行）。上面已经重新算过，这里必须把旧值清掉 ——
+    // 否则 spread 之后又会被 `undefined` 覆盖不成，留下一个会 400 的值。
+    if (reasoning.effort === undefined) delete body.reasoning_effort
     for (const key of Object.keys(body)) if (body[key] === undefined) delete body[key]
 
     let response: Response
@@ -887,7 +1368,13 @@ export class BuddyAdapter extends BaseAdapter {
       const send = ctx.fetch ?? fetch
       response = await send(url, {
         method: 'POST',
-        headers: buddyHeaders(this.product, token, payload.model),
+        // 三个会话头：`sessionId` 按账号稳定，`messageId` / `requestId` **每次新值**
+        // （参考实现同款：session 复用、后两个 `crypto.randomUUID()`）。
+        headers: buddyHeaders(this.product, token, payload.model, {
+          sessionId: this.sessionIdOf(record),
+          messageId: randomUUID(),
+          requestId: randomUUID(),
+        }),
         body: JSON.stringify(body),
         signal,
       })

@@ -101,6 +101,16 @@ interface OpenAiChunk {
     cache_creation_input_tokens?: number
   }
   error?: { message?: string; type?: string; code?: string }
+  /**
+   * 网关形态的错误帧字段（见 `translateChunk` 里那段「不认它就会静默成功」）。
+   *
+   * 这些字段**不在** OpenAI 协议里，是 Qoder 网关/信封剥离线自己用的形状。
+   * 声明出来是为了让判据读的是**已声明的字段**，而不是到处 `as` 强转。
+   */
+  message?: string
+  statusCodeValue?: number
+  stackTrace?: unknown
+  type?: string
 }
 
 /** 思维链字段名在不同上游不一样，这里按优先级取第一个非空的。 */
@@ -170,6 +180,23 @@ export function translateChunk(payload: string): StreamEvent[] {
     return []
   }
   const events: StreamEvent[] = []
+  /**
+   * ⚠️ **`JSON.parse('null')` 得到的是 `null`，不是对象** ——
+   * 而下面每一处都读 `parsed.xxx`，于是 `translateChunk('null')` 会抛
+   * `Cannot read properties of null (reading 'error')`。
+   *
+   * 这条路径是**真的会走到**的：Qoder 信封里的 `body: null` 心跳帧经
+   * `innerTextOf` 的 `JSON.stringify(null)` 就是字符串 `'null'`。
+   * 目前 `unwrapQoderEnvelopeStream` 用 `classifyInner` 把心跳**提前丢掉**了，
+   * 所以没炸；但那是**别人的**保护 —— `translateChunk` 是导出给所有适配器
+   * 用的通用函数，任何人直接喂它一帧 `null`（或将来某个上游直接下发
+   * `data: null`）就会抛，而这里的异常会一路冒到流消费处、
+   * 把「跳过一帧」升级成「整轮对话失败」。
+   * 通用解析器不该依赖调用方替它挡住非对象 JSON。
+   *
+   * 非对象的一律当「合法但空」处理（与 `{}` / `[]` / 裸标量一致）。
+   */
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return []
   if (parsed.error !== undefined && parsed.error !== null) {
     const failure: FailureInfo = {
       kind: 'server',
@@ -178,6 +205,56 @@ export function translateChunk(payload: string): StreamEvent[] {
     }
     events.push({ type: 'error', failure })
     return events
+  }
+  /**
+   * ⚠️ **网关形态 / 信封剥离后的错误帧**：既没有 `error`、也没有 `choices`，
+   * 只带 `message` + （`statusCodeValue` 或 `stackTrace`），
+   * 或信封剥离后统一的 `type: 'model_error'`。
+   *
+   * ## 不认它就会「静默成功」（真实缺陷，用户报障 2026-10-20）
+   *
+   * 用户报：**Qoder CN 的模型发消息后没有回复，直接显示「已完成」**；
+   * 同一个账号的 Qoder 平台正常。抓原始帧看到上游在 **HTTP 200** 的流里回：
+   *
+   * ```
+   * {"code":"400","message":"[FAIL]node:oa_qwen-plus-main msg:Execution failed: null",
+   *  "statusCodeValue":400,"statusCode":"BAD_REQUEST"}
+   * ```
+   *
+   * `unwrapQoderEnvelopeStream` 把它保真转成 `{code, message, type:'model_error'}`
+   * —— 而这里**一个条件都不命中**（没有 `error`、没有 `choices`），
+   * 整帧被当成「合法但空的 chunk」丢掉。流随后照常 `finish(stop)`，
+   * 于是 DSH 收到的是「成功但零正文」⇒ 界面上就是「已完成，没有回复」。
+   *
+   * 危害比「报错」大得多：报错用户至少知道要重试；**静默成功会被当成模型真没话说**。
+   *
+   * 参考实现（`openai-compat.ts`）对同一形态有显式分支，注释里写着
+   * 「若只判 `statusCodeValue >= 400`，整帧会被静默丢弃……连报错都没有」。
+   * 我们把那段移植过来时漏了这条判据。
+   *
+   * 判据必须同时覆盖两种来源：
+   *   - 信封剥离后的 `type === 'model_error'`（`statusCodeValue` 已被信封吃掉）；
+   *   - 直连网关时的 `statusCodeValue >= 400` / 带 `stackTrace`。
+   */
+  if (parsed.choices === undefined && typeof parsed.message === 'string') {
+    const gateway = parsed
+    const status = typeof gateway.statusCodeValue === 'number' ? gateway.statusCodeValue : undefined
+    const looksLikeError =
+      gateway.type === 'model_error'
+      || (status !== undefined && status >= 400)
+      || gateway.stackTrace !== undefined
+    if (looksLikeError) {
+      events.push({
+        type: 'error',
+        failure: {
+          kind: 'server',
+          message: gateway.message,
+          ...(status === undefined ? {} : { status }),
+          at: Date.now(),
+        },
+      })
+      return events
+    }
   }
   const choice = parsed.choices?.[0]
   if (choice !== undefined) {

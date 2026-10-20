@@ -773,11 +773,28 @@ export class GatewayRuntime {
     }
   }
 
-  /** 刷新（某些/全部）账号的额度。 */
-  async refreshQuotas(agentId?: string): Promise<Array<Record<string, unknown>>> {
-    const targets = (agentId === undefined ? this.accounts.all() : this.accounts.byAgent(agentId)).filter(
-      (account) => account.enabled,
-    )
+  /**
+   * 刷新（某些/全部）账号的额度。
+   *
+   * 三条筛选语义，`accountId` **优先**：
+   *   - `accountId` 给了 → 只刷这一个，且**刻意不看 `enabled`**：用户在界面上点名要刷它，
+   *     停用账号也照刷（额度快照是事实，与「能不能参与对话路由」是两件事）；
+   *     账号不存在 → 返回**空数组**，不抛错。
+   *   - `agentId` 给了 → 该平台全部**启用**账号。
+   *   - 都不给 → 全部平台的**启用**账号。
+   *
+   * ⚠️ 返回项的字段是**冻结契约**（客户端半边正按它渲染），只许加、不许改名或改形状：
+   * `{ accountId, agentId, label, unit, remaining|null, total|null, used|null, unlimited, error|null, fetchedAt }`
+   */
+  async refreshQuotas(
+    options: { agentId?: string; accountId?: string } = {},
+  ): Promise<Array<Record<string, unknown>>> {
+    const targets =
+      options.accountId !== undefined
+        ? [this.accounts.get(options.accountId)].filter((item): item is AccountRecord => item !== undefined)
+        : options.agentId !== undefined
+          ? this.accounts.byAgent(options.agentId).filter((account) => account.enabled)
+          : this.accounts.all().filter((account) => account.enabled)
     const out: Array<Record<string, unknown>> = []
     for (const account of targets) {
       const snapshot = await this.fetchQuota(account)

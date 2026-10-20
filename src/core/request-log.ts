@@ -30,8 +30,18 @@ export interface RequestLogEntry {
   agentId: string
   /** 平台展示名。 */
   agentName: string
-  /** 模型 id。 */
+  /** 模型 id（**上游的目录 key**，如 `qfmodel`）。 */
   model: string
+  /**
+   * 模型的**展示名**（如 `Qwen3.8-Flash`）—— 与 DSH 选择器里显示的一致。
+   *
+   * ⚠️ 为什么必须单独存一个：目录 key（`qfmodel`）和选择器里的名字
+   * （`Qwen3.8-Flash`）**完全是两套词汇**，用户报障过「日志里的模型名
+   * 全部都是 qfmodel，并不是真实选中的模型名称」—— 其实记的是**对的**，
+   * 只是那不是他在界面上看到的那个名字，两者对不上就等于「看不懂」。
+   * 取不到时留空，界面退回显示 id（绝不编一个名字出来）。
+   */
+  modelName?: string
   /** 用的哪个账号；免账号通道写 `null`。 */
   accountId: string | null
   /** 是否成功。 */
