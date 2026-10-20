@@ -57,7 +57,7 @@ dsh plugin --profile desktop add .\dsh-multi-agent-gateway-0.1.0.tgz
 
 ### 通过界面（推荐）
 
-**设置 → 插件 → 免费模型聚合器**。可以：
+**设置 → 插件 → 多 Agent 网关**。可以：
 
 - 总开关、路由策略；
 - 每个 Agent：启用、模型上报、模型名是否带 Agent 前缀；

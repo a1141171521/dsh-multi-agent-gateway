@@ -17,7 +17,7 @@ export function unsupportedReason(agentName: string, capability: string): string
 
 /** 凭证缺失。 */
 export function missingCredentialReason(agentName: string, ref: string): string {
-  return `「${agentName}」账号缺少凭证：${ref} 为空。请到「设置 → 插件 → 免费模型聚合器」里补上`
+  return `「${agentName}」账号缺少凭证：${ref} 为空。请到「设置 → 插件 → 多 Agent 网关」里补上`
 }
 
 /** 上游明确拒绝（权限不足）。 */
