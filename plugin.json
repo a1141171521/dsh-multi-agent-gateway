@@ -1,10 +1,10 @@
 {
   "id": "dsh-multi-agent-gateway",
-  "name": "免费模型聚合器",
+  "name": "多 Agent 通用 API 反代网关",
   "version": "0.1.0",
   "main": "./lib/index.js",
   "type": "provider",
-  "description": "把其他平台的免费模型接进 DSH：统一账号管理 / 自动签到 / 额度拉取 / 活动任务 / 多账号智能路由；模型按平台分组进原生选择器并标注积分倍率。",
+  "description": "统一多 Agent 账号管理、自动签到、额度拉取、活动任务与多账号智能路由；对 DSH 模型选择器按 Agent 分组上报模型并标注积分倍率。",
   "engines": {
     "dsh": ">=0.1.5-rc.1",
     "node": ">=20"
