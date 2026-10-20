@@ -1,6 +1,9 @@
-# dsh-multi-agent-gateway
+# dsh-free-token
 
-**DSH 的多 Agent 通用 API 反代网关 Provider 插件。**
+**把其他平台的免费模型接进 DeepSeek Harness —— 多账号 Provider 插件。**
+
+初衷很简单：**白嫖其他平台的免费模型**。注册了一堆平台、又懒得挨个开客户端，
+就让它们在 DSH 里统一出现：当一个 provider，按平台分组进原生模型选择器。
 
 一个插件管起所有「AI Agent 平台」的账号：统一账号管理、每日签到、额度/积分拉取、
 活动任务自动执行、多账号智能路由；同时把各平台的模型**按 Agent 分组**上报到 DSH
@@ -110,12 +113,15 @@ within OpenCode"*）是**营销话术**，它实际校验的是**请求形状**�
 ## 快速开始
 
 ```powershell
-# 1) 装进当前 profile（会自动应用 bundle patch）
+# 1) 从 GitHub 装（推荐，会自动应用 bundle patch）
+dsh plugin --profile desktop add github:a1141171521/dsh-free-token
+
+#    或装本地源码目录（开发用；目录名与包名保持不变）
 dsh plugin --profile desktop add D:\AI\DeepseekPlugin\dsh-multi-agent-gateway
 
 # 2) 重启 DSH 桌面端（客户端 bundle 要重新加载）
 
-# 3) 打开 设置 → 插件 → 多 Agent 网关，填账号
+# 3) 打开 设置 → 插件 → 免费模型聚合器，填账号
 ```
 
 详细步骤见 [`docs/INSTALL.md`](docs/INSTALL.md)。

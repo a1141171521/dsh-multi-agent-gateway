@@ -23,7 +23,7 @@ dsh plugin --profile desktop add D:\AI\DeepseekPlugin\dsh-multi-agent-gateway
 ### 方式二：从 git 仓库装
 
 ```powershell
-dsh plugin --profile desktop add github:<你的用户名>/dsh-multi-agent-gateway
+dsh plugin --profile desktop add github:a1141171521/dsh-free-token
 ```
 
 ### 方式三：从 tarball 装

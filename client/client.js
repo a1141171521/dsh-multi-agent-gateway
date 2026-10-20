@@ -420,9 +420,9 @@ window.__ModuleLoader__.load({
     // ───────────────────────────── 字典 ─────────────────────────────
     // ⚠️ 模板**必须是字符串**（官方 locale 用 `template.replace`，写成函数会在渲染期抛 TypeError）。
     const zh = {
-      nav: '多 Agent 网关',
-      title: '多 Agent 通用 API 反代网关',
-      intro: '统一管理各 Agent 的账号、自动签到、额度拉取、活动任务与多账号路由；模型按 Agent 分组上报到对话框的模型选择器。',
+      nav: '免费模型聚合器',
+      title: '免费模型聚合器',
+      intro: '把其他平台的免费模型接进 DSH：统一管理各平台账号、自动签到、额度拉取、活动任务与多账号路由；模型按平台分组进对话框的模型选择器。',
       refresh: '刷新',
       tick: '立即执行一轮定时任务',
       saving: '保存中…',
@@ -521,10 +521,10 @@ window.__ModuleLoader__.load({
       loginHint: '授权页会显示「opencode-cli」申请访问你的 OpenCode 账号 —— 那是官方 CLI 用的同一个客户端。',
     }
     const en = {
-      nav: 'Multi-Agent Gateway',
-      title: 'Multi-Agent API Gateway',
+      nav: 'Free Token',
+      title: 'Free Token — Free Models Hub',
       intro:
-        'One place for every Agent account, daily check-in, quota polling, activity tasks and multi-account routing. Models are reported to the composer picker grouped per Agent.',
+        'Brings free models from other platforms into DSH: one place for platform accounts, daily check-in, quota polling, activity tasks and multi-account routing. Models are reported to the composer picker grouped per platform.',
       refresh: 'Refresh',
       tick: 'Run one scheduler pass now',
       saving: 'Saving…',
@@ -1961,7 +1961,7 @@ window.__ModuleLoader__.load({
       const enabled = payload.enabled !== false
       const update = updateInfo(state)
       return `<div class="mag-head">`
-        + `<span class="mag-brand"><span class="mag-dot" data-tone="${enabled ? 'ok' : 'idle'}"></span>多 Agent 网关</span>`
+        + `<span class="mag-brand"><span class="mag-dot" data-tone="${enabled ? 'ok' : 'idle'}"></span>免费模型聚合器</span>`
         + `<nav class="mag-tabs" role="tablist">${tabs}</nav>`
         + `<span class="mag-spacer"></span>`
         + (update.available
@@ -2530,7 +2530,7 @@ window.__ModuleLoader__.load({
       return `<div class="mag-card" id="mag-sidebar">`
         + `<h3>左侧导航栏</h3>`
         + `<div class="mag-form-row"><div class="mag-lab">在左侧导航栏显示入口`
-        + `<div class="mag-hint">打开后左侧多一行「多 Agent 网关」，点它直接进这一页，`
+        + `<div class="mag-hint">打开后左侧多一行「免费模型聚合器」，点它直接进这一页，`
         + `不用再去「设置 → 插件」里找。</div></div>`
         + `<div class="mag-ctl">${switchHTML(attrs, shown)}</div></div>`
         + `<div class="mag-hint">${badge(shown ? '已加入左侧导航栏' : '未加入左侧导航栏', shown ? 'ok' : 'idle')}`
@@ -2991,7 +2991,7 @@ window.__ModuleLoader__.load({
       if (!view.supported || view.chosen || view.shown) return ''
       return `<div class="mag-banner" id="mag-sidebar-banner">`
         + `<span class="mag-dot" data-tone="warn"></span><b>要不要把它放到左侧导航栏？</b>`
-        + `<span class="mag-hint">加了之后，左侧导航栏会多一行「多 Agent 网关」，点一下直接打开这一页。</span>`
+        + `<span class="mag-hint">加了之后，左侧导航栏会多一行「免费模型聚合器」，点一下直接打开这一页。</span>`
         + `<span class="mag-spacer"></span>`
         + `<button class="mag-btn mag-btn-sm mag-btn-primary" data-act="sidebar-on">添加到侧栏</button>`
         + `<button class="mag-btn mag-btn-sm" data-act="sidebar-off">不用</button>`
