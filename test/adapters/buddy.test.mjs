@@ -1405,16 +1405,101 @@ test('sessionId 按账号稳定：同一账号两次请求相同，不同账号�
   assert.notEqual(calls[0].headers['x-conversation-id'], calls[2].headers['x-conversation-id'], '不同账号必须不同')
 })
 
-test('messageId / requestId 每次请求都是新值（session 复用、后两个不复用）', async () => {
+test('messageId 每次请求新值、root request id 按会话稳定（2026-10-23 抓包口径）', async () => {
+  // 抓包事实：`x-request-id` 与 `x-conversation-message-id` 同一条 32 位十六进制，
+  // **每次调用新值**；而 `x-conversation-request-id` = `x-root-request-id` 是**会话级**
+  // 的 root id（同一次对话里稳定，且同时充当链路 trace-id）。
+  // 早期实现把 conversation-request-id 当成「每次新值」，与客户端形态不符。
   const { ctx, calls } = chatCtx()
   const rec = account()
   await drainChat(INTL, ctx, [{ role: 'user', content: 'a' }], rec)
   await drainChat(INTL, ctx, [{ role: 'user', content: 'b' }], rec)
 
+  // message id：每次新值，32 位十六进制（无连字符）
   assert.notEqual(calls[0].headers['x-conversation-message-id'], calls[1].headers['x-conversation-message-id'])
-  assert.notEqual(calls[0].headers['x-conversation-request-id'], calls[1].headers['x-conversation-request-id'])
-  // UUID 形态（参考实现用 crypto.randomUUID()）
-  assert.match(calls[0].headers['x-conversation-message-id'], /^[0-9a-f-]{36}$/i)
+  assert.match(calls[0].headers['x-conversation-message-id'], /^[0-9a-f]{32}$/i)
+  // x-request-id 与 message-id 是同一条值
+  assert.equal(calls[0].headers['x-request-id'], calls[0].headers['x-conversation-message-id'])
+  // root：会话内稳定，且 conversation-request-id 与 root-request-id 同值
+  assert.equal(calls[0].headers['x-conversation-request-id'], calls[1].headers['x-conversation-request-id'], 'root 会话内稳定')
+  assert.equal(calls[0].headers['x-root-request-id'], calls[0].headers['x-conversation-request-id'])
+  assert.match(calls[0].headers['x-root-request-id'], /^[0-9a-f]{32}$/i)
+  // 会话 id 是 UUID 形态（客户端真实形态），不是裸 32 位十六进制
+  assert.match(calls[0].headers['x-conversation-id'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+})
+
+test('★ 对话请求头按内嵌 CLI 的真实形态发（2026-10-23 抓包，35 个头）', async () => {
+  // 依据：docs/WORKBUDDY-INTL-REQUEST.md + docs/workbuddy-intl-capture/sample-headers.json
+  const { ctx, calls } = chatCtx()
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }], account({ token: 'tok-1', user_id: 'u_1' }))
+
+  const h = calls[0].headers
+  // 鉴权：Bearer + x-api-key 同值双发
+  assert.equal(h.authorization, 'Bearer tok-1')
+  // ⚠️ 回归护栏：官方 JWT **不能**进 x-api-key。
+  // 2026-10-23 真账号 A/B：只带 authorization → 200；再加 x-api-key: <JWT> →
+  // 401 {"message":"not_found"}。抓包里那个头是自定义模型的 sk-… key。
+  assert.equal(h['x-api-key'], undefined, 'JWT 凭据绝不能塞进 x-api-key')
+  // 客户端形态头
+  assert.equal(h.accept, 'application/json', '抓包里是 application/json，流式由 body.stream 决定')
+  assert.equal(h['x-requested-with'], 'XMLHttpRequest')
+  assert.equal(h['x-codebuddy-request'], '1')
+  assert.equal(h['x-agent-type'], 'main')
+  assert.equal(h['x-agent-intent'], 'craft')
+  assert.equal(h['x-agent-purpose'], 'conversation')
+  assert.equal(h['x-ide-type'], 'CLI')
+  assert.equal(h['x-ide-name'], 'CLI')
+  assert.equal(h['x-ide-version'], '2.137.1', 'CLI 版本，不是桌面端产品版本 5.5.2')
+  assert.equal(h['user-agent'], 'CLI/2.137.1 WorkBuddy AI/2.137.1')
+  assert.equal(h['x-product'], 'SaaS')
+  assert.equal(h['x-product-code'], undefined, '国际版 CLI 对话路径不发 x-product-code')
+  assert.equal(h['x-user-id'], 'u_1')
+  // 链路头：trace-id = root request id
+  assert.equal(h['x-trace-id'], h['x-root-request-id'])
+  assert.match(h.traceparent, /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/)
+  assert.match(h.b3, /^[0-9a-f]{32}-[0-9a-f]{16}-1-[0-9a-f]{16}$/)
+  assert.equal(h['x-b3-traceid'], h['x-root-request-id'])
+  assert.equal(h['x-b3-sampled'], '1')
+  // SDK 指纹
+  assert.equal(h['x-stainless-lang'], 'js')
+  assert.equal(h['x-stainless-runtime'], 'node')
+  assert.equal(h['x-stainless-package-version'], '6.25.0')
+  assert.match(h['x-stainless-runtime-version'], /^v\d+\./)
+})
+
+test('★ x-api-key 只对 sk-… 形态的凭据发（API key 才发，JWT 不发）', async () => {
+  const { ctx, calls } = chatCtx()
+  await drainChat(INTL, ctx, [{ role: 'user', content: 'hi' }], account({ token: 'sk-live-abc123' }))
+  assert.equal(calls[0].headers['x-api-key'], 'sk-live-abc123', 'API key 形态照客户端发')
+
+  const { ctx: ctx2, calls: calls2 } = chatCtx()
+  await drainChat(INTL, ctx2, [{ role: 'user', content: 'hi' }], account({ token: 'eyJhbGciOi.payload.sig' }))
+  assert.equal(calls2[0].headers['x-api-key'], undefined, 'JWT 形态必须不发（否则 401 not_found）')
+})
+
+test('★ 国内版对话路径保持旧形态：不发 CLI 形态头，也不发 x-api-key', async () => {
+  const { ctx, calls } = chatCtx()
+  await drainChat(CN, ctx, [{ role: 'user', content: 'hi' }], account({ token: 'tok-1' }))
+
+  const h = calls[0].headers
+  assert.equal(h['x-codebuddy-request'], undefined)
+  assert.equal(h['x-api-key'], undefined)
+  assert.equal(h['x-agent-type'], undefined)
+  assert.equal(h['x-stainless-lang'], undefined)
+  assert.equal(h['x-ide-name'], 'CodeBuddy', '国内版沿用旧形态（产品名 + 桌面端版本）')
+  assert.equal(h['user-agent'], 'CodeBuddyIDE/1.106.1')
+  assert.equal(h['x-product-code'], 'codebuddy')
+})
+
+test('★ 国际版 user 消息带客户端形态标记 agent:"cli"（system 不带）', async () => {
+  const { ctx, calls } = chatCtx()
+  await drainChat(INTL, ctx, [
+    { role: 'system', content: 'You are a helpful assistant.' },
+    { role: 'user', content: 'hi' },
+  ])
+  const body = JSON.parse(String(calls[0].body))
+  assert.equal(body.messages[0].agent, undefined, 'system 消息不带 agent')
+  assert.equal(body.messages[1].agent, 'cli')
 })
 
 // ─────────────────── 缺陷 A2：首条必须是 system ───────────────────

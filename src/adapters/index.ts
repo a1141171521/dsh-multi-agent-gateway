@@ -50,8 +50,8 @@ export function builtinAdapters(): AgentAdapter[] {
 export { OpenCodeAdapter, builtinSkeletons, BuddyAdapter, BUDDY_CN, BUDDY_INTL }
 export { QoderAdapter, QODER_CN }
 export { TraeAdapter }
-export { parseModelsFromConfig, buddyHeaders, userAgentFor } from './buddy.js'
-export type { BuddyProduct } from './buddy.js'
+export { parseModelsFromConfig, buddyHeaders, buddyChatHeaders, userAgentFor } from './buddy.js'
+export type { BuddyChatIds, BuddyProduct } from './buddy.js'
 export { BaseAdapter } from './base.js'
 export { createSkeleton } from './skeleton.js'
 export { SKELETON_IDS } from './skeletons.js'

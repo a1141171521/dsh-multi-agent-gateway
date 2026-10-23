@@ -48,7 +48,6 @@
  * （`test/adapters/buddy.test.mjs`，用假 ctx 记录每次调用）。
  */
 
-import { createHash, randomUUID } from 'node:crypto'
 import { BaseAdapter } from './base.js'
 import { iterateSse } from '../core/sse.js'
 import { unsupportedReason } from './messages.js'
@@ -63,6 +62,18 @@ import {
   isDeepSeekModel,
   parseReasoningFields,
 } from '../vendor/buddy/buddy-reasoning.js'
+import {
+  AGENT_INTENT_CRAFT,
+  AGENT_TYPE_MAIN,
+  CLI_IDE_VERSION,
+  UA_CLI_INTL,
+  hex32,
+  newRequestId,
+  newSpanId,
+  stainlessHeadersOf,
+  traceHeadersOf,
+  uuidFromSeed,
+} from '../vendor/buddy/buddy-client-shape.js'
 import {
   CHECKIN_ACTIVITY_STATUS_PATH,
   DAILY_CHECKIN_PATH,
@@ -150,6 +161,28 @@ export interface BuddyProduct {
    * true，但语义无关 —— 合并成一个字段会让第三个产品出现时必然写错一个。
    */
   requiresConversationHeaders: boolean
+  /**
+   * **对话请求**的客户端形态。
+   *
+   * 缺省 = 沿用旧形态（{@link buddyHeaders} 那 5 个身份头），国内版就是这一档。
+   * 填了它，对话路径改发「内嵌 CLI 的真实形态」：`x-ide-*` 用 CLI、`x-product`
+   * 用 `SaaS`、按需发 `x-api-key`、并补 `x-codebuddy-request` / `x-requested-with`
+   * / 链路头 / SDK 指纹。
+   *
+   * 依据：2026-10-23 国际版真机抓包（`docs/WORKBUDDY-INTL-REQUEST.md`）。
+   * 国内版没有等价的抓包，所以**不要**给国内版随手补上。
+   */
+  chatIdentity?: {
+    ideType: string
+    ideName: string
+    ideVersion: string
+    /** 对话路径的 `X-Product`；缺省 = `attributionName`。 */
+    xProduct?: string
+    /** 是否发 `X-Product-Code`（国际版 CLI 实测**不发**）。 */
+    productCode: boolean
+  }
+  /** 对话路径的 UA 覆盖（国际版 = `CLI/2.137.1 WorkBuddy AI/2.137.1`）。 */
+  chatUserAgent?: string
 }
 
 const UA_INTL = 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2'
@@ -220,6 +253,20 @@ export const BUDDY_INTL: BuddyProduct = {
   pluginVersion: '5.5.2',
   // ⚠️ 国际版**必须**带三个 conversation 头，否则 400 + code 11128「渠道校验」。
   requiresConversationHeaders: true,
+  // 对话路径按内嵌 CLI 的真实形态发（2026-10-23 真机抓包，见
+  // docs/WORKBUDDY-INTL-REQUEST.md）。注意与上面 `userAgent`（桌面端形态）
+  // **故意不同**：`/v3/config` 与签到/余额走桌面端形态，chat 走 CLI 形态。
+  chatUserAgent: UA_CLI_INTL,
+  chatIdentity: {
+    ideType: 'CLI',
+    ideName: 'CLI',
+    ideVersion: CLI_IDE_VERSION,
+    xProduct: 'SaaS',
+    productCode: false,
+    // ⚠️ 不要给对话路径加 `x-api-key: <JWT>`：上游会判成「错误的 API key」→
+    // 401 `{"message":"not_found"}`（2026-10-23 真账号 A/B 实测）。适配器只在
+    // 凭据本身是 `sk-…` API key 时才发这个头。
+  },
 }
 
 export const BUDDY_PRODUCTS: readonly BuddyProduct[] = [BUDDY_CN, BUDDY_INTL]
@@ -489,6 +536,105 @@ export function buddyHeaders(
   return headers
 }
 
+/** 一次对话请求要带的三个 id（形态见 {@link buddyChatHeaders}）。 */
+export interface BuddyChatIds {
+  /** 会话 id（UUID 形态，按账号稳定）。 */
+  conversationId: string
+  /** 会话的 root request id（32 位十六进制，按会话稳定）。 */
+  rootRequestId: string
+  /** 本条消息 / 本次请求的 id（32 位十六进制，每次调用新值）。 */
+  messageId: string
+}
+
+/**
+ * **对话请求**要带的头 —— 按「内嵌 CLI 客户端」的真实形态发（2026-10-23 真机抓包，
+ * `docs/WORKBUDDY-INTL-REQUEST.md` + `docs/workbuddy-intl-capture/`）。
+ *
+ * ## 为什么单独一个函数，不改 `buddyHeaders`
+ *
+ * `buddyHeaders` 同时服务 `/v3/config` 等非对话路径，那边的形态**没有**抓包
+ * （只有参考实现的桌面端形态），而且已被实测验证可用。把对话路径独享的真实
+ * 形态放新函数里，`/v3/config` 与国内版**一行都不动** —— 最小爆炸半径。
+ *
+ * ## 与真实客户端逐条对齐（抓包 = 35 个头）
+ *
+ * | 头 | 客户端真实形态 | 说明 |
+ * |---|---|---|
+ * | `authorization` | `Bearer <token>` | 官方账号是 JWT |
+ * | `x-api-key` | 仅 `sk-…` 凭据 | ⚠️ JWT 塞进去 = 401 `{"message":"not_found"}`（A/B 实测） |
+ * | `accept` | `application/json` | **不是** `text/event-stream`；流式由 body.stream 决定 |
+ * | `x-requested-with` | `XMLHttpRequest` | |
+ * | `x-codebuddy-request` | `1` | |
+ * | `x-agent-type` | `main` | |
+ * | `x-agent-intent` | `craft` | 对话路径的取值 |
+ * | `x-agent-purpose` | `conversation` | 与旧形态一致 |
+ * | `x-conversation-id` | UUID，按会话稳定 | |
+ * | `x-conversation-request-id` = `x-root-request-id` | 32 hex，按会话稳定 | 是同一条 root id |
+ * | `x-conversation-message-id` = `x-request-id` | 32 hex，每次新值 | 是同一条 message id |
+ * | `traceparent` / `b3` / `x-b3-*` / `x-trace-id` | trace-id = root request id | 链路天然串起一次对话 |
+ * | `x-stainless-*` | openai-node 指纹 | 7 个，见 {@link stainlessHeadersOf} |
+ * | `x-user-id` | 登录账号 uid | 有才发 |
+ * | `x-ide-*` | `CLI` / `CLI` / `2.137.1` | **不是** 产品名 + 桌面端版本 |
+ * | `x-product` | `SaaS` | 抓包实测；国际版 CLI 不发 `x-product-code` |
+ * | `user-agent` | `CLI/2.137.1 WorkBuddy AI/2.137.1` | |
+ *
+ * ⚠️ `x-private-data`（`X-Private-Data`）**刻意不发**：客户端对官方请求会带它，
+ * 但内容不可复现 —— 伪造一个错误的内容比缺一个头更容易被风控盯上。
+ *
+ * ⚠️ 国内版（`requiresConversationHeaders: false` 且无 `chatIdentity`）原样走
+ * {@link buddyHeaders}：那边没有抓包依据，不加没验证过的头。
+ */
+export function buddyChatHeaders(
+  product: BuddyProduct,
+  token: string,
+  modelId: string,
+  ids: BuddyChatIds,
+  userId?: string,
+): Record<string, string> {
+  // 国内版 / 未配置对话形态的产品：保持旧形态（五个身份头 + Bearer），不加新头。
+  if (product.chatIdentity === undefined) return buddyHeaders(product, token, modelId)
+
+  const identity = product.chatIdentity
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${token}`,
+    accept: 'application/json',
+    'content-type': 'application/json',
+    'x-requested-with': 'XMLHttpRequest',
+    'x-codebuddy-request': '1',
+    'x-domain': product.apiDomain,
+    ...(identity.productCode ? { 'x-product-code': product.productCode } : {}),
+    'x-product': identity.xProduct ?? product.attributionName,
+    'x-agent-purpose': 'conversation',
+    'x-agent-type': AGENT_TYPE_MAIN,
+    'x-agent-intent': AGENT_INTENT_CRAFT,
+    'x-ide-name': identity.ideName,
+    'x-ide-type': identity.ideType,
+    'x-ide-version': identity.ideVersion,
+    'user-agent': product.chatUserAgent ?? userAgentFor(product, modelId),
+    // ⚠️ `x-api-key` **只对 API key 形态的凭据发**（`sk-…`）。
+    // 官方账号 token 是 JWT：把它塞进这个头，上游当成「错误的 API key」直接
+    // 401 `{"message":"not_found"}`（2026-10-23 真账号 A/B 实测，见
+    // docs/WORKBUDDY-INTL-REQUEST.md §8）。抓包里那个头来自**自定义模型**的 key。
+    ...(token.startsWith('sk-') ? { 'x-api-key': token } : {}),
+    // 三个会话头：会话 id 稳定；root 与 message 两条**不是同一个值**
+    // （抓包：root/conversation-request-id 稳定，message/request-id 每次新值）。
+    'x-conversation-id': ids.conversationId,
+    'x-conversation-request-id': ids.rootRequestId,
+    'x-root-request-id': ids.rootRequestId,
+    'x-conversation-message-id': ids.messageId,
+    'x-request-id': ids.messageId,
+  }
+  // 账号 uid 有才发（与 creditsHeaders 同款口诀：空串头比缺头更坏事）。
+  if (userId !== undefined && userId !== '') headers['x-user-id'] = userId
+  // 链路头：trace-id 用 root request id（抓包里两者同值），span 每次新值。
+  const spanId = newSpanId()
+  const parentSpanId = newSpanId()
+  Object.assign(headers, traceHeadersOf(ids.rootRequestId, spanId, parentSpanId))
+  // SDK 指纹：openai-node 的 stainless 头族。
+  Object.assign(headers, stainlessHeadersOf())
+  return headers
+}
+
 /** 从 `{code, data, message}` 信封里取 data。 */
 function unwrapData(body: unknown): Record<string, unknown> | null {
   if (typeof body !== 'object' || body === null) return null
@@ -575,12 +721,26 @@ export class BuddyAdapter extends BaseAdapter {
    *
    * 不需要落盘（它是**纯函数**，没有迁移/清理问题），也不需要存进凭据。
    *
-   * ⚠️ 与 qoder 的 `machineIdOf` 一样**只取哈希前 32 位十六进制**：这个值会进
-   * 请求头，不需要也不应该带上任何可反推账号的信息。
+   * ⚠️ 形态对齐抓包：客户端发的是 **UUID**（`bff4befa-1477-4313-85ab-bf9e436f4502`），
+   * 所以用 `uuidFromSeed()` 把同一份哈希格式化成 UUID v4 形态（版本位/变体位写死）。
+   * 确定性不变（同一账号每次重启同一个 id），只是**外形**换成客户端的样子。
    */
   private sessionIdOf(record: AccountRecord): string {
-    const hex = createHash('sha256').update(`buddy:${this.product.agentId}:${record.id}`).digest('hex')
-    return hex.slice(0, 32)
+    return uuidFromSeed(`buddy:${this.product.agentId}:${record.id}`)
+  }
+
+  /**
+   * 会话的 **root request id**（`x-conversation-request-id` = `x-root-request-id`）。
+   *
+   * 抓包里它**每次会话稳定**（`752abbd0…`），而 `x-request-id` /
+   * `x-conversation-message-id` 每次调用新值 —— 现在的实现把这两件事做对了：
+   * root 按会话派生、message 每次随机。
+   *
+   * 它同时是链路头的 `trace-id`（客户端发 `x-trace-id` 与它同值），于是同一次
+   * 对话的所有请求在服务端的 trace 视图里天然串成一条。
+   */
+  private rootRequestIdOf(record: AccountRecord): string {
+    return hex32(`buddy-root:${this.product.agentId}:${this.sessionIdOf(record)}`)
   }
 
   /** 思考档位在 `ctx.cache` 里的键（**按产品**隔离：两个产品的模型池不同）。 */
@@ -689,6 +849,18 @@ export class BuddyAdapter extends BaseAdapter {
     const first = messages[0]
     if (first !== undefined && first.role === 'system') return messages
     return [{ role: 'system', content: BUDDY_MINIMAL_SYSTEM }, ...messages]
+  }
+
+  /**
+   * 给 user 消息补客户端的**形态标记** `agent: "cli"`（仅国际版）。
+   *
+   * 抓包里每条 user 消息都带这个非标字段（客户端内部消息格式透传出来的），
+   * system 消息没有。官方网关既然收客户端的请求就必须容忍它 —— 补上它把
+   * 请求体形状也拉到客户端的样子；国内版没有抓包依据，不加。
+   */
+  private withClientMessageShape(messages: ChatRequest['messages']): ChatRequest['messages'] {
+    if (!this.product.requiresConversationHeaders) return messages
+    return messages.map((m) => (m.role === 'user' ? { ...m, agent: 'cli' } : m))
   }
 
   /** 端点：配置里填了 `apiBaseUrl` 就用它（接自有反代），否则用内置产品地址。 */
@@ -1350,7 +1522,7 @@ export class BuddyAdapter extends BaseAdapter {
     const body: Record<string, unknown> = {
       ...payload,
       model: payload.model,
-      messages: this.withLeadingSystem(payload.messages),
+      messages: this.withClientMessageShape(this.withLeadingSystem(payload.messages)),
       stream: true,
       stream_options: { include_usage: true },
       // `reasoning_effort` 覆盖 payload 里那个（核心层可能带了不可移植的原始值）。
@@ -1368,13 +1540,19 @@ export class BuddyAdapter extends BaseAdapter {
       const send = ctx.fetch ?? fetch
       response = await send(url, {
         method: 'POST',
-        // 三个会话头：`sessionId` 按账号稳定，`messageId` / `requestId` **每次新值**
-        // （参考实现同款：session 复用、后两个 `crypto.randomUUID()`）。
-        headers: buddyHeaders(this.product, token, payload.model, {
-          sessionId: this.sessionIdOf(record),
-          messageId: randomUUID(),
-          requestId: randomUUID(),
-        }),
+        // id 语义按抓包对齐：conversation-id / root-request-id 按会话稳定，
+        // message-id / request-id **每次新值**（32 位十六进制，无连字符）。
+        headers: buddyChatHeaders(
+          this.product,
+          token,
+          payload.model,
+          {
+            conversationId: this.sessionIdOf(record),
+            rootRequestId: this.rootRequestIdOf(record),
+            messageId: newRequestId(),
+          },
+          firstNonEmpty(record.credentials.user_id, record.credentials.userId, record.credentials.uid),
+        ),
         body: JSON.stringify(body),
         signal,
       })
