@@ -1,6 +1,6 @@
 {
   "id": "dsh-multi-agent-gateway",
-  "name": "多 Agent 通用 API 反代网关",
+  "name": "Free Token",
   "version": "0.1.0",
   "main": "./lib/index.js",
   "type": "provider",

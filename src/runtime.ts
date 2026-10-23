@@ -135,7 +135,7 @@ export class GatewayRuntime {
       at: Date.now(),
       level: 'info',
       scope: 'gateway',
-      message: '多 Agent 网关启动中',
+      message: 'Free Token 启动中',
       detail: `dataDir=${options.config.dataDir}`,
     })
 

@@ -29,7 +29,7 @@
 
 ## 界面：五页 + 浏览器登录
 
-设置页现在是**独立一页**（设置 → 多 Agent 网关），内部按「你此刻要回答的问题」分五页：
+设置页现在是**独立一页**（设置 → Free Token），内部按「你此刻要回答的问题」分五页：
 
 | 页 | 回答什么问题 |
 |---|---|
@@ -158,7 +158,7 @@ dsh plugin --profile desktop add D:\AI\DeepseekPlugin\dsh-multi-agent-gateway
 
 # 2) 重启 DSH 桌面端（客户端 bundle 要重新加载）
 
-# 3) 打开 设置 → 插件 → 多 Agent 网关，填账号
+# 3) 打开 设置 → 插件 → Free Token，填账号
 ```
 
 详细步骤见 [`docs/INSTALL.md`](docs/INSTALL.md)。
