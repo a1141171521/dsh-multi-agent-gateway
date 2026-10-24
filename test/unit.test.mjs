@@ -17,7 +17,16 @@ import { utc8DateString, utc8Hour, hasQoderCampaignRefreshedToday } from '../lib
 import { checkInKey, taskKey } from '../lib/core/tasks.js'
 import { redactSecret, redactDeep, CredentialVault } from '../lib/core/crypto.js'
 import { MemoryCache, TokenBucket, Semaphore } from '../lib/core/cache.js'
-import { SseDecoder, translateChunk, normalizeUsage, isParseableJson } from '../lib/core/sse.js'
+import { SseDecoder, translateChunk, normalizeUsage, isParseableJson, iterateSse } from '../lib/core/sse.js'
+import {
+  parseQueueError,
+  isBillingErrorBody,
+  queueDelayMs,
+  QUEUE_MAX_DELAY_MS,
+  QUEUE_BUSINESS_CODE,
+  BILLING_BUSINESS_CODE,
+} from '../lib/core/queue.js'
+import { unwrapQoderEnvelopeStream } from '../lib/vendor/qoder/qoder-envelope.js'
 import { parseSchedule, matches, isDue } from '../lib/core/scheduler.js'
 import { AccountManager } from '../lib/core/accounts.js'
 import { AccountRouter, penaltyMsFor, RETRY_AFTER_CAP_MS, QUOTA_COOLDOWN_MS, AUTH_COOLDOWN_MS } from '../lib/core/router.js'
@@ -2477,7 +2486,15 @@ test('Qoder：缺 uid 的 token 在发请求前就被拒（否则上游只会回
   const record = { id: 'qoder-cn:a', agentId: 'qoder-cn', label: 'a', credentials: { token: 'plain-token' }, enabled: true, createdAt: 0, updatedAt: 0 }
   const verdict = await adapter.validateCredentials(record, {})
   assert.equal(verdict.ok, false)
-  assert.equal(verdict.kind, 'auth')
+  // ⚠️ 这条断言原本写的是 `auth`，2026-10-24 随真实报障一起改掉（**不是放宽，是纠正**）：
+  // `kind` 会被 `src/llm/adapter.ts` 原样 `toUpperCase()` 成 DSH 的失败码，而 DSH 对
+  // `AUTH` 有特殊处理 —— 它**丢掉我们写的 message**、固定显示本地化文案「API 密钥无效」，
+  // 并且 `displayFailure()` 对 `AUTH` 显式返回 `message: ""`。于是「凭证缺 uid」被说成
+  // 「密钥无效」，把用户引向完全错误的方向（Qoder 根本没有 API key）。
+  // 改用 `bad_request`：语义是「本地请求上下文有问题，绝不能换号重试」
+  // （`src/core/router.ts` 明确列为不换号的情形），且 DSH 对 `BAD_REQUEST` 无特殊处理，
+  // 我们的 message 会原样显示。理由全文见 `src/adapters/qoder.ts` 的 QODER_MISSING_UID_KIND。
+  assert.equal(verdict.kind, 'bad_request')
   // 话术要**可操作**：说「重新登录」，而不是只报「解不出 user_id」（用户无法自救）
   assert.ok(String(verdict.message).includes('重新登录'), `实际：${verdict.message}`)
 
@@ -2713,4 +2730,896 @@ test('Qoder uid：优先用凭证里存的（设备令牌不是 JWT，解不出�
 test('WorkBuddy：没有 token 时不列模型（登录前一个都调不动）', async () => {
   const adapter = new BuddyAdapter(BUDDY_CN)
   assert.deepEqual(await adapter.getModelMetaList(qoderRecord(undefined), {}), [])
+})
+
+// ═══════════════ 检查更新：available / message（用户报障「永远显示已是最新」）═══════════════
+//
+// 现场：用户推了两个提交，界面仍显示「已是最新」。根因**不是**落后多少的问题：
+// 宿主 `UpdateStatus` 从来没下发过 `available`，而客户端读的是 `d.available === true`
+// ⇒ `undefined === true` 恒 false ⇒ 徽标永远画「已是最新」。这个功能从来没生效过。
+//
+// 下面钉住两件事：
+//   ① `available` 的判据是 **`behind > 0`**，不掺版本号比较
+//      （本项目三个提交的 version 都是 0.1.0，比版本号就等于永远「已是最新」）；
+//   ② `message` 一律走 `describeUpdate()`，且**失败绝不能报成「已是最新」**
+//      —— 本机 Clash 没开时就是那条路径。
+
+/** 造一个「本地 clone + 可推送的裸远端」fixture（与上面那条 applyUpdate 用例同款）。 */
+function updateFixture(prefix) {
+  const base = mkdtempSync(join(tmpdir(), prefix))
+  const remote = join(base, 'remote.git')
+  const seed = join(base, 'seed')
+  const work = join(base, 'work')
+  mkdirSync(remote, { recursive: true })
+  gitRun(remote, ['init', '--bare', '-b', 'main'])
+  mkdirSync(seed, { recursive: true })
+  gitRun(seed, ['init', '-b', 'main'])
+  writeFileSync(join(seed, 'package.json'), JSON.stringify({ name: 'x', version: '0.1.0' }), 'utf8')
+  gitRun(seed, ['add', '-A'])
+  gitRun(seed, ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-m', 'v0.1.0'])
+  gitRun(seed, ['remote', 'add', 'origin', remote])
+  gitRun(seed, ['push', 'origin', 'main'])
+  gitRun(base, ['clone', remote, work])
+  return { base, remote, seed, work }
+}
+
+/** 往远端推一个**不改版本号**的提交（复刻本项目的真实形态）。 */
+function pushCommit(repo, message) {
+  writeFileSync(join(repo.seed, `${message}.txt`), 'x', 'utf8')
+  gitRun(repo.seed, ['add', '-A'])
+  gitRun(repo.seed, ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-m', message])
+  gitRun(repo.seed, ['push', 'origin', 'main'])
+}
+
+test('updateStatus：behind>0 → available=true，message 说「有新版本」', async () => {
+  const f = updateFixture('mag-ufld1-')
+  try {
+    pushCommit(f, 'ahead')
+    const status = await checkUpdate(f.work)
+    assert.equal(status.behind, 1)
+    assert.equal(status.available, true, '★ 落后提交时必须报可更新（改前这个字段压根不存在）')
+    assert.match(status.message, /有新版本/, `message 应说明有新版本，实际：${status.message}`)
+    // 形状契约：这两个字段必须真的在（客户端按 `=== true` 读，undefined 会让它恒 false）
+    assert.ok(Object.hasOwn(status, 'available'), 'available 必须存在，不能是 undefined')
+    assert.ok(Object.hasOwn(status, 'message'), 'message 必须存在')
+  } finally {
+    rmSync(f.base, { recursive: true, force: true })
+  }
+})
+
+test('updateStatus：behind=0 → available=false，message 说「已是最新」', async () => {
+  const f = updateFixture('mag-ufld2-')
+  try {
+    const status = await checkUpdate(f.work)
+    assert.equal(status.behind, 0)
+    assert.equal(status.available, false)
+    assert.match(status.message, /已是最新/, `实际：${status.message}`)
+  } finally {
+    rmSync(f.base, { recursive: true, force: true })
+  }
+})
+
+test('★ updateStatus：版本号相等但 behind>0 → available 仍然 true（判据不是版本号）', async () => {
+  const f = updateFixture('mag-ufld3-')
+  try {
+    // 远端过来 2 个提交，**一个都不改 version** —— 这正是本项目的现状
+    // （72e4b28 / 64ca9a9 / ee5f417 的 package.json 全是 0.1.0，也没有 tag）。
+    pushCommit(f, 'one')
+    pushCommit(f, 'two')
+
+    const status = await checkUpdate(f.work)
+    assert.equal(status.behind, 2)
+    assert.equal(status.current, '0.1.0')
+    assert.equal(status.latest, '0.1.0')
+    // 版本号 == 版本号，compareVersions 会回 0 —— 拿它当判据就会误判「已是最新」。
+    assert.equal(compareVersions(status.current, status.latest), 0, '前提：两个版本号确实相等')
+    assert.equal(status.available, true, '★ 版本号相等但落后提交时，必须仍然报可更新')
+    assert.ok(!/已是最新/.test(status.message), `不能报成已是最新，实际：${status.message}`)
+  } finally {
+    rmSync(f.base, { recursive: true, force: true })
+  }
+})
+
+test('★ updateStatus：fetch 失败 → 不能报成「已是最新」，要把原因说出来', async () => {
+  const f = updateFixture('mag-ufld4-')
+  try {
+    // 把 origin 指到一个不存在的路径 = 远端不可达。
+    // 本机 Clash 没开时用户遇到的就是这条路径。
+    gitRun(f.work, ['remote', 'set-url', 'origin', join(tmpdir(), 'mag-definitely-not-here.git')])
+
+    const status = await checkUpdate(f.work)
+    // 「能更新，但这次查不动」——不该把功能整个藏掉
+    assert.equal(status.supported, true, '仍是 git 检出，supported 应保持 true')
+    assert.equal(status.available, false, '没查到就不能说有更新')
+    // ★ 核心：false 不能等同于「最新」。原因必须留在 message 里（改前它被静默丢弃）。
+    assert.match(status.message, /拉取远端失败/, `必须说清是拉取失败，实际：${status.message}`)
+    assert.ok(!/已是最新/.test(status.message), '★ 绝不能把「没查到」谎报成「已是最新」')
+    assert.equal(typeof status.error, 'string')
+    assert.equal(status.message, status.error, 'message 走 describeUpdate，有 error 时就是 error 原文')
+  } finally {
+    rmSync(f.base, { recursive: true, force: true })
+  }
+})
+
+test('★ updateStatus：rev-list 拿不到 behind → 不能报「已是最新」', async () => {
+  const f = updateFixture('mag-ufld5-')
+  try {
+    pushCommit(f, 'ahead')
+    // 删掉 remote-tracking 引用 + 改掉 fetch refspec：
+    // fetch 仍成功，HEAD 也正常，但 `HEAD..origin/main` 解析不了 ⇒ rev-list 失败。
+    // 这复刻了「behind 拿不到」这条分支（改前它被 `catch { behind = 0 }` 静默吞掉，
+    // 于是 behind=0 ⇒ 文案变成「已是最新」—— 把没查出来谎报成确认最新）。
+    gitRun(f.work, ['update-ref', '-d', 'refs/remotes/origin/main'])
+    gitRun(f.work, ['config', 'remote.origin.fetch', '+refs/heads/nonexistent:refs/remotes/origin/nonexistent'])
+
+    const status = await checkUpdate(f.work)
+    assert.equal(status.supported, true)
+    assert.equal(status.behind, 0, '拿不到就是拿不到，保守留在 0')
+    assert.equal(status.available, false, '拿不到 behind 时保守 false')
+    // ★ 但**必须**说明「无法判断」，不能默认成最新
+    assert.match(status.message, /无法判断落后多少/, `实际：${status.message}`)
+    assert.ok(!/已是最新/.test(status.message), '★ 绝不能把「没查出来」谎报成「已是最新」')
+    assert.equal(typeof status.error, 'string', 'error 也要留着，供客户端显示原因')
+  } finally {
+    rmSync(f.base, { recursive: true, force: true })
+  }
+})
+
+test('updateStatus：非 git 检出时 available=false 且 message 给出可行动的原因', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mag-ufld6-'))
+  try {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '0.1.0' }), 'utf8')
+    const status = await checkUpdate(dir)
+    assert.equal(status.supported, false)
+    assert.equal(status.available, false)
+    assert.match(status.message, /不是 git 检出/, `实际：${status.message}`)
+    assert.ok(!/已是最新/.test(status.message), '不支持自我更新 ≠ 已是最新')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('updateStatus：available 与 message 文案口径一致（三种结论互斥）', async () => {
+  // 这条防的是「字段之间自相矛盾」：available=true 却说「已是最新」，
+  // 或 available=false 却说「有新版本」—— 客户端两个地方都会显示，自相矛盾很难查。
+  const f = updateFixture('mag-ufld7-')
+  try {
+    pushCommit(f, 'ahead')
+    const behind = await checkUpdate(f.work)
+    assert.equal(behind.behind > 0, behind.available, 'available 必须恒等于 behind > 0')
+
+    const fresh = updateFixture('mag-ufld7b-')
+    try {
+      const status = await checkUpdate(fresh.work)
+      assert.equal(status.behind > 0, status.available, 'available 必须恒等于 behind > 0')
+      assert.equal(describeUpdate(status), status.message, 'message 必须是 describeUpdate 的结果')
+    } finally {
+      rmSync(fresh.base, { recursive: true, force: true })
+    }
+  } finally {
+    rmSync(f.base, { recursive: true, force: true })
+  }
+})
+
+// ═══════════ 代理连不上：可操作文案 + 回环代理才重试直连（task-20）═══════════
+//
+// 现场（用户实机）：上一步修好「如实报失败」后，他看到的是 git 的 fatal 原文：
+//   `拉取远端失败：fatal: unable to access '…': Failed to connect to github.com:443
+//    over proxy 127.0.0.1 after 2053 ms: Could not connect to server`
+// 真实原因是仓库 .git/config 里钉了 http.proxy=http://127.0.0.1:7897 而 Clash 没开。
+// 这段是真话但**不可操作** —— 用户看完不知道该干什么。
+//
+// 下面用**真实抓到的 git stderr 原文**当 fixture（本机 2026-10-24 实测，
+// 见 probe-git-shapes 的对照表），而不是自己编字符串 —— 编的字符串
+// 容易刚好符合我自己的识别逻辑，那样测的是「我以为的 git」而不是「真的 git」。
+
+/**
+ * 真实 stderr 样本（一字未改，来自本机实测）。
+ *
+ * ⚠️ 尤其注意 `DIRECT_DOWN`：**强制直连失败时没有 `over proxy`**，
+ * 只有 `Could not connect to server`。这是「不能用弱特征单独判定代理问题」的实证。
+ */
+const REAL_GIT_STDERR = {
+  /** 代理挂着但代理没开（用 127.0.0.1:9 模拟 Clash 挂掉）——有 `over proxy`。 */
+  LOOPBACK_PROXY_DOWN:
+    "fatal: unable to access 'https://github.com/a1141171521/dsh-multi-agent-gateway.git/': Failed to connect to github.com:443 over proxy 127.0.0.1 after 2022 ms: Could not connect to server",
+  /** 同上，用 localhost 写法。 */
+  LOCALHOST_PROXY_DOWN:
+    "fatal: unable to access 'https://github.com/a1141171521/dsh-multi-agent-gateway.git/': Failed to connect to github.com:443 over proxy localhost after 2226 ms: Could not connect to server",
+  /** ★ 强制直连也连不上 —— **没有** `over proxy`（实测 21 秒）。 */
+  DIRECT_DOWN:
+    "fatal: unable to access 'https://github.com/nonexistent-org-xyz/nonexistent-repo-xyz.git/': Failed to connect to github.com:443 after 21039 ms: Could not connect to server",
+  /** DNS 解析失败（非连接类）。 */
+  DNS_FAIL:
+    "fatal: unable to access 'https://this-host-definitely-does-not-exist-xyz123.invalid/repo.git/': Could not resolve host: this-host-definitely-does-not-exist-xyz123.invalid",
+  /** 超时被杀：stderr 为空，只剩我们自己的命令行。 */
+  TIMEOUT_KILLED: 'Command failed: git -c http.proxy= -c https.proxy= fetch --quiet origin main',
+}
+
+test('代理识别：真实 stderr → 判为代理不可达，文案可操作且不含裸 fatal', async () => {
+  const { classifyFetchFailure, describeFetchFailure } = await import('../lib/core/updater.js')
+
+  const info = classifyFetchFailure(REAL_GIT_STDERR.LOOPBACK_PROXY_DOWN, 'http://127.0.0.1:7897')
+  assert.equal(info.kind, 'proxy-unreachable', '有 over proxy ⇒ 应当**确凿**判为代理问题')
+  assert.equal(info.loopback, true)
+  assert.equal(info.retryDirect, true, '回环代理 ⇒ 允许试直连')
+
+  const message = describeFetchFailure({
+    info,
+    proxyDetail: REAL_GIT_STDERR.LOOPBACK_PROXY_DOWN,
+    timedOut: false,
+    timeoutMs: 30_000,
+  })
+  assert.match(message, /代理/, `文案要提到代理，实际：${message}`)
+  assert.match(message, /127\.0\.0\.1:7897/, `文案要含**现取**的代理地址，实际：${message}`)
+  // ★ 核心：不能再把 git 的 fatal 原文原样丢给用户（那是「不可操作」的病根）
+  assert.ok(!/fatal: unable to access/.test(message), `不该出现裸 fatal 原文：${message}`)
+  // 要给出可行动的下一步
+  assert.match(message, /检查更新|重试/, `要告诉用户下一步做什么，实际：${message}`)
+})
+
+test('代理识别：代理地址缺失时退化成通用文案（不写死地址）', async () => {
+  const { classifyFetchFailure, describeFetchFailure } = await import('../lib/core/updater.js')
+  const info = classifyFetchFailure(REAL_GIT_STDERR.LOOPBACK_PROXY_DOWN, null)
+  const message = describeFetchFailure({
+    info,
+    proxyDetail: REAL_GIT_STDERR.LOOPBACK_PROXY_DOWN,
+    timedOut: false,
+    timeoutMs: 30_000,
+  })
+  assert.match(message, /代理/, `实际：${message}`)
+  // 取不到配置就不该编一个地址出来
+  assert.ok(!/\d+\.\d+\.\d+\.\d+:\d+/.test(message), `没有配置时不该出现具体地址：${message}`)
+})
+
+test('★ 非代理类失败（DNS）不被误判成代理问题，保留原文', async () => {
+  const { classifyFetchFailure, describeFetchFailure } = await import('../lib/core/updater.js')
+  const info = classifyFetchFailure(REAL_GIT_STDERR.DNS_FAIL, 'http://127.0.0.1:7897')
+  assert.equal(info.kind, 'unknown', 'DNS 失败不是代理问题')
+  assert.equal(info.retryDirect, false, '认不出来就不该动网络路径')
+
+  const message = describeFetchFailure({
+    info,
+    proxyDetail: REAL_GIT_STDERR.DNS_FAIL,
+    timedOut: false,
+    timeoutMs: 30_000,
+  })
+  assert.match(message, /Could not resolve host/, `认不出来就保留原文，实际：${message}`)
+  assert.ok(!/Clash/.test(message), `别把未知失败说成「代理没开」：${message}`)
+})
+
+test('★ 直连失败（无 over proxy）不被误判成「代理没开」', async () => {
+  const { classifyFetchFailure } = await import('../lib/core/updater.js')
+  // 这条是实测逼出来的：`Could not connect to server` 在**直连失败**时也会出现，
+  // 只看它就会把「网络不通」说成「代理没开」，用户去开代理白折腾。
+  const noProxy = classifyFetchFailure(REAL_GIT_STDERR.DIRECT_DOWN, null)
+  assert.equal(noProxy.kind, 'unknown', '没配代理 + 无 over proxy ⇒ 不能赖代理')
+  assert.equal(noProxy.retryDirect, false)
+
+  // 配了**非回环**代理时，最多只能说「存疑」，且**绝不重试**
+  const withCorporate = classifyFetchFailure(REAL_GIT_STDERR.DIRECT_DOWN, 'http://192.0.2.1:8080')
+  assert.notEqual(withCorporate.kind, 'proxy-unreachable', '没有 over proxy 就不该「确凿」')
+  assert.equal(withCorporate.retryDirect, false, '★ 非回环代理绝不重试')
+})
+
+test('回环判定：127.0.0.1 / localhost / ::1 算回环，其它一律不算', async () => {
+  const { isLoopbackProxy, proxyHostOf } = await import('../lib/core/updater.js')
+  assert.equal(proxyHostOf('http://127.0.0.1:7897'), '127.0.0.1')
+  assert.equal(proxyHostOf('localhost:7897'), 'localhost')
+  assert.equal(proxyHostOf('http://[::1]:7897'), '::1')
+
+  assert.equal(isLoopbackProxy('http://127.0.0.1:7897'), true)
+  assert.equal(isLoopbackProxy('http://localhost:7897'), true)
+  assert.equal(isLoopbackProxy('http://[::1]:7897'), true)
+  // ★ 非回环：绝不重试（绕过用户/公司的网络策略）
+  assert.equal(isLoopbackProxy('http://192.0.2.1:8080'), false)
+  assert.equal(isLoopbackProxy('http://10.0.0.5:8080'), false)
+  assert.equal(isLoopbackProxy('http://proxy.corp.example:8080'), false)
+  assert.equal(isLoopbackProxy(''), false)
+})
+
+test('超时（stderr 为空）不把「我们自己的命令行」显示给用户', async () => {
+  const { classifyFetchFailure, describeFetchFailure, isUninformativeDetail } =
+    await import('../lib/core/updater.js')
+  assert.equal(isUninformativeDetail(REAL_GIT_STDERR.TIMEOUT_KILLED), true,
+    '`Command failed: git …` 是我们自己的命令行，对用户没有信息量')
+  assert.equal(isUninformativeDetail(''), true)
+  assert.equal(isUninformativeDetail(REAL_GIT_STDERR.DNS_FAIL), false)
+
+  const info = classifyFetchFailure(REAL_GIT_STDERR.TIMEOUT_KILLED, 'http://127.0.0.1:7897')
+  const message = describeFetchFailure({
+    info,
+    proxyDetail: REAL_GIT_STDERR.TIMEOUT_KILLED,
+    timedOut: true,
+    timeoutMs: 30_000,
+  })
+  assert.ok(!/Command failed/.test(message), `别把命令行丢给用户：${message}`)
+  assert.match(message, /超时|未完成/, `要说清是超时，实际：${message}`)
+})
+
+test('★ stderr 为空但**不是**我们超时杀的 → 也不能把命令行/空串显示给用户', async () => {
+  // 这条是真·变异测试补出来的：上面那条走的是 `timedOut === true` 的分支，
+  // 而「原文没有信息量」的守卫在 `timedOut === false` 时才会用到。
+  // 两者是不同的失败形态：进程可能被系统信号杀掉、git 也可能崩掉而没吐 stderr，
+  // 那时 killed 未必为 true，但原文一样是空的或只有我们自己的命令行。
+  const { classifyFetchFailure, describeFetchFailure } = await import('../lib/core/updater.js')
+
+  for (const [label, detail] of [
+    ['只有我们自己的命令行', REAL_GIT_STDERR.TIMEOUT_KILLED],
+    ['空串', ''],
+    ['纯空白', '   '],
+  ]) {
+    const info = classifyFetchFailure(detail, 'http://127.0.0.1:7897')
+    const message = describeFetchFailure({
+      info,
+      proxyDetail: detail,
+      timedOut: false, // ← 关键：没被我们超时杀
+      timeoutMs: 30_000,
+    })
+    assert.ok(!/Command failed/.test(message), `${label}：不该显示我们自己的命令行，实际：${message}`)
+    assert.match(message, /原因未知|超时|未完成/, `${label}：要给一句人话，实际：${message}`)
+    assert.ok(message.trim() !== '拉取远端失败：', `${label}：不能只留个前缀，实际：${message}`)
+  }
+})
+
+// ── 重试直连：用注入的假 git 驱动完整分支（离线可跑，且能稳定造出两种局面）──
+
+/**
+ * 造一个「假 git」，**按参数**决定返回什么（不依赖调用顺序）。
+ *
+ * 用真实的 `__setGitRunnerForTest` 缝注入，所以走的是**生产代码的同一条路径**
+ * （`checkUpdate` 真跑一遍），而不是另写一个平行实现去自证。
+ *
+ * ⚠️ 早先按「调用顺序」回放，结果 `config --get` 这类额外调用会把序列错位，
+ * 测试变得极脆。改成按参数匹配后，只有 `fetch` 需要区分「第几次」
+ * （因为同一个参数要返回不同结果），所以它单独用 `onFetch` 计数。
+ */
+async function withFakeGit(script, run) {
+  const { __setGitRunnerForTest } = await import('../lib/core/updater.js')
+  const calls = []
+  let fetchCount = 0
+  const gitDefaults = {
+    isWorkTree: true,
+    branch: 'main',
+    remote: 'https://github.com/x/y.git',
+    /** `git config --get <key>` 的答案表；没有的键当「未设置」。 */
+    proxyConfig: {},
+    /** 每次 fetch 的结果（按顺序取，取完用最后一个）。 */
+    fetchResults: [{ ok: true, stdout: '', detail: '', timedOut: false }],
+    revList: '0',
+    remotePkg: JSON.stringify({ name: 'x', version: '0.1.0' }),
+  }
+  const config = { ...gitDefaults, ...script }
+  const restore = __setGitRunnerForTest(async (_cwd, args, timeoutMs) => {
+    const joined = args.join(' ')
+    calls.push({ args: [...args], timeoutMs })
+
+    if (joined.includes('rev-parse --is-inside-work-tree')) {
+      return { ok: true, stdout: config.isWorkTree ? 'true' : 'false', detail: '', timedOut: false }
+    }
+    if (joined.includes('rev-parse --abbrev-ref')) {
+      return { ok: true, stdout: config.branch, detail: '', timedOut: false }
+    }
+    if (joined.includes('remote get-url origin')) {
+      return { ok: true, stdout: config.remote, detail: '', timedOut: false }
+    }
+    if (joined.includes('config --get')) {
+      // 取键名（`config --get http.proxy`）
+      const key = args[args.indexOf('--get') + 1] ?? ''
+      const value = config.proxyConfig[key]
+      if (typeof value !== 'string' || value === '') {
+        return { ok: false, stdout: '', detail: 'not set', timedOut: false }
+      }
+      return { ok: true, stdout: value, detail: '', timedOut: false }
+    }
+    if (joined.includes('fetch')) {
+      const result = config.fetchResults[Math.min(fetchCount, config.fetchResults.length - 1)]
+      fetchCount += 1
+      return result
+    }
+    if (joined.includes('rev-list')) {
+      return { ok: true, stdout: config.revList, detail: '', timedOut: false }
+    }
+    if (joined.includes('show')) {
+      return { ok: true, stdout: config.remotePkg, detail: '', timedOut: false }
+    }
+    return { ok: true, stdout: '', detail: '', timedOut: false }
+  })
+  try {
+    return await run(calls)
+  } finally {
+    restore()
+  }
+}
+
+test('★ 回环代理 + 直连成功 → available 按直连算，且说明「已改用直连」', async () => {
+  await withFakeGit(
+    {
+      proxyConfig: { 'http.proxy': 'http://127.0.0.1:7897' },
+      fetchResults: [
+        // ① 走代理 → 失败（真实 stderr）
+        { ok: false, stdout: '', detail: REAL_GIT_STDERR.LOOPBACK_PROXY_DOWN, timedOut: false },
+        // ② 直连重试 → 成功
+        { ok: true, stdout: '', detail: '', timedOut: false },
+      ],
+      revList: '2',
+    },
+    async (calls) => {
+      const status = await checkUpdate('X:/fake')
+      assert.equal(status.supported, true)
+      assert.equal(status.behind, 2, '直连成功后，behind 应按直连结果算')
+      assert.equal(status.available, true, 'available 按直连结果算')
+      assert.match(status.message, /已改用直连/, `要说明用了直连，实际：${status.message}`)
+
+      // ★ 必须真的用「绕过代理」的参数重试过
+      const fetches = calls.filter((c) => c.args.includes('fetch'))
+      assert.equal(fetches.length, 2, '应当有两次 fetch（一次代理、一次直连）')
+      assert.ok(
+        !fetches[0].args.includes('-c'),
+        `第一次不该带覆盖参数：${fetches[0].args.join(' ')}`,
+      )
+      assert.ok(
+        fetches[1].args.includes('-c') && fetches[1].args.includes('http.proxy='),
+        `第二次必须用 -c http.proxy= 绕开代理：${fetches[1].args.join(' ')}`,
+      )
+      assert.ok(
+        fetches[1].timeoutMs <= 10_000,
+        `★ 直连重试必须用短超时（实测直连失败要 21 秒），实际 ${fetches[1].timeoutMs}ms`,
+      )
+    },
+  )
+})
+
+test('★ 回环代理 + 直连也失败 → message 同时说清两次尝试', async () => {
+  await withFakeGit(
+    {
+      proxyConfig: { 'http.proxy': 'http://127.0.0.1:7897' },
+      fetchResults: [
+        { ok: false, stdout: '', detail: REAL_GIT_STDERR.LOOPBACK_PROXY_DOWN, timedOut: false },
+        { ok: false, stdout: '', detail: REAL_GIT_STDERR.DIRECT_DOWN, timedOut: false },
+      ],
+    },
+    async () => {
+      const status = await checkUpdate('X:/fake')
+      assert.equal(status.available, false)
+      assert.match(status.message, /连不上代理/, `要说第一次（代理）失败：${status.message}`)
+      assert.match(status.message, /127\.0\.0\.1:7897/, `要含代理地址：${status.message}`)
+      assert.match(status.message, /改用直连也失败/, `★ 也要说第二次（直连）失败：${status.message}`)
+    },
+  )
+})
+
+test('★★ 非回环代理 → 绝不重试（只发一次 fetch，且不带绕过参数）', async () => {
+  await withFakeGit(
+    {
+      // 公司代理（非回环）
+      proxyConfig: { 'http.proxy': 'http://proxy.corp.example:8080' },
+      fetchResults: [
+        { ok: false, stdout: '', detail: REAL_GIT_STDERR.LOOPBACK_PROXY_DOWN, timedOut: false },
+      ],
+    },
+    async (calls) => {
+      await checkUpdate('X:/fake')
+      const fetches = calls.filter((c) => c.args.includes('fetch'))
+      assert.equal(fetches.length, 1, '★ 非回环代理只允许试一次 —— 重试等于绕过公司网络策略')
+      assert.ok(
+        !calls.some((c) => c.args.includes('http.proxy=')),
+        '★ 任何调用都不许带「绕过代理」参数',
+      )
+    },
+  )
+})
+
+test('认不出来（无 over proxy、无代理配置）→ 不重试，保留原文', async () => {
+  await withFakeGit(
+    {
+      proxyConfig: {},
+      fetchResults: [
+        { ok: false, stdout: '', detail: REAL_GIT_STDERR.DIRECT_DOWN, timedOut: false },
+      ],
+    },
+    async (calls) => {
+      const status = await checkUpdate('X:/fake')
+      const fetches = calls.filter((c) => c.args.includes('fetch'))
+      assert.equal(fetches.length, 1, '认不出来就不该重试')
+      // 保留原文（`shortenDetail` 会截断到适合设置页一行的长度，
+      // 所以断言开头那段能认出来的部分，而不是结尾）。
+      assert.match(status.message, /fatal: unable to access/, `保留原文：${status.message}`)
+      assert.match(status.message, /Failed to connect to github\.com/, `保留原文：${status.message}`)
+      // 但**不许**把它猜成代理问题
+      assert.ok(!/代理/.test(status.message), `别猜成代理问题：${status.message}`)
+      assert.ok(!/Clash/.test(status.message), `别猜成「代理没开」：${status.message}`)
+    },
+  )
+})
+
+test('代理地址现取：优先 http.proxy，取不到退回 https.proxy', async () => {
+  await withFakeGit(
+    {
+      // http.proxy 未设置，只有 https.proxy
+      proxyConfig: { 'https.proxy': 'http://127.0.0.1:8888' },
+      fetchResults: [
+        { ok: false, stdout: '', detail: REAL_GIT_STDERR.LOOPBACK_PROXY_DOWN, timedOut: false },
+        { ok: true, stdout: '', detail: '', timedOut: false },
+      ],
+      revList: '1',
+    },
+    async () => {
+      const status = await checkUpdate('X:/fake')
+      // 用的是 https.proxy 里那个地址，不是写死的 7897
+      assert.match(status.message, /127\.0\.0\.1:8888/, `应当用现取的 https.proxy：${status.message}`)
+    },
+  )
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10605 排队：解析排队码与 retryAfterSeconds（task-23）
+//
+// 用户报障：Qoder 回
+//   {"code":"10605","message":"{\"isQueued\":true,…,\"retryAfterSeconds\":30,…}"}
+// 而 `sse.ts` 把它硬编码成 `kind: 'server'` ⇒ `server` 在 DSH 的可重试码里
+// ⇒ **立刻白重试 5 次（≈15.5 秒）**，完全无视上游说的「等 30 秒」，最后把裸 JSON
+// 丢给用户。用户以为「DS 模型在 Qoder 是免费的」是错的 —— 他记得对，是**排队**，
+// 而 `subCode: RESOURCE_LIMIT` 这个名字误导人（它是**容量**限制，不是**额度**限制）。
+//
+// 每个用例都钉住一条「改前会静默错」的行为。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 报障报文里的**内层**排队体（一字不改）。 */
+const QUEUE_INNER = JSON.stringify({
+  isQueued: true,
+  modelKey: 'dfmodel',
+  queueCount: 0,
+  queueType: 'p3',
+  retryAfterSeconds: 30,
+  serviceAvailable: false,
+  subCode: 'RESOURCE_LIMIT',
+  waitTime: 30,
+})
+
+/** 取一个 SSE 负载的 error 事件（没有则 undefined）。 */
+function errorOf(payload) {
+  return translateChunk(typeof payload === 'string' ? payload : JSON.stringify(payload)).find((e) => e.type === 'error')
+}
+
+test('10605 排队：解析排队码与 retryAfterSeconds', () => {
+  // ★ 主用例：正是用户看到的那一帧（信封剥离后的形态）。
+  const event = errorOf({ code: '10605', message: QUEUE_INNER, type: 'model_error' })
+  assert.notEqual(event, undefined, '应当产出 error 事件')
+  const f = event.failure
+  assert.notEqual(f.kind, 'server', '排队绝不能归成 server —— 它在可重试码里，会白重试 5 次')
+  assert.equal(f.kind, 'rate_limit', '排队是「暂时被挡住」，语义就是 rate_limit')
+  assert.equal(f.retryAfterMs, 30000, '必须解析出 retryAfterSeconds×1000')
+  assert.equal(isRetryable('rate_limit'), true, '排队确实该重试')
+  assert.equal(shouldSwitchAccount('rate_limit'), true, '排队该换号再试（不该判死账号）')
+})
+
+test('10605 排队：延迟真的会进账号冷却（下游链路通了）', () => {
+  // 这条证明「解析出来」与「真的用上」是同一件事 —— 否则等于没修。
+  const f = errorOf({ code: '10605', message: QUEUE_INNER, type: 'model_error' }).failure
+  assert.equal(penaltyMsFor(f.kind, f.retryAfterMs, 300), 30000, '冷却应当等于上游要求的 30 秒')
+})
+
+test('10605 排队：文案是人话，且明确否定「额度」误读', () => {
+  // 用户因为 RESOURCE_LIMIT 这个名字去查了一次额度，别再让他查第二次。
+  const f = errorOf({ code: '10605', message: QUEUE_INNER, type: 'model_error' }).failure
+  assert.match(f.message, /排队/)
+  assert.match(f.message, /p3/)
+  assert.match(f.message, /30 秒/)
+  assert.ok(!f.message.includes('{'), '不能把裸 JSON 丢给用户')
+  assert.match(f.message, /不是你的额度用尽/, '必须明确否定额度误读')
+})
+
+test('10605 排队：排队字段在内层、外层没有 code → 仍能识别', () => {
+  // ⚠️ 这是参考实现第一版翻车的点：「必须命中 code 才算排队」会让这一形态
+  // 静默失效（探针显示 sleep 次数 = 0，错误照旧抛 server）。
+  const event = errorOf({ message: QUEUE_INNER, type: 'model_error' })
+  assert.equal(event?.failure.kind, 'rate_limit')
+  assert.equal(event?.failure.retryAfterMs, 30000)
+})
+
+test('10605 排队：数字编码的码值也要认（兼容字符串/数字）', () => {
+  const event = errorOf({ code: 10605, message: QUEUE_INNER, type: 'model_error' })
+  assert.equal(event?.failure.kind, 'rate_limit')
+  assert.equal(event?.failure.retryAfterMs, 30000)
+})
+
+test('10605 排队：retryAfterSeconds 为 0 → retryAfterMs 是 0（0 是合法值）', () => {
+  // ⚠️ 0 与 undefined 是两件事：前者是「立刻可重试」。falsy 判据会把它换成
+  // 默认冷却，让本可立刻重试的请求白等。
+  const inner = JSON.stringify({ isQueued: true, retryAfterSeconds: 0 })
+  const f = errorOf({ code: '10605', message: inner, type: 'model_error' }).failure
+  assert.equal(f.retryAfterMs, 0)
+  assert.notEqual(f.retryAfterMs, undefined)
+  assert.equal(penaltyMsFor(f.kind, f.retryAfterMs, 300), 0, '0 冷却 = 立刻可用')
+})
+
+test('10605 排队：延迟优先序 retry_after_ms → retryAfterMs → retryAfterSeconds', () => {
+  // 参考实现 kJa()/EV()/IRA() 的取证结论。
+  const a = errorOf({
+    code: '10605',
+    message: JSON.stringify({ isQueued: true, retry_after_ms: 2500, retryAfterMs: 7500, retryAfterSeconds: 30 }),
+    type: 'model_error',
+  }).failure
+  assert.equal(a.retryAfterMs, 2500, 'retry_after_ms 优先')
+
+  const b = errorOf({
+    code: '10605',
+    message: JSON.stringify({ isQueued: true, retryAfterMs: 7500, retryAfterSeconds: 30 }),
+    type: 'model_error',
+  }).failure
+  assert.equal(b.retryAfterMs, 7500, '其次是 retryAfterMs')
+
+  const c = errorOf({
+    code: '10605',
+    message: JSON.stringify({ isQueued: true, retryAfterSeconds: 4 }),
+    type: 'model_error',
+  }).failure
+  assert.equal(c.retryAfterMs, 4000, '最后才是 retryAfterSeconds')
+})
+
+test('10605 排队：瞬时排队（isQueued:false + serviceAvailable:true）也要认', () => {
+  // ⚠️ 不能要求 isQueued === true：服务端「可立即处理」时实测就是这个形态
+  //（用户报告「一次重试就能成功」）。参考实现写单测时实测到了这条
+  //（期望 2000ms 实际 1000ms）。
+  const inner = JSON.stringify({ isQueued: false, serviceAvailable: true, waitTime: 0, retryAfterSeconds: 2 })
+  const f = errorOf({ code: '10605', message: inner, type: 'model_error' }).failure
+  assert.equal(f.kind, 'rate_limit')
+  assert.equal(f.retryAfterMs, 2000, '必须取到 2000ms，不能退到兜底 1 秒')
+})
+
+test('10605 排队：解析器能吃 data/result 嵌套（递归展开）', () => {
+  // ⚠️ 注意这是**解析器层**的断言，不是 translateChunk 层：
+  // `translateChunk` 的 model_error 分支要求**顶层** `parsed.message` 是字符串
+  // 才进得来（那是它识别「网关形态错误帧」的既有判据），所以纯嵌套形状
+  // 根本不会走到分类器 —— 这一点单独有一条用例钉住。
+  const info = parseQueueError({ data: { result: { code: '10605', message: QUEUE_INNER } } })
+  assert.equal(info?.retryAfterSeconds, 30)
+  assert.equal(info?.queueType, 'p3')
+  assert.equal(queueDelayMs(info), 30000)
+})
+
+test('10605 排队：顶层 message 是字符串时才进 model_error 分支（既有判据不变）', () => {
+  // 钉住「不改坏既有行为」：纯嵌套（顶层没有 message 字符串）不是这个分支的形态，
+  // 它本来就被别处处理（或就是合法空帧）。这里如实断言**现状**，
+  // 而不是假装分类器管得着。
+  const events = translateChunk(JSON.stringify({ data: { result: { code: '10605', message: QUEUE_INNER } }, type: 'model_error' }))
+  assert.equal(events.length, 0, '纯嵌套不进 model_error 分支 —— 这是既有判据，本次不改动它')
+})
+
+test('10605 排队：延迟封顶，畸形的大值不会把账号锁死', () => {
+  const inner = JSON.stringify({ isQueued: true, retryAfterSeconds: 86400 })
+  const f = errorOf({ code: '10605', message: inner, type: 'model_error' }).failure
+  assert.equal(f.retryAfterMs, QUEUE_MAX_DELAY_MS, '要封顶到 QUEUE_MAX_DELAY_MS')
+  assert.ok(f.retryAfterMs <= RETRY_AFTER_CAP_MS, '且不超过全局封顶')
+})
+
+test('10605 排队：负值/非有限值判无效，不当成 0（避免忙循环）', () => {
+  for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const inner = JSON.stringify({ isQueued: true, retryAfterSeconds: bad })
+    const f = errorOf({ code: '10605', message: inner, type: 'model_error' }).failure
+    assert.equal(f.kind, 'rate_limit', '仍然是排队')
+    assert.equal(f.retryAfterMs, undefined, `${bad} 应判无效而不是 0`)
+  }
+})
+
+test('10605 排队：parseQueueError 的入参两种形态都吃', () => {
+  const outer = parseQueueError({ code: '10605', message: QUEUE_INNER })
+  assert.equal(outer?.retryAfterSeconds, 30)
+  assert.equal(outer?.queueType, 'p3')
+  const inner = parseQueueError(QUEUE_INNER)
+  assert.equal(inner?.retryAfterSeconds, 30, '内层（没有 code）也要能解析出字段')
+  assert.equal(inner?.isQueued, true)
+  // 不是排队的一律 undefined，不能误判。
+  assert.equal(parseQueueError({ code: '400', message: 'boom' }), undefined)
+  assert.equal(parseQueueError('不是 JSON'), undefined)
+  assert.equal(parseQueueError(null), undefined)
+  assert.equal(parseQueueError(undefined), undefined)
+})
+
+test('普通 model_error 仍然归 server（不能误伤）', () => {
+  // 已有用例依赖这个行为（「不认它就会静默成功」那一段）。回归守住。
+  const f = errorOf({
+    code: '400',
+    message: '[FAIL]node:oa_qwen-plus-main msg:Execution failed: null',
+    statusCodeValue: 400,
+    statusCode: 'BAD_REQUEST',
+    type: 'model_error',
+  }).failure
+  assert.equal(f.kind, 'server')
+  assert.equal(f.retryAfterMs, undefined)
+  assert.equal(f.status, 400)
+  assert.match(f.message, /Execution failed/)
+})
+
+test('普通 model_error（无 statusCodeValue、只有 stackTrace）仍是 server', () => {
+  const f = errorOf({ message: 'boom', stackTrace: 'at x', type: 'model_error' }).failure
+  assert.equal(f.kind, 'server')
+  assert.match(f.message, /boom/)
+})
+
+test('OpenAI 标准 error 字段分支也走同一份分类（不能只修一处）', () => {
+  // ⚠️ translateChunk 有两个错误分支，排队识别只补一个就会漏掉另一个 ——
+  // 参考实现第一版正是这么翻车的（只修 HTTP 通道，SSE 通道静默失效）。
+  const queued = errorOf({ error: { message: 'too many', code: '10605' } })
+  assert.notEqual(queued, undefined, 'error 分支应当仍然产出事件')
+  // 这条形态下排队参数不在体里，退到 server 是可接受的；
+  // 但若体里带了排队内层，就必须识别出来。
+  const withQueue = errorOf({ error: { message: QUEUE_INNER } })
+  assert.equal(withQueue?.failure.kind, 'rate_limit', 'error 分支也要认排队')
+  assert.equal(withQueue?.failure.retryAfterMs, 30000)
+})
+
+test('业务码 110（当天额度耗尽）→ quota，不可重试', () => {
+  // ⚠️ 它原先也是 server ⇒ 白重试 5 次（≈15.5 秒），而**等多久结果都一样**，
+  // 那是纯损失。参考实现记录过同一个坑。
+  const f = errorOf({ code: '110', message: 'Billing daily count exceeded', type: 'model_error' }).failure
+  assert.equal(f.kind, 'quota')
+  assert.equal(isRetryable('quota'), false, 'quota 不可重试 —— 这正是修复的目的')
+  assert.match(f.message, /额度/)
+  // 冷却应当是「当日」量级，不是几分钟。
+  assert.equal(penaltyMsFor(f.kind, f.retryAfterMs, 300), QUOTA_COOLDOWN_MS)
+})
+
+test('额度文案兜底：码值不是 110 但文案命中也要认', () => {
+  // 参考实现取证：110 这个码值在客户端产物里**没有硬编码**，说明它由服务端下发；
+  // 上游哪天换码值，只认码就会漏判。
+  for (const text of ['Billing daily count exceeded', 'billing_error', 'daily count exceeded']) {
+    const f = errorOf({ code: '9999', message: text, type: 'model_error' }).failure
+    assert.equal(f.kind, 'quota', `${text} 应判 quota`)
+  }
+})
+
+test('额度判据不能误伤正常内容（关键词必须窄）', () => {
+  // 模型正文里讨论「余额」是常见的，泛词会误伤。
+  const f = errorOf({ code: '400', message: '请问我的余额还有多少？', statusCodeValue: 400, type: 'model_error' }).failure
+  assert.equal(f.kind, 'server', '普通业务错误不该被说成额度耗尽')
+  const g = errorOf({ message: 'quota related documentation', type: 'model_error' }).failure
+  assert.equal(g.kind, 'server', 'quota 这个泛词不能当判据')
+})
+
+test('排队与额度互不干扰（同一份体只能命中一个）', () => {
+  const queued = { code: '10605', message: QUEUE_INNER }
+  assert.notEqual(parseQueueError(queued), undefined)
+  assert.equal(isBillingErrorBody(queued), false, '排队体不能被判成额度')
+  const billing = { code: '110', message: 'Billing daily count exceeded' }
+  assert.equal(parseQueueError(billing), undefined, '额度体不能被判成排队')
+  assert.equal(isBillingErrorBody(billing), true)
+})
+
+test('10605 排队：端到端走 Qoder 信封层（真实链路的形态）', async () => {
+  // ⚠️ 这条最有价值：证明「上游原始 SSE 帧 → 信封剥离 → sse.ts」整条链
+  // 真的产出 rate_limit + 30000，而不是只有绕过信封层时才正确。
+  const upstreamFrame = {
+    headers: {},
+    body: JSON.stringify({ code: '10605', message: QUEUE_INNER, subCode: 'RESOURCE_LIMIT' }),
+    statusCodeValue: 200,
+    statusCode: 'OK',
+  }
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(upstreamFrame)}\n\n`))
+      controller.close()
+    },
+  })
+  const text = await unwrapQoderEnvelopeStream(new Response(stream), 'qoder').text()
+  const inner = text.trim().replace(/^data:\s*/, '')
+  // 信封层必须保真带上 code（丢掉它排队就永远命中不了）。
+  assert.match(inner, /"code":"10605"/, '信封层必须保留顶层 code')
+  const f = errorOf(inner).failure
+  assert.equal(f.kind, 'rate_limit')
+  assert.equal(f.retryAfterMs, 30000)
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 排队延迟：Retry-After 响应头兜底（优先序第 4 档）+ iterateSse 端到端
+//
+// 参考实现取证的四档优先序：`retry_after_ms` → `retryAfterMs`
+// → `retryAfterSeconds × 1000` → `Retry-After` 响应头。
+// 前三档在体内，第 4 档在 `Response` 上 —— 少了它，一个「只说了排队、
+// 没说等多久」的响应会丢掉服务端已经写明的时长。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 造一个 SSE 响应（可选带头部）。 */
+function sseResponseOf(frames, headers = {}) {
+  const body = frames.map((f) => `data: ${typeof f === 'string' ? f : JSON.stringify(f)}\n\n`).join('')
+  return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream', ...headers } })
+}
+
+/** 从 iterateSse 里取第一个 error 事件的 failure。 */
+async function firstSseError(response) {
+  for await (const event of iterateSse(response)) {
+    if (event.type === 'error') return event.failure
+  }
+  return undefined
+}
+
+const QUEUE_NO_DELAY = JSON.stringify({ isQueued: true, queueType: 'p3', serviceAvailable: false })
+
+test('排队延迟：Retry-After 响应头兜底（优先序第 4 档）', async () => {
+  const f = await firstSseError(
+    sseResponseOf([{ code: '10605', message: QUEUE_NO_DELAY, type: 'model_error' }], { 'retry-after': '7' }),
+  )
+  assert.equal(f?.kind, 'rate_limit')
+  assert.equal(f?.retryAfterMs, 7000, '体内没给延迟时，应当取响应头')
+})
+
+test('排队延迟：四档优先序，体内一律压过响应头', async () => {
+  const withHeader = { 'retry-after': '99' }
+  const cases = [
+    [{ isQueued: true, retry_after_ms: 1500 }, 1500, 'retry_after_ms'],
+    [{ isQueued: true, retryAfterMs: 2500 }, 2500, 'retryAfterMs'],
+    [{ isQueued: true, retryAfterSeconds: 4 }, 4000, 'retryAfterSeconds'],
+  ]
+  for (const [inner, expected, label] of cases) {
+    const f = await firstSseError(
+      sseResponseOf([{ code: '10605', message: JSON.stringify(inner), type: 'model_error' }], withHeader),
+    )
+    assert.equal(f?.retryAfterMs, expected, `${label} 应当压过响应头的 99 秒`)
+  }
+})
+
+test('排队延迟：四档都没有 → undefined（交上层退避，不是假装 0）', async () => {
+  const f = await firstSseError(sseResponseOf([{ code: '10605', message: QUEUE_NO_DELAY, type: 'model_error' }]))
+  assert.equal(f?.retryAfterMs, undefined)
+})
+
+test('排队延迟：响应头是 HTTP-date 也能解析', async () => {
+  const future = new Date(Date.now() + 90_000).toUTCString()
+  const f = await firstSseError(
+    sseResponseOf([{ code: '10605', message: QUEUE_NO_DELAY, type: 'model_error' }], { 'retry-after': future }),
+  )
+  assert.ok(f?.retryAfterMs > 80_000 && f?.retryAfterMs <= 90_000, `实得 ${f?.retryAfterMs}`)
+})
+
+test('排队延迟：畸形的响应头（负数）判无效，不当成「立即解除」', async () => {
+  // ⚠️ 这条是 parseRetryAfter 那个缺陷在 SSE 路径上的回归：
+  // `Date.parse('-5')` 是合法的（被当 ISO 年份），Math.max(0,…) 会把它抹成 0
+  // = 「立即解除」⇒ 刚被限流的账号马上被重选。
+  const f = await firstSseError(
+    sseResponseOf([{ code: '10605', message: QUEUE_NO_DELAY, type: 'model_error' }], { 'retry-after': '-5' }),
+  )
+  assert.equal(f?.retryAfterMs, undefined)
+})
+
+test('排队延迟：非排队错误不借用响应头的延迟（不能误伤）', async () => {
+  const f = await firstSseError(
+    sseResponseOf(
+      [{ code: '400', message: 'boom', statusCodeValue: 400, type: 'model_error' }],
+      { 'retry-after': '99' },
+    ),
+  )
+  assert.equal(f?.kind, 'server')
+  assert.equal(f?.retryAfterMs, undefined, '普通错误不该被塞进排队延迟')
+})
+
+test('排队端到端：iterateSse 从真实 SSE 流里产出 rate_limit + 延迟', async () => {
+  // 这条把「字节流 → SSE 解码 → 分类」整条串起来，证明不是只有直接调
+  // translateChunk 才对。
+  const inner = JSON.stringify({ isQueued: true, queueType: 'p3', retryAfterSeconds: 30, serviceAvailable: false })
+  const response = sseResponseOf([
+    { code: '10605', message: inner, type: 'model_error' },
+    '[DONE]',
+  ])
+  const f = await firstSseError(response)
+  assert.equal(f?.kind, 'rate_limit')
+  assert.equal(f?.retryAfterMs, 30000)
+  assert.match(f?.message ?? '', /排队/)
+})
+
+test('排队端到端：跨 chunk 切分的一帧也能识别（SSE 缓冲回归）', async () => {
+  // 一个 SSE 事件被 TCP 切成两段是常态，切成两段后仍必须识别出排队。
+  const inner = JSON.stringify({ isQueued: true, retryAfterSeconds: 30 })
+  const frame = `data: ${JSON.stringify({ code: '10605', message: inner, type: 'model_error' })}\n\n`
+  const half = Math.floor(frame.length / 2)
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(frame.slice(0, half)))
+      controller.enqueue(new TextEncoder().encode(frame.slice(half)))
+      controller.close()
+    },
+  })
+  const f = await firstSseError(new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+  assert.equal(f?.kind, 'rate_limit')
+  assert.equal(f?.retryAfterMs, 30000)
 })

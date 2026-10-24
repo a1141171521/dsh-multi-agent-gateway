@@ -572,6 +572,92 @@ schema 默认值，**必须重启 DSH 才会加载**。所以仍按「未修好�
 
 ---
 
+## 🟡 #0s 账号删光后平台仍留在模型选择器里（2026-10-21，已修待真机）
+
+> 用户原话：「当某个平台的账号被全部移除后，则在对话框的模型选择列表中，
+> 不要再显示该平台的模型」
+
+### 现场（Lead 复现，本机当时恰好 0 个账号）
+
+```
+opencode         账号=0  活跃=true  进选择器=true     ← 这个是对的（免账号通道）
+qoder            账号=0  活跃=true  进选择器=true     ← ✗
+qoder-cn         账号=0  活跃=true  进选择器=true     ← ✗
+workbuddy        账号=0  活跃=true  进选择器=true     ← ✗
+workbuddy-intl   账号=0  活跃=true  进选择器=true     ← ✗
+```
+
+### 两个根因，**缺一个就只是「半修」**
+
+**A. 判据里根本没有「有没有账号」这一条。**
+`isAgentActive()` 只看 `enabled && visible`；`exposedAgentIds()` 只看它 + `exposeModels`，
+而 `allModels()`（上报给 DSH 的那份）就是靠它拼的 ⇒ 零账号的平台照样上报。
+
+**B. 删账号不会通知 DSH 重读模型目录。**
+`removeAccount()` 只调 `refreshSchedule()`（那只重建定时任务）。
+DSH 的下拉**只在收到 `llm/adapters-updated` 时**才重读，而那个事件原先**只由改配置那条路**踢。
+⇒ 就算修好 A，用户删完账号**不重启还是看到旧清单**。
+
+### 修法
+
+- **A**：新增纯函数 `accountGateDecision({ accountFree, routableAccounts })`
+  → `{ exposed, reason }`，以及 `agentAccountGate()` / `isAgentExposed()`。
+  `exposedAgentIds()` 与 `index.ts` 的 `registerRoutes()` **读同一个判据**，
+  所以「选择器里不显示了」与「路由真被摘掉」必然同步 ——
+  两处各写一套过滤会出现「分组没了、路由还挂着」的错位。
+- **B**：runtime 加 `setAccountsChangedHook()`（与既有 `setDirtyHook` 同款，避免 runtime→index 成环）；
+  `index.ts` 注册的回调执行 `registerRoutes() → notifyModelsChanged()`。
+  **顺序不能反**（先决定该有哪些路由，再通知宿主重读）。
+  4 处账号写操作（增 / 改 / 删 / OAuth 登录建号）全走它。
+  回调抛错**不影响账号操作本身**（账号已删，不该因为通知 UI 失败而报错），只记日志。
+
+### ⚠️ 三条不能违反的设计约束
+
+**1. 免账号平台必须保留。** `opencode` 零账号也能用（匿名免费层，README 的「Free Token」），
+一起砍掉就把主场景弄没了。判据落在**适配器声明的 `capabilities.accountFree`** 上
+（唯一 `opencode` 声明 `true`），**不是写死平台名数组** ——
+客户端已有一份 `FREE_ONLY` 硬编码，宿主侧再复制一份迟早漂移。
+缺省（不声明）= **必须有账号**：新平台忘了声明只会「少显示一个分组」（看得见、好修），
+不会静默上报一堆调不动的模型。
+
+> 曾考虑复用 `upstream.freeTierMode`，**实测否掉**：六个平台解析出来**全都是 undefined**
+> （生产 schema 默认 `'auto'` ⇒ 所有平台都会被判成免账号，等于没修）；
+> 且它是**用户可改的配置项**，拿它当结构判据会让「用户设成 never」意外抹掉平台。
+
+**2. 账号门不能并进 `isAgentActive()`。**
+该函数还被 `snapshotRouting().active` 与 `snapshotState().agents[].enabled` 用着，
+而客户端把 `enabled === false` 渲染成**「已停用」**、另有专门的**「未配置」**文案
+（`client.js:2063-2067`）。并进去 ⇒ 「你没配账号」会被误报成「你关掉了这个平台」。
+所以拆成两个判据：`isAgentActive()` = **配置语义**（保持原样、继续喂 UI），
+`isAgentExposed()` = **上报语义**（配置 + 账号门，只喂选择器/路由）。
+
+**3. 「有没有账号」用 `routable()` 口径**（`enabled && routeChat !== false`），不是 `byAgent()`。
+问题等价于「用户从这个分组挑个模型，发出去能成吗」——
+`routable()` 就是路由器自己的候选口径，两处一致才不会出现
+「看得见、点了必然报没有可用账号」。代价（可逆且看得见）：
+**停用账号**或**关掉对话路由**也会让分组消失，但账号记录仍在账号页，用户能立刻改回来。
+
+### 顺手修掉一个会以新形式复发的旧 bug
+
+`exposedCount` 的注释写着「**实际会进 DSH 选择器**的模型数」，并记录了历史 bug
+（「显示 22 个模型进选择器、下拉里空空如也」）。账号门会让它**以新形式复发**
+（显示 N 个、下拉一个没有），所以让它也过 `isAgentExposed()`（被门掉时返回 0）。
+**`modelCount` 故意不动** —— 它的语义是「上游拉回来多少个」，与是否上报无关。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 真实零账号现场（`.scratch/verify-account-gate.mjs`） | ✅ 只剩 `opencode`（`reason=account-free`） |
+| 完整周期「加号 → 出现 → 删光 → 消失 → 再加 → 又出现」（`.scratch/verify-account-gate-cycle.mjs`） | ✅ 全过 |
+| 边界：停用账号 / 关掉对话路由 / 设置页仍列出该平台 | ✅ 全过 |
+| 新增用例 | ✅ `test/account-gate.test.mjs` **22 条** |
+| 全量回归 | ✅ **500 宿主 + 63 客户端 + 冒烟** |
+| **变异测试** | ✅ 4 个变异体：去掉账号门 → 16 条失败；**天真写法「零账号就砍」→ 9 条失败**（证明「免账号保留」不是白过的）；A/B 各自失效 → 恰好对应 3 条失败 |
+| 真机确认「DSH 下拉真的刷新了」 | ⏳ 需装上去点一次（根因 B 的测试用的是假 `registerAdapter`） |
+
+---
+
 ## 🟢 #0r WorkBuddy 的思考档位：19 个模型被我们吃掉（2026-10-20，已修并真机验证）
 
 > 用户问：「为什么 workbuddy 的 deepseek 模型不能调整思考等级呢？ qoder 的就可以呢」

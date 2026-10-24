@@ -311,7 +311,7 @@ export function qoderChatHeaders(
     'Content-Type': 'application/json',
     'X-Request-ID': requestId,
     'X-Session-ID': sessionId,
-    'User-Agent': `${product.userAgentPrefix}/1.0.0`,
+    'User-Agent': `${product.userAgentPrefix}/${product.clientVersion}`,
   }
 }
 

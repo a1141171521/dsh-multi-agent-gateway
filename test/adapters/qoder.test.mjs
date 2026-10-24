@@ -1069,3 +1069,329 @@ test('Qoder：过滤只影响上报列表，不影响其它路径（未登录仍
   }
 })
 
+
+// ───────────────────── 工具调用：tools 下发 与 工具历史往返 ─────────────────────
+//
+// 背景（2026-10-24 用户真机报障）：用 Qoder 跑任务，输出是一堆裸的
+// `<｜｜DSML｜｜ invoke name="bash">` 标记，**任务实际什么都没执行**。
+// 根因是适配器从来不下发 `tools` —— 探针实测模型自己说
+// 「I don't see any tools listed in my available functions」，
+// 于是它只能从训练里臆造工具调用格式、写进正文。
+//
+// 参考实现把这类问题记成「本文件第三个同型缺陷」：tools 不下发、
+// 工具历史丢 tool_calls、tool_call_id 被丢 —— 三者要一起想。
+
+test('buildQoderTools：OpenAI 形状 → 加密端点的 tools[]', async () => {
+  const { buildQoderTools } = await import('../../lib/adapters/qoder.js')
+  const tools = buildQoderTools([
+    {
+      type: 'function',
+      function: {
+        name: 'bash',
+        description: 'Run a shell command.',
+        parameters: { type: 'object', properties: { command: { type: 'string' } } },
+      },
+    },
+  ])
+  assert.equal(tools.length, 1)
+  assert.equal(tools[0].type, 'function')
+  assert.equal(tools[0].function.name, 'bash')
+  assert.equal(tools[0].function.description, 'Run a shell command.')
+  assert.deepEqual(tools[0].function.parameters, {
+    type: 'object',
+    properties: { command: { type: 'string' } },
+  })
+})
+
+test('buildQoderTools：description / parameters 缺省时**该键不出现**（不是空串/空对象）', async () => {
+  const { buildQoderTools } = await import('../../lib/adapters/qoder.js')
+  const tools = buildQoderTools([{ type: 'function', function: { name: 'noargs', description: '' } }])
+  assert.equal(tools.length, 1)
+  assert.equal(tools[0].function.name, 'noargs')
+  // 空 description 不该变成 ''，缺失的 parameters 不该变成 {}
+  assert.equal('description' in tools[0].function, false, '空 description 不该写进请求体')
+  assert.equal('parameters' in tools[0].function, false, '缺省 parameters 不该写进请求体')
+})
+
+test('buildQoderTools：非数组 / 空数组 / 畸形条目都不抛错，且不产出垃圾工具', async () => {
+  const { buildQoderTools } = await import('../../lib/adapters/qoder.js')
+  assert.deepEqual(buildQoderTools(undefined), [])
+  assert.deepEqual(buildQoderTools(null), [])
+  assert.deepEqual(buildQoderTools([]), [])
+  assert.deepEqual(buildQoderTools('bash'), [], '字符串不是工具列表')
+  // 没有 function.name 的条目必须被跳过 —— 发一个无名工具给上游只会让它困惑
+  assert.deepEqual(buildQoderTools([{ type: 'function', function: {} }, { nope: 1 }, 42]), [])
+})
+
+test('toInferHistory：assistant 只带 tool_calls（content 为 null）时消息必须保留', async () => {
+  const { toInferHistory } = await import('../../lib/adapters/qoder.js')
+  const { history } = toInferHistory([
+    { role: 'user', content: '列目录' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        { id: 'call_1', type: 'function', function: { name: 'bash', arguments: '{"command":"ls"}' } },
+      ],
+    },
+  ])
+  assert.equal(history.length, 2, 'content 为 null 的 assistant 消息不能被当成空消息丢掉')
+  const assistant = history[1]
+  assert.equal(assistant.role, 'assistant')
+  assert.equal(assistant.content, '', 'null 要退化成空串（客户端 content 恒为字符串）')
+  assert.equal(Array.isArray(assistant.tool_calls), true)
+  assert.equal(assistant.tool_calls.length, 1)
+  assert.equal(assistant.tool_calls[0].function.name, 'bash')
+})
+
+test('toInferHistory：role:tool 的 tool_call_id 必须保留（否则工具结果无法配对）', async () => {
+  const { toInferHistory } = await import('../../lib/adapters/qoder.js')
+  const { history } = toInferHistory([
+    { role: 'user', content: '列目录' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'bash', arguments: '{}' } }],
+    },
+    { role: 'tool', content: 'file-a\nfile-b', tool_call_id: 'call_1' },
+  ])
+  assert.equal(history.length, 3)
+  assert.equal(history[2].role, 'tool')
+  assert.equal(history[2].tool_call_id, 'call_1', '丢了它模型就不知道这是哪次调用的结果')
+  assert.equal(history[2].content, 'file-a\nfile-b')
+})
+
+test('toInferHistory：纯文本仍走字符串形态（不因多模态支持而全改成数组）', async () => {
+  const { toInferHistory } = await import('../../lib/adapters/qoder.js')
+  const { history, userText, systemText } = toInferHistory([
+    { role: 'system', content: '你是助手' },
+    { role: 'user', content: '你好' },
+  ])
+  assert.equal(systemText, '你是助手')
+  assert.equal(userText, '你好', 'userText 取最后一条 user 消息的文本')
+  assert.equal(history.length, 1, 'system 单独抽出去，不进 history')
+  assert.equal(typeof history[0].content, 'string', '纯文本必须是字符串')
+})
+
+test('toInferHistory：带图消息保留 content 数组（否则图片在下游静默消失）', async () => {
+  const { toInferHistory } = await import('../../lib/adapters/qoder.js')
+  const { history } = toInferHistory([
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: '这是什么' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+      ],
+    },
+  ])
+  assert.equal(history.length, 1)
+  assert.equal(Array.isArray(history[0].content), true, '有图时必须保留数组形态')
+  const parts = history[0].content
+  assert.equal(parts.length, 2)
+  assert.deepEqual(parts[1], { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } })
+})
+
+test('toInferHistory：只有文字的多模态数组降级成字符串；真·空消息被跳过', async () => {
+  const { toInferHistory } = await import('../../lib/adapters/qoder.js')
+  const onlyText = toInferHistory([
+    { role: 'user', content: [{ type: 'text', text: '拼' }, { type: 'text', text: '起来' }] },
+  ])
+  assert.equal(typeof onlyText.history[0].content, 'string', '无图时降级为字符串')
+  assert.equal(onlyText.history[0].content, '拼起来')
+
+  const withEmpty = toInferHistory([
+    { role: 'user', content: '正常' },
+    { role: 'assistant', content: '' },
+  ])
+  assert.equal(withEmpty.history.length, 1, '三者皆空的消息要跳过')
+})
+
+// ═══════════ 客户端指纹对齐（task-22）═══════════
+//
+// 用户要求：「用 rea 分析官方客户端发的请求和我们反代的差异，改插件避免被风控」。
+// 反混淆官方 CN IDE 的 `extensions/aicoding-agent/dist/extension.js`
+// （`ChatIntegration.chatAsk`）后确认了三处差异，逐条钉在下面。
+//
+// ⚠️ 真机验证记录（2026-10-24，本机 qoder-cn 真实账号）：
+//   probe-dsml.mjs    → ✓ finish: tool_calls、12 个 tool_call 事件
+//   probe-tool-roundtrip.mjs → ✓ 多轮往返成立（第 1 轮 16 个事件、第 2 轮正文 33 字）
+//   即 `is_reply` 从恒 true 改成按轮次之后，上游行为**没有变坏**（无需回退）。
+
+test('★ 指纹：session_id 由会话内容派生 —— 同会话相同、异会话不同', async () => {
+  const { qoderSessionIdOf } = await import('../../lib/adapters/qoder.js')
+
+  const first = [
+    { role: 'system', content: '你是助手' },
+    { role: 'user', content: '你好' },
+  ]
+  const a = qoderSessionIdOf(first, 'dfmodel')
+  const b = qoderSessionIdOf(first, 'dfmodel')
+  assert.equal(a, b, '★ 同一段对话必须得到同一个 id（官方 sessionId 是整段会话复用的）')
+
+  // UUID 形状：官方这个字段是 UUID，不能塞一串 hex
+  assert.match(a, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, '必须是 v4 形状的 UUID')
+
+  // 异会话 → 必须不同
+  const other = qoderSessionIdOf([{ role: 'user', content: '换一个完全不同的话题' }], 'dfmodel')
+  assert.notEqual(a, other, '★ 首条 user 不同 ⇒ 不同会话，id 必须不同')
+
+  // 多轮续聊（追加 assistant/user）→ 仍然同一个（种子始终是**第一条** user）
+  const round2 = [...first, { role: 'assistant', content: '你好呀' }, { role: 'user', content: '继续' }]
+  assert.equal(qoderSessionIdOf(round2, 'dfmodel'), a, '★ 续聊必须复用同一个 id，否则等于每轮换会话')
+})
+
+test('★ 指纹：session_id 派生不含时间/随机 —— 同输入跨"时刻"必须一致', async () => {
+  const { qoderSessionIdOf } = await import('../../lib/adapters/qoder.js')
+  const messages = [{ role: 'user', content: '固定输入' }]
+  // 连续算 200 次，必须**全部**相同。若派生掺了时间或随机，这里必挂。
+  const ids = new Set()
+  for (let i = 0; i < 200; i += 1) ids.add(qoderSessionIdOf(messages, 'dfmodel'))
+  assert.equal(ids.size, 1, '★ 派生必须纯确定性（只有会话内容参与），不能掺时间/随机')
+})
+
+test('★ 指纹：payload 的 session_id 默认也是确定性的（不传 sessionId 也不随机）', async () => {
+  const { buildQoderInferPayload } = await import('../../lib/vendor/qoder/qoder-wasm.js')
+  const ask = {
+    modelKey: 'dfmodel',
+    userText: '你好',
+    history: [{ role: 'user', content: '你好' }],
+  }
+  const a = buildQoderInferPayload(ask, 'fixed-request-id')
+  const b = buildQoderInferPayload(ask, 'fixed-request-id')
+  // ⚠️ 这条守的是一个真实的坑：早先兜底用 `crypto.randomUUID()`，
+  // 于是「任何忘记传 sessionId 的调用方」都会静默退回随机、缺陷原样复发
+  // （实测撞到过：probe-payload.mjs 不传 sessionId，一度仍报 CHANGED）。
+  assert.equal(a.session_id, b.session_id, '★ 省略 sessionId 时兜底也必须是确定性的')
+
+  const other = buildQoderInferPayload({ ...ask, userText: '别的话题', history: [{ role: 'user', content: '别的话题' }] }, 'fixed-request-id')
+  assert.notEqual(a.session_id, other.session_id, '不同会话仍要不同')
+  assert.match(String(a.session_id), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+})
+
+test('★ 指纹：显式传入的 sessionId 必须被原样采用（上层派生结果优先）', async () => {
+  const { buildQoderInferPayload } = await import('../../lib/vendor/qoder/qoder-wasm.js')
+  const fixed = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+  const payload = buildQoderInferPayload(
+    { modelKey: 'dfmodel', userText: 'x', history: [{ role: 'user', content: 'x' }], sessionId: fixed },
+    'fixed-request-id',
+  )
+  assert.equal(payload.session_id, fixed, '传了就用传的 —— 否则适配器的派生等于没生效')
+})
+
+test('★ 指纹：is_reply 按轮次（官方默认 false，首轮必须是 false）', async () => {
+  const { qoderIsReplyOf } = await import('../../lib/adapters/qoder.js')
+
+  // 首轮：没有 assistant / tool
+  assert.equal(qoderIsReplyOf([{ role: 'user', content: '你好' }]), false, '★ 首轮必须是 false')
+  assert.equal(
+    qoderIsReplyOf([{ role: 'system', content: 's' }, { role: 'user', content: '你好' }]),
+    false,
+    'system 不算「回复过」',
+  )
+  // 连续追问两条 user 在语义上仍是**首轮发起**
+  assert.equal(
+    qoderIsReplyOf([{ role: 'user', content: 'a' }, { role: 'user', content: 'b' }]),
+    false,
+    '只有 user 消息时仍算首轮',
+  )
+
+  // 续轮：出现过 assistant 或 tool
+  assert.equal(
+    qoderIsReplyOf([{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }]),
+    true,
+    '★ 有 assistant ⇒ 是在续',
+  )
+  assert.equal(
+    qoderIsReplyOf([{ role: 'user', content: 'a' }, { role: 'tool', content: 'r', tool_call_id: 't' }]),
+    true,
+    '★ 有 tool 结果 ⇒ 是在续（工具往返的下一轮）',
+  )
+})
+
+test('★ 指纹：payload 的 is_reply 默认 false（改前恒 true）', async () => {
+  const { buildQoderInferPayload } = await import('../../lib/vendor/qoder/qoder-wasm.js')
+  const base = { modelKey: 'dfmodel', userText: '你好', history: [{ role: 'user', content: '你好' }] }
+  // 默认 = 官方默认值 false
+  assert.equal(buildQoderInferPayload(base, 'r').is_reply, false, '★ 默认必须是 false（官方 `A = !1`）')
+  // 显式传 true 才为 true
+  assert.equal(buildQoderInferPayload({ ...base, isReply: true }, 'r').is_reply, true)
+})
+
+test('★ 指纹：UA 版本不再写死 1.0.0，取产品上的 clientVersion', async () => {
+  const { QODER, QODER_CN } = await import('../../lib/vendor/qoder/qoder-product.js')
+  const { qoderChatHeaders } = await import('../../lib/vendor/qoder/qoder.js')
+
+  for (const product of [QODER, QODER_CN]) {
+    assert.match(product.clientVersion, /^\d+\.\d+\.\d+$/, `${product.id} 的 clientVersion 要是 semver`)
+    assert.notEqual(product.clientVersion, '1.0.0', '★ 不能再是写死的 1.0.0')
+  }
+
+  const headers = qoderChatHeaders({ security_oauth_token: 't' }, QODER, 'req', 'ses')
+  assert.equal(headers['User-Agent'], `qoder/${QODER.clientVersion}`, '★ UA 要跟着产品字段走')
+  assert.equal(headers['User-Agent'], 'qoder/1.34.0', '本机实测的官方版本（见 clientVersion 注释的来源）')
+})
+
+test('★ 指纹：对话请求头上的 UA 是官方形态，而不是 Node 默认的 "node"', async () => {
+  // 这条守的是一处**比版本号严重得多**的问题：
+  // WASM 生成的 headers 里**不含** `User-Agent`，早先我们原样交给 fetch，
+  // Node 的 undici 就补上了自己的默认值 `User-Agent: node`
+  // （实测抓过本地回环服务器，原文就是 `node`）。
+  // 「node」打在一个声称来自桌面 IDE 的加密推理请求上 —— 直接说明不是官方客户端。
+  const { QoderAdapter, QODER_CN: CN } = await import('../../lib/adapters/qoder.js')
+  const adapter = new QoderAdapter(CN)
+
+  // 用假 fetch 截获真实发出的 headers（不打上游）。
+  const captured = { headers: null }
+  const payload = Buffer.from(JSON.stringify({ user_id: '12345678901234567' })).toString('base64url')
+  const record = {
+    id: 'qoder-cn:test',
+    agentId: 'qoder-cn',
+    label: '测试',
+    credentials: {
+      token: `eyJhbGciOiJIUzI1NiJ9.${payload}.sig`,
+      uid: '12345678901234567',
+      machine_id: '11111111-2222-3333-4444-555555555555',
+    },
+    enabled: true,
+    createdAt: 0,
+    updatedAt: 0,
+  }
+  const silent = { debug() {}, info() {}, warn() {}, error() {}, child() { return silent } }
+  const ctx = {
+    config: { upstream: {}, requestTimeoutMs: 1000, rateLimitPerMinute: 60 },
+    log: silent,
+    http: async () => ({ ok: false, status: 0, kind: 'none', headers: new Headers(), body: null, text: '' }),
+    cache: new Map(),
+    now: () => Date.now(),
+    fetch: async (_url, init) => {
+      captured.headers = init.headers
+      return new Response('data: [DONE]\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    },
+  }
+
+  const controller = new AbortController()
+  try {
+    for await (const _event of adapter.requestChatStream(
+      { model: 'dfmodel', messages: [{ role: 'user', content: '你好' }], stream: true },
+      record,
+      ctx,
+      controller.signal,
+    )) { /* 只为把请求发出去 */ }
+  } catch {
+    // 流解析报错与本用例无关，我们只看 headers
+  }
+
+  assert.notEqual(captured.headers, null, '应当截获到一次 fetch')
+  const headers = captured.headers
+  const uaKey = Object.keys(headers).find((k) => k.toLowerCase() === 'user-agent')
+  assert.notEqual(uaKey, undefined, '★ 必须**显式**带 UA —— 否则 undici 会补成 "node"')
+  assert.equal(headers[uaKey], 'qoder/1.34.0', 'UA 要是官方形态')
+  assert.notEqual(headers[uaKey], 'node', '★ 绝不能是 Node 默认的 node')
+
+  // 补 UA 不能把 WASM 签的头冲掉（那是 403 Signature invalid 的来源）
+  assert.ok(
+    Object.keys(headers).some((k) => k.toLowerCase() === 'authorization' && /^Bearer COSY\./.test(headers[k])),
+    '★ WASM 签的 Authorization 必须原样保留',
+  )
+  assert.ok(Object.keys(headers).some((k) => k.toLowerCase() === 'cosy-version'), 'Cosy-Version 也要保留')
+})

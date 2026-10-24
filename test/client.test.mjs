@@ -2066,3 +2066,198 @@ test('请求日志：模型列显示选择器里的名字，目录 key 放进 ti
   panel.dispose()
 })
 
+// ───────────────── 检查更新：四态与「失败不能说成最新」 ─────────────────
+//
+// 用户报障原话：「昨天的版本发布到 git 后，检查更新仍是最新版本，说明检查更新未生效」。
+//
+// 两个根因叠在一起，而且**这个文件此前对更新卡片零覆盖** —— 所以才长期存活：
+//
+//   ① 客户端读 `d.available === true`，而宿主**从来没发过** `available`
+//      ⇒ 恒 false ⇒ 徽标永远落在 `update.checked ? '已是最新'` 那一条上。
+//   ② `updateInfo()` 算了 `message`，但**没有任何地方渲染它** —— 于是
+//      「拉取远端失败：…」这种唯一能解释问题的信息用户永远看不到。
+//
+// ⚠️ 补上 `available` 还不够：**`behind === 0` 同样证明不了「已是最新」**。
+// `checkUpdate()` 在 `git fetch` 失败时返回的正是 `behind: 0` + `error`
+// （`src/core/updater.ts:161-172`）。所以判断顺序必须是**先判失败、再判最新**。
+// 下面那条「拉取远端失败」的用例就是钉这个顺序的。
+
+/**
+ * 造一个设置页投影，`update` 用给定值（其余沿用既有 `dashboardWith` 的形状）。
+ *
+ * 与 `dashboardWith` 一样走**真实的 `GatewayPanel`**，只是把 `update` 换掉 ——
+ * 缺陷恰恰在「宿主给什么 → 界面画什么」这条链路上，喂人造 HTML 是测不出来的。
+ */
+function settingsPageWith(update, { page = 'settings' } = {}) {
+  const { panel } = dashboardWith({ page })
+  const projection = panel.projection()
+  return { panel, state: { ...projection, shell: { ...projection.shell, page }, update } }
+}
+
+/** 只截「版本更新」那张卡，避免把页头/总览的同名文字算进来。 */
+function updateCardHTML(state) {
+  const html = client.DashboardHTML(state)
+  const start = html.indexOf('id="mag-update"')
+  assert.ok(start > 0, '设置页必须有「版本更新」卡片')
+  const end = html.indexOf('id="mag-about"')
+  return html.slice(start, end === -1 ? start + 1600 : end)
+}
+
+const updateBadgeOf = (card) => {
+  const hit = card.match(/<span class="mag-badge" data-tone="(\w+)">([^<]*)</)
+  assert.ok(hit !== null, '「当前版本」那一行必须有徽标')
+  return { tone: hit[1], label: hit[2] }
+}
+
+test('检查更新：available=true → 徽标「可更新到 X」+ 立即更新按钮 + message 渲染出来', () => {
+  const { panel, state } = settingsPageWith({
+    status: 'ready',
+    error: null,
+    applying: false,
+    data: {
+      supported: true, current: '0.1.0', latest: '0.2.0', behind: 7,
+      available: true,
+      message: '有新版本：0.1.0 → 0.2.0（落后 7 个提交）',
+    },
+  })
+  const card = updateCardHTML(state)
+
+  assert.deepEqual(updateBadgeOf(card), { tone: 'warn', label: '可更新到 0.2.0' })
+  assert.ok(card.includes('data-act="update-apply"'), '有新版本时必须出现「立即更新到 X」按钮')
+  assert.ok(card.includes('立即更新到 0.2.0'), '按钮要写明更新到哪个版本')
+  // ② 号根因：message 以前从来没被渲染过
+  assert.ok(card.includes('有新版本：0.1.0 → 0.2.0（落后 7 个提交）'), '宿主的 message 必须显示出来')
+  assert.ok(!card.includes('已是最新'), '有新版本时绝不能同时说「已是最新」')
+  panel.dispose()
+})
+
+test('检查更新：available=false + message「已是最新」→ 徽标「已是最新」（ok 语气）', () => {
+  const { panel, state } = settingsPageWith({
+    status: 'ready',
+    error: null,
+    applying: false,
+    data: { supported: true, current: '0.1.0', latest: '0.1.0', behind: 0, available: false, message: '已是最新（0.1.0）' },
+  })
+  const card = updateCardHTML(state)
+
+  assert.deepEqual(updateBadgeOf(card), { tone: 'ok', label: '已是最新' })
+  assert.ok(card.includes('已是最新（0.1.0）'), '宿主的原话要照显')
+  assert.ok(!card.includes('data-act="update-apply"'), '已是最新时不该出现更新按钮')
+  panel.dispose()
+})
+
+test('检查更新：★「拉取远端失败」绝不能显示成「已是最新」（本次 bug 的核心回归）', () => {
+  // fetch 失败时宿主返回 `behind: 0` + error（`src/core/updater.ts:161-172`），
+  // 而 `behind === 0` **正是**「已是最新」的判据 —— 只看它就必然误报。
+  // 这条断言的就是「失败优先于最新」这个顺序。
+  const { panel, state } = settingsPageWith({
+    status: 'ready',
+    error: null,
+    applying: false,
+    data: {
+      supported: true, current: '0.1.0', latest: null, behind: 0,
+      available: false,
+      message: '拉取远端失败：Failed to connect to github.com port 443',
+    },
+  })
+  const card = updateCardHTML(state)
+
+  const badge = updateBadgeOf(card)
+  assert.equal(badge.label, '检查失败', '检查失败必须自己成一个状态')
+  assert.notEqual(badge.tone, 'ok', '失败不能用绿色 ok 语气')
+  assert.equal(badge.tone, 'err', '失败要用 err 语气')
+  assert.ok(card.includes('拉取远端失败：Failed to connect to github.com port 443'), '失败原因必须显示出来')
+  assert.ok(!card.includes('已是最新'), '★ 检查失败绝不能被说成「已是最新」—— 用户就是这么被误导的')
+  assert.ok(!card.includes('data-act="update-apply"'), '一次失败的检查不该给出「立即更新」按钮')
+  panel.dispose()
+})
+
+test('检查更新：旧宿主（ready 但 data 没有 available）不崩、不误报最新，并退回 behind/error', () => {
+  // 宿主补 `available` 之前发的就是这种形状。客户端不能因为缺字段就一律说「最新」，
+  // 也不能崩 —— 两个方向都要钉住。
+  // ① 只有 error：显示失败原因（`d.message` 缺失 → 退回 `d.error`）。
+  {
+    const { panel, state } = settingsPageWith({
+      status: 'ready',
+      error: null,
+      applying: false,
+      data: { supported: true, current: '0.1.0', latest: null, behind: 0, error: '拉取远端失败：proxy refused' },
+    })
+    const card = updateCardHTML(state)
+    const badge = updateBadgeOf(card)
+    assert.equal(badge.label, '检查失败', '旧宿主的 error 也要被当成失败')
+    assert.equal(badge.tone, 'err')
+    assert.ok(card.includes('拉取远端失败：proxy refused'), '旧宿主的 error 原文要显示')
+    assert.ok(!card.includes('已是最新'), '★ 旧宿主也不能误报「已是最新」')
+    panel.dispose()
+  }
+  // ② 没有 available，但 behind > 0：仍然要能报出「可更新」（behind 是既有字段）。
+  {
+    const { panel, state } = settingsPageWith({
+      status: 'ready',
+      error: null,
+      applying: false,
+      data: { supported: true, current: '0.1.0', latest: '0.2.0', behind: 7 },
+    })
+    const card = updateCardHTML(state)
+    assert.equal(updateBadgeOf(card).label, '可更新到 0.2.0', '旧宿主靠 behind 也要能报出可更新')
+    assert.ok(card.includes('data-act="update-apply"'), '可更新时按钮要出现')
+    assert.ok(!card.includes('已是最新'), '★ 旧宿主也不能误报「已是最新」')
+    panel.dispose()
+  }
+})
+
+test('检查更新：status=error（端点本身失败）显示错误而不是「已是最新」', () => {
+  const { panel, state } = settingsPageWith({
+    status: 'error',
+    data: null,
+    error: 'remote.multiAgentGateway.updateStatus 不可用（客户端贡献没挂上？）',
+    applying: false,
+  })
+  const card = updateCardHTML(state)
+
+  assert.equal(updateBadgeOf(card).label, '检查失败')
+  assert.equal(updateBadgeOf(card).tone, 'err')
+  assert.ok(card.includes('updateStatus 不可用'), '端点失败的原因要显示出来')
+  assert.ok(!card.includes('已是最新'), '★ 端点失败不能显示成「已是最新」')
+  assert.ok(!card.includes('data-act="update-apply"'), '拿不到状态时不该给更新按钮')
+  panel.dispose()
+})
+
+test('检查更新：未检查 → 「未检查」，不渲染检查结果行、不给更新按钮', () => {
+  const { panel, state } = settingsPageWith({ status: 'idle', data: null, error: null, applying: false })
+  const card = updateCardHTML(state)
+
+  assert.deepEqual(updateBadgeOf(card), { tone: 'idle', label: '未检查' })
+  assert.ok(!card.includes('已是最新'), '还没检查过不能说「已是最新」')
+  assert.ok(!card.includes('检查结果'), '没有 message 时不渲染空的「检查结果」行')
+  assert.ok(!card.includes('data-act="update-apply"'))
+  assert.ok(card.includes('data-act="update-check"'), '「检查更新」按钮一直在')
+  panel.dispose()
+})
+
+test('检查更新：supported=false（不是 git 检出）显示原因，而不是「已是最新」', () => {
+  const { panel, state } = settingsPageWith({
+    status: 'ready',
+    error: null,
+    applying: false,
+    data: { supported: false, current: '0.1.0', latest: null, behind: 0, error: '插件目录不是 git 检出，无法自我更新' },
+  })
+  const card = updateCardHTML(state)
+
+  assert.equal(updateBadgeOf(card).tone, 'err')
+  assert.ok(card.includes('无法自我更新'), '不支持的原因要显示出来')
+  assert.ok(!card.includes('已是最新'), '★ 不支持自我更新不能说成「已是最新」')
+  panel.dispose()
+})
+
+test('检查更新：busy（检查中）禁用按钮并说明，不给更新按钮', () => {
+  const { panel, state } = settingsPageWith({ status: 'loading', data: null, error: null, applying: false })
+  const card = updateCardHTML(state)
+
+  assert.ok(card.includes('检查中…'), '加载中要说明正在进行')
+  assert.ok(/data-act="update-check" disabled/.test(card), '检查中要禁用「检查更新」防连点')
+  assert.ok(!card.includes('已是最新'), '检查中不能说「已是最新」')
+  panel.dispose()
+})
+

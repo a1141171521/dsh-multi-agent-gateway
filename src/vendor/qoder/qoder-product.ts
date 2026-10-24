@@ -344,6 +344,28 @@ export interface QoderProduct {
   sashClientType: string
   /** `User-Agent` 头取值前缀（源码拼 `qoder/{version}`）。 */
   userAgentPrefix: string
+  /**
+   * `User-Agent` 里的**客户端版本号**（`{userAgentPrefix}/{clientVersion}`）。
+   *
+   * ## 取值依据（2026-10-24 本机实测，两个独立来源互相印证）
+   *
+   * `C:\Program Files\Qoder CN IDE\resources\app\`：
+   *   - `package.json` → `"version": "1.34.0"`
+   *   - `product.json` → `"productVersion": "1.34.0"`
+   *
+   * ⚠️ **别误取 `product.json` 的 `version`（本机是 `1.106.3`）** ——
+   * 那是上游 VS Code 的**基础版本**（`product.json` 里另有 `commit` / `date`，
+   * 与 vscode 的版本线一致），`productVersion` 才是 Qoder 自己的版本。
+   * 早先这里写死 `1.0.0`，而上游看到 `qoder/1.0.0` 与 `qoder/1.34.0` 的差别
+   * 就是一个能对上的客户端版本。
+   *
+   * ## 客户端升级后应同步
+   *
+   * 这个值**没有自动获取渠道**（插件不读用户机器上的 IDE 安装目录 ——
+   * 那既跨平台不可靠、也无权读）。升级 Qoder 客户端后，重新读一次上面两个文件，
+   * 把这里的默认值跟着改即可。
+   */
+  clientVersion: string
   /** 默认凭据 ref（无账号池时的单凭据回退）。 */
   defaultCredentialRef: string
   /**
@@ -530,6 +552,9 @@ export const QODER: QoderProduct = {
   // 官方桌面客户端身份（源码常量 `Mh.clientType`）。仅用于 `/sash/` 端点。
   sashClientType: '10',
   userAgentPrefix: 'qoder',
+  // 本机官方 IDE `resources/app/package.json` → 1.34.0（`product.json` 的
+  // `productVersion` 同值）。客户端升级后同步这里，见字段注释。
+  clientVersion: '1.34.0',
   defaultCredentialRef: 'QODER_ACCESS_TOKEN',
   fallbackModels: QODER_FALLBACK_MODELS,
 }
@@ -708,6 +733,11 @@ export const QODER_CN: QoderProduct = {
   sashClientType: '10',
   // E11：CN asar 的 sash 请求头 UA 恒为 `"Qoder"`，与国际版一致。
   userAgentPrefix: 'qoder',
+  // 本机官方 CN IDE `resources/app/package.json` → 1.34.0
+  // （`product.json` 的 `productVersion` 同为 1.34.0；⚠️ 它的 `version`
+  // 是上游 VS Code 基线 1.106.3，别取那个）。
+  // 这是本次实测**唯一有本机实证**的版本号，所以两个产品共用它。
+  clientVersion: '1.34.0',
   defaultCredentialRef: 'QODERCN_ACCESS_TOKEN',
   fallbackModels: QODER_CN_FALLBACK_MODELS,
 }
