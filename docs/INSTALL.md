@@ -29,8 +29,8 @@ dsh plugin --profile desktop add github:<你的用户名>/dsh-multi-agent-gatewa
 ### 方式三：从 tarball 装
 
 ```powershell
-npm pack                                     # 产出 dsh-multi-agent-gateway-0.1.1.tgz
-dsh plugin --profile desktop add .\dsh-multi-agent-gateway-0.1.1.tgz
+npm pack                                     # 产出 dsh-multi-agent-gateway-0.2.1.tgz
+dsh plugin --profile desktop add .\dsh-multi-agent-gateway-0.2.1.tgz
 ```
 
 ### 其它 profile
