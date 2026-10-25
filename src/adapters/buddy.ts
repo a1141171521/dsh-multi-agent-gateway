@@ -74,6 +74,7 @@ import {
   traceHeadersOf,
   uuidFromSeed,
 } from '../vendor/buddy/buddy-client-shape.js'
+import { guardChatMessages } from '../vendor/buddy/buddy-channel-guard.js'
 import {
   CHECKIN_ACTIVITY_STATUS_PATH,
   DAILY_CHECKIN_PATH,
@@ -1522,7 +1523,15 @@ export class BuddyAdapter extends BaseAdapter {
     const body: Record<string, unknown> = {
       ...payload,
       model: payload.model,
-      messages: this.withClientMessageShape(this.withLeadingSystem(payload.messages)),
+      // 消息归一化三层，**顺序有依赖**，别随手调换：
+      //   ① `guardChatMessages` —— 网关守卫（`developer` → `system`，抹掉 DSH 身份句）。
+      //      必须是第一层：它把 `developer` 换成 `system` 之后，下一层的「首条是不是
+      //      system」判断才会看到真实形态。见 `vendor/buddy/buddy-channel-guard.ts`
+      //      的文件头（`code 11-128` 的两个成因与实测表）。
+      //   ② `withLeadingSystem` —— 国际版硬要求首条是 system（否则 400
+      //      `first message is not system prompt`）。
+      //   ③ `withClientMessageShape` —— 给 user 消息补客户端形态标记 `agent:"cli"`。
+      messages: this.withClientMessageShape(this.withLeadingSystem(guardChatMessages(payload.messages))),
       stream: true,
       stream_options: { include_usage: true },
       // `reasoning_effort` 覆盖 payload 里那个（核心层可能带了不可移植的原始值）。

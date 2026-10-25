@@ -60,7 +60,7 @@ export function createHttp(log: Logger, defaultTimeoutMs = 60000): HttpFn {
     }
 
     const headers: Record<string, string> = { ...(init.headers ?? {}) }
-    if (headers['user-agent'] === undefined) headers['user-agent'] = 'dsh-multi-agent-gateway/0.1.0'
+    if (headers['user-agent'] === undefined) headers['user-agent'] = 'dsh-multi-agent-gateway/0.1.1'
 
     let response: Response
     try {

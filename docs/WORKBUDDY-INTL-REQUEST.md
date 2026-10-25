@@ -98,6 +98,10 @@
 | 13 | `x-conversation-*` 三头 | 已按 product 开关 ✅ | 语义已纠正（见 §5） |
 | 14 | 官方模型走产品端点 + JWT | 固定走官方 `/v2/chat/completions` | 语义一致（只做官方通道） |
 
+> 另见 [`WORKBUDDY-CHANNEL-CHECK.md`](WORKBUDDY-CHANNEL-CHECK.md)：同一个 `11-128`
+> 还有**另外两个成因**（`developer` 角色、DSH 身份句），两者与上表第 12/13 行是
+> 彼此独立的判据，`msg` 也不一样。排查 `11-128` 时按那份文档逐层剥离。
+
 ## 5. 落地记录（2026-10-23，按上表改完）
 
 改动文件：
