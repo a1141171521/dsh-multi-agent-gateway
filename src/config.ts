@@ -44,6 +44,18 @@ export const AGENT_UPSTREAM_DEFAULTS: Record<string, Record<string, string>> = {
   trae: { chatBaseUrl: '', apiBaseUrl: '', modelsUrl: '' },
   workbuddy: { chatBaseUrl: '', apiBaseUrl: '', modelsUrl: '' },
   'workbuddy-intl': { chatBaseUrl: '', apiBaseUrl: '', modelsUrl: '' },
+  /**
+   * 商汤小浣熊（Raccoon Office）。
+   *
+   * ⚠️ `chatBaseUrl` 是 **`/api/web/llm/v2`**，不是 `/v1` —— 适配器会自己拼
+   * `/chat/completions`。留空也能跑（适配器里有内置兜底），这里写出来是为了
+   * 让「高级 → 对话 base url」输入框里能看到真值，用户要改反代时知道改哪个。
+   */
+  raccoon: {
+    chatBaseUrl: 'https://xiaohuanxiong.com/api/web/llm/v2',
+    apiBaseUrl: 'https://xiaohuanxiong.com',
+    modelsUrl: '',
+  },
 }
 
 /** 内置 Agent 的显示名（分组标题）。也用于「配置里没写这个 Agent」时补默认项。 */
@@ -54,12 +66,13 @@ export const AGENT_DISPLAY_NAMES: Record<string, string> = {
   trae: 'Trae',
   workbuddy: 'WorkBuddy',
   'workbuddy-intl': 'WorkBuddy International',
+  raccoon: '商汤小浣熊',
 }
 
 /**
  * 这一期**对外露出**的平台。
  *
- * 六个平台现在**全部真实现**（2026-10-19 Trae 升级后），所以全部露出。
+ * 七个平台现在**全部真实现**（2026-10-19 Trae 升级、2026-10-27 加入商汤小浣熊），所以全部露出。
  *
  * ⚠️ 这个数组只影响「**默认值**」—— 用户配置里显式写了 `visible` 就以配置为准。
  * 它与 `adapters/index.ts` 的 `AGENT_ORDER`、`client.js` 的 `AGENTS`、
@@ -82,6 +95,14 @@ export const DEFAULT_VISIBLE_AGENTS: readonly string[] = [
   // 显式值优先于这里的默认）—— 那是刻意的，别把显式配置也一起压掉。
   'workbuddy',
   'workbuddy-intl',
+  /**
+   * 商汤小浣熊。
+   *
+   * 与 `trae` 相反：这一条是**本机全链路实测过**才加进来的 ——
+   * 目录、余额、签到、流式对话（含思维链与工具调用）都真打过真上游，
+   * 见 `src/adapters/raccoon.ts` 文件头那张表。所以它**默认可见**。
+   */
+  'raccoon',
 ]
 
 /** 一段定时计划的 schema（签到 / 额度共用）。 */
@@ -312,7 +333,7 @@ const GatewaySchema = Schema.object({
  *
  * 用 dict 时路径里会出现 `agents.*.enabled` 这样的通配段，宿主**直接拒绝整份配置**
  * （真机上就是 `ValidationError: invalid config: $.agents.*.enabled …`，
- * 插件永远起不来）。所以六个内置 Agent 在这里逐条列出 ——
+ * 插件永远起不来）。所以七个内置 Agent 在这里逐条列出 ——
  * 加一个内置 Agent 时要同时改这里和 `AGENTS`（客户端）与 `builtinAdapters()`。
  *
  * 第三方适配器（运行期注册的）走 `extraAgents`：那是个 `Schema.dict`，
@@ -336,7 +357,8 @@ export const Config = Schema.object({
     trae: AgentSchema.description('Trae'),
     workbuddy: AgentSchema.description('WorkBuddy'),
     'workbuddy-intl': AgentSchema.description('WorkBuddy International'),
-  }).description('按 Agent 的配置（固定六个分组，键就是 agentId）。'),
+    raccoon: AgentSchema.description('商汤小浣熊'),
+  }).description('按 Agent 的配置（固定七个分组，键就是 agentId）。'),
   extraAgents: Schema.dict(Schema.any()).description(
     '第三方适配器的额外配置：键是 agentId，值与该 Agent 的配置同构（只能通过 cordis.patch.yml 写）。',
   ),
@@ -529,14 +551,14 @@ export function resolveAgentConfig(
  * 把用户配置解析成运行期配置。
  *
  * `knownAgentIds` 是适配器注册表里的 id 全集 —— 配置里没出现过的 Agent 也会
- * 补一份默认配置（这样 UI 上永远能看到全部六个分组，而不是「配了才出现」）。
+ * 补一份默认配置（这样 UI 上永远能看到全部七个分组，而不是「配了才出现」）。
  */
 export function resolveConfig(
   input: PluginConfig | undefined,
   options: { knownAgentIds: string[]; defaultDataDir: string },
 ): ResolvedConfig {
   const raw = input ?? {}
-  // `agents` 是固定的六项；`extraAgents` 是第三方适配器的补充（YAML 专用）。
+  // `agents` 是固定的七项；`extraAgents` 是第三方适配器的补充（YAML 专用）。
   const configured: Record<string, Partial<AgentConfigInput>> = {
     ...(raw.extraAgents ?? {}),
     ...(raw.agents ?? {}),

@@ -13,6 +13,152 @@
 
 ---
 
+## 🟢 #0t 元数据请求带着插件名与版本号出门，比官方客户端更醒目（2026-10-27）
+
+### 现象
+
+用户问「插件发的指纹和客户端一样吗」。抓包对比后发现**不一样**，
+而且不一致的方向是**更糟**的那个：
+
+| 请求 | 官方客户端 | 插件（修之前） |
+|---|---|---|
+| 对话（裸 `fetch`） | `user-agent: node` | `user-agent: node` ✅ |
+| 额度 / 目录 / 签到 / 测活（`ctx.http`） | `user-agent: node` | **`user-agent: dsh-multi-agent-gateway/0.2.2`** |
+
+等于向网关点名「我是一个第三方反代工具，版本 0.2.2」。
+
+### 根因
+
+两条 HTTP 路径的默认 UA **不一样**：
+
+- 对话走 `ctx.fetch ?? fetch`（undici）⇒ 没给 UA 时补字面量 `node`；
+- 其余走 `core/http.ts`，它有一行
+  `if (headers['user-agent'] === undefined) headers['user-agent'] = \`dsh-multi-agent-gateway/${pluginVersion()}\``。
+
+这个默认值本身没错（自家排查有用），错在**小浣熊这条链路上客户端发的是 `node`**，
+所以它在这里变成了负资产。
+
+### 为什么读代码差点得出错误结论
+
+只看适配器的 `headersOf()` 会以为「我们什么都不发，那两边都是 `node`」——
+**这只对了一半**。另一半（`ctx.http` 的默认值）在另一个文件里。
+只抓一条请求也会漏：抓对话是 `node`，抓额度才发现是插件名。
+
+判据：**要判断「实际发出去什么」，只能抓包，而且要按路径分别抓。**
+
+### 怎么确认客户端到底发什么
+
+不是看它的代码，是用**它自己安装目录里的那个 exe** 发一次：
+
+```powershell
+# <安装目录> = 开始菜单里那个快捷方式指向的目录（含 商汤小浣熊.exe 与 resources\app.asar）
+$env:ELECTRON_RUN_AS_NODE = '1'
+& '<安装目录>\商汤小浣熊.exe' .scratch\capture-from-client.mjs <port>
+```
+
+本地 HTTP 服务器抓到的就是它主进程全局 `fetch`（Node 24 / Electron 41 的 undici）
+真实发出的头：`user-agent: node` + `sec-fetch-mode: cors` + `accept-encoding: gzip, deflate`。
+
+### 改了什么
+
+1. `RACCOON_USER_AGENT = 'node'`：适配器**所有**请求显式设这个 UA，
+   盖掉 `core/http.ts` 的默认值。
+2. `RACCOON_GRANT_HEADERS`：`X-Client-Platform` / `X-Client-Version`
+   **只在签到这一个接口**上发 —— 因为全仓查实际使用点，客户端只在
+   `login/points/grant`（网页端）、内容检测与手机互联上带这套头，
+   模型目录与积分余额用的 `fetchWithAuth` **不带**。
+   「为了像客户端就把四件套全发出去」恰恰不像客户端。
+3. 单测三条钉住（元数据 UA、只有签到带 X-Client-*、常量取值），
+   并做了反向验证：撤掉修复后正好这 3 条变红，其余 37 条不受影响。
+
+### 还差什么（**别把这当成「已经不会被风控」**）
+
+- **官方客户端的对话请求不是 Electron 发的**，是 `box-agent-acp.exe`
+  （PyInstaller 的 Python 包，`httpx` + OpenAI/Anthropic SDK）。
+  它的 UA 与 `x-stainless-*` **没抓到样本** ⇒ 「对话与官方逐字节相同」不成立。
+- 结构性的那一条改不掉：**插件与客户端共用同一个 token、同一个出口 IP**。
+  同时用就是「一个账号、两套 HTTP 栈交错发请求」。
+- 真正决定风控的是**行为**（节奏、并发、上下文形态、消费曲线），
+  `rateLimitPerMinute` / `maxConcurrentRequests` 比头重要得多。
+
+---
+
+## 🟢 #0r 商汤小浣熊的 usage 帧比 finish 晚 0.5–3.7 秒，token 统计永久为空（2026-10-27）
+
+### 现象
+
+新接入的商汤小浣熊平台，日志里「输入 / 输出 / 速度」三列**恒为 `—`**，
+倍率却是对的。同样的症状用户以前报过（#0g 那条「速度/输入/输出为 —」）。
+
+### 根因
+
+`src/llm/adapter.ts` 的 `USAGE_DRAIN_MS` 是**全局常量 250ms**。这个值是按
+Qoder 调的 —— Qoder 的 usage 帧比 finish 晚 **17ms**，250ms 有十几倍余量。
+
+但小浣熊在网关侧要等计费算完才补这一帧，本机 8 次采样：
+
+| 间隔 | 样本 |
+|---|---|
+| finish → usage | 472 / 1421 / 1970 / 2315 / 2515 / 3418 / 3709 / 3744 ms |
+
+最小 472ms、最大 3744ms、**均值 ≈ 2.4s** —— 全在 250ms 窗口之外，
+所以这一帧**永远收不到**，`settle()` 拼采样时 `usage` 仍是 `undefined`，
+`inputTokens` / `outputTokens` / `tps` 三个键根本不出现。
+
+### 为什么不能直接把常量调大
+
+调到 5s 的话，Qoder 这类只晚 17ms 的平台**每一轮**收尾都要多挂最多 5 秒
+（用户看到的：字都出完了还在转圈）。这是**每一轮**的代价，不是偶发。
+
+### 改了什么
+
+1. `AgentCapabilities` 新增 `usageDrainMs?: number`（`src/core/types.ts`）——
+   窗口是**平台事实**，由适配器声明，核心层照办。不填 = 用默认 250ms。
+2. `pump()` 改读 `adapter.capabilities?.usageDrainMs ?? USAGE_DRAIN_MS`
+   （`src/llm/adapter.ts`）。**可选链是必须的**：第三方运行期注册的鸭子类型
+   适配器可能真没有 `capabilities`，少一层就是 `TypeError` 打断整轮对话。
+3. 商汤小浣熊适配器声明 `usageDrainMs: 5000`（实测最大值 + 三成余量）。
+
+### 怎么验证的
+
+- 单测 `test/request-log-sampling.test.mjs` 三条：慢平台收得到、快平台不被拖、
+  缺 `capabilities` 不崩；
+- 真机 `test/live-raccoon.mjs`：经 DSH LLM 适配器装配跑一轮，断言
+  `usage` 透到 DSH、采样里 `outputTokens > 0`、`tps` 有值。
+
+实测结果：修复前 `in/out=undefined/undefined tps=—`，
+修复后 `in/out=32/47 tps=9.4`。
+
+### 还差什么
+
+无。真机确认过（2026-10-27）。
+
+---
+
+## 🟡 #0s 商汤小浣熊：视觉能力只按实测标了 1 个模型（2026-10-27）
+
+### 现状
+
+目录里 `tags` 含 `vision` 的模型有 6 个，但本适配器只给
+`sn-deepseek-v4-1-flash-1017` 标了 `inputModalities: ['text','image']`。
+
+理由是实测结果不一致：
+
+| 模型 | 发 1×1 PNG data URI |
+|---|---|
+| `sn-deepseek-v4-1-flash-1017` | 200 |
+| `sn-glm-5-3`（tags 里有 `vision`） | **400** `rejected by an internal MaaS component` |
+
+所以**没有按 tag 猜**。`inputModalities` 缺省 = 只有文本，这是安全的缺省
+（DSH 不会把图片塞进一个不收图片的模型）。
+
+### 还差什么
+
+另外 8 个模型没测过视觉。要放开的话，得逐个真发一张图片看状态码，
+再往 `src/adapters/raccoon.ts` 的 `VISION_CAPABLE` 里加。**别拿 tags 当依据**。
+
+---
+
 ## 🟡 #0q 请求日志把「每条失败」都记成「免账号」，原因只藏在悬停里（2026-10-27）
 
 > 用户原话：「有的用户用插件出现了这个错误，是授权过期了吗？」
@@ -482,9 +628,9 @@ Qoder 设备码登录给的是 **`dt-...` 这样的不透明设备令牌，不�
 真机验证（`.scratch/verify-uid-backfill.mjs`）：
 
 ```
-账号 qoder-cn:qoder-cn-账号：token=dt-4OLYeuvgM... uid=null
-  200 /sash/api/v2/me/usage → uid="019e88b9-1c04-7552-8feb-7b4a137d4c3d"
-回写后账号里的 uid："019e88b9-1c04-7552-8feb-7b4a137d4c3d"
+账号 qoder-cn:qoder-cn-账号：token=dt-EXAMPLE-NOT-A-… uid=null
+  200 /sash/api/v2/me/usage → uid="00000000-0000-4000-8000-000000000001"
+回写后账号里的 uid："00000000-0000-4000-8000-000000000001"
 回写后校验：ok=true
 ✓ 老账号的 uid 能靠上游补齐并回写，不需要用户重新登录
 ```

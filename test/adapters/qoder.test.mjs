@@ -31,7 +31,7 @@ import {
 const USAGE_BODY = {
   displayMode: 'qoder',
   qoderUsage: {
-    userId: '019e88b9-1c04-7552-8feb-7b4a137d4c3d',
+    userId: '00000000-0000-4000-8000-000000000001',
     userType: 'personal_standard',
     usageType: 'credits',
     totalUsagePercentage: 0.15,
@@ -59,7 +59,7 @@ const USAGE_BODY = {
  */
 function campaignsBody(list) {
   return {
-    uid: '019e88b9-1c04-7552-8feb-7b4a137d4c3d',
+    uid: '00000000-0000-4000-8000-000000000001',
     showCampaign: list.length > 0,
     claimable: list.some((item) => item.claimStatus === 'CLAIMABLE'),
     campaignUrl: 'https://openapi.qoder.com.cn/growth-page/activity-iframe',
@@ -194,7 +194,7 @@ test('Qoder 余额：addOnQuota 与 userQuota 都解析出来，且能区分「�
     name: '资源包', unit: 'credits', total: 1000, used: 142, remaining: 858,
   })
   assert.equal(usage.hasAddOnQuota, true)
-  assert.equal(usage.userId, '019e88b9-1c04-7552-8feb-7b4a137d4c3d')
+  assert.equal(usage.userId, '00000000-0000-4000-8000-000000000001')
   assert.equal(usage.userType, 'personal_standard')
   assert.equal(qoderTotalRemaining(usage), 858)
 })

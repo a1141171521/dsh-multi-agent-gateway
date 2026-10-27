@@ -722,3 +722,160 @@ test('流中途报错：账号已选到，必须记下来（正是用户最想�
   assert.equal(samples[0].errorKind, 'network', '中途断流的分类也要记')
 })
 
+// ─────────── usage 等待窗口：必须由适配器声明，不能全局写死 ───────────
+
+/**
+ * ## 守的是什么
+ *
+ * 商汤小浣熊的 `usage` 帧比 `finish` 晚 **472 … 3744ms**（本机 8 次采样，
+ * 均值 ≈ 2.4s）；而 Qoder 只晚 **17ms**。原先窗口是全局常量 250ms，于是：
+ *
+ *   - 小浣熊：这一帧**永远收不到** ⇒ 日志里输入/输出/速度三列恒为 `—`；
+ *   - 若把常量抬到 4s：Qoder 这类快的平台**每一轮**都要多挂最多 4 秒。
+ *
+ * 所以窗口改成 `AgentCapabilities.usageDrainMs`（适配器声明自己的上游形状）。
+ * 这三条用例把它钉住：慢平台能收到、快平台不被拖、第三方缺字段不炸。
+ */
+
+/** 造一个最小可用的 LlmAdapter，供这三条用例共用（都是假上游，不打真网）。 */
+function drainHarness(backend, samples) {
+  return createLlmAdapter({
+    agentId: backend.id,
+    displayName: backend.name,
+    labelWithAgent: false,
+    accounts: new Proxy({}, { get: () => () => undefined }),
+    router: {
+      async execute(_agentId, run) {
+        const outcome = await run({
+          id: `${backend.id}:test`,
+          agentId: backend.id,
+          label: 't',
+          credentials: {},
+          enabled: true,
+          createdAt: 0,
+          updatedAt: 0,
+        })
+        return outcome.ok === true
+          ? { ok: true, accountId: `${backend.id}:test`, attempts: [], value: outcome.value }
+          : {
+              ok: false,
+              accountId: `${backend.id}:test`,
+              attempts: [],
+              failure: { kind: outcome.kind ?? 'unknown', message: outcome.message ?? '' },
+            }
+      },
+    },
+    adapterOf: () => backend,
+    contextOf: () => ({
+      config: { requestTimeoutMs: 5000 },
+      log: silent,
+      http: async () => ({ ok: true }),
+      cache: {},
+      now: () => Date.now(),
+    }),
+    modelsOf: async () => [],
+    exposedModelsOf: async () => [],
+    onRequest: (sample) => samples.push(sample),
+    log: silent,
+  })
+}
+
+test('★ usage 窗口：适配器声明 5s 时，晚到 900ms 的 usage 也能收进采样', async () => {
+  const backend = {
+    id: 'raccoon',
+    name: '商汤小浣熊',
+    // 关键：声明一个比默认 250ms 宽的窗口。
+    capabilities: { usageDrainMs: 5000 },
+    async *requestChatStream() {
+      yield { type: 'text', text: '好的' }
+      yield { type: 'finish', reason: 'stop' }
+      // 真机实测：usage 在 finish 之后 472…3744ms 才到。这里取 900ms（够证明 >250ms）。
+      await new Promise((resolve) => setTimeout(resolve, 900))
+      yield { type: 'usage', usage: { inputTokens: 32, outputTokens: 48, reasoningTokens: 46 } }
+    },
+  }
+  const samples = []
+  const adapter = drainHarness(backend, samples)
+
+  const chunks = []
+  for await (const chunk of adapter.stream({
+    provider: 'multiagent-raccoon',
+    model: 'raccoon/sn-x',
+    messages: [{ role: 'user', content: 'hi' }],
+  })) {
+    chunks.push(chunk)
+  }
+
+  assert.equal(samples.length, 1)
+  assert.equal(
+    samples[0].inputTokens,
+    32,
+    '晚到 900ms 的 usage 必须进采样（否则日志 token 列是 —）',
+  )
+  assert.equal(samples[0].outputTokens, 48)
+  assert.equal(samples[0].reasoningTokens, 46)
+  // usage 也必须透给 DSH（它是会话侧 token 用量的来源）。
+  const usageChunk = chunks.find((chunk) => chunk.type === 'usage')
+  assert.notEqual(usageChunk, undefined, 'usage 必须透给 DSH')
+  assert.equal(usageChunk.usage.outputTokens, 48)
+})
+
+test('★ usage 窗口：不声明时用默认 250ms —— 快平台不该被拖（超时后照常收尾）', async () => {
+  const backend = {
+    id: 'qoder-cn',
+    name: 'Qoder CN',
+    // 刻意**不**声明 usageDrainMs ⇒ 走默认 250ms。
+    async *requestChatStream() {
+      yield { type: 'text', text: '好' }
+      yield { type: 'finish', reason: 'stop' }
+      // 挂 2 秒才发 usage：超过默认窗口，必须被丢弃（而不是把整轮拖 2 秒）。
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } }
+    },
+  }
+  const samples = []
+  const adapter = drainHarness(backend, samples)
+
+  const started = Date.now()
+  const chunks = []
+  for await (const chunk of adapter.stream({
+    provider: 'multiagent-qoder-cn',
+    model: 'qoder-cn/auto',
+    messages: [{ role: 'user', content: 'hi' }],
+  })) {
+    chunks.push(chunk)
+  }
+  const elapsed = Date.now() - started
+
+  assert.ok(elapsed < 1500, `默认窗口下不该等满 2 秒（实测 ${elapsed}ms）`)
+  assert.equal(samples.length, 1)
+  assert.equal(
+    Object.hasOwn(samples[0], 'inputTokens'),
+    false,
+    '窗口外的 usage 拿不到，就不要编一个 0',
+  )
+  assert.equal(chunks.filter((chunk) => chunk.type === 'finish').length, 1, '必须照常收尾')
+})
+
+test('★ usage 窗口：第三方适配器没有 capabilities 也不会崩（可选链的回归）', async () => {
+  const backend = {
+    id: 'third-party',
+    name: 'Third Party',
+    // ⚠️ 故意不给 capabilities —— 运行期注册的鸭子类型适配器可能真没有。
+    async *requestChatStream() {
+      yield { type: 'text', text: '好' }
+      yield { type: 'finish', reason: 'stop' }
+    },
+  }
+  const samples = []
+  const adapter = drainHarness(backend, samples)
+  const chunks = []
+  for await (const chunk of adapter.stream({
+    provider: 'multiagent-third',
+    model: 'third-party/m',
+    messages: [{ role: 'user', content: 'hi' }],
+  })) {
+    chunks.push(chunk)
+  }
+  assert.equal(chunks.filter((chunk) => chunk.type === 'finish').length, 1)
+})

@@ -1256,11 +1256,19 @@ test('端到端：把适配器的 chunk 喂进宿主装配逻辑，流式正文�
 
 // ───────────────────────── 适配器 ─────────────────────────
 
-test('注册表：内置清单包含全部六个平台，且接口完整', () => {
+test('注册表：内置清单包含全部七个平台，且接口完整', () => {
   const adapters = builtinAdapters()
   const registry = new AdapterRegistry()
   registry.registerAll(adapters)
-  assert.deepEqual(registry.ids(), ['opencode', 'qoder', 'qoder-cn', 'trae', 'workbuddy', 'workbuddy-intl'])
+  assert.deepEqual(registry.ids(), [
+    'opencode',
+    'qoder',
+    'qoder-cn',
+    'trae',
+    'workbuddy',
+    'workbuddy-intl',
+    'raccoon',
+  ])
   for (const adapter of adapters) {
     const check = validateAdapter(adapter)
     assert.equal(check.ok, true, `${adapter.id} 缺少 ${check.missing.join(',')}`)
@@ -1289,8 +1297,8 @@ test('Trae 默认隐藏但不删除：协议层仍在，且显式配置可覆盖
   const active = (config, id) => config.agents[id].enabled === true && config.agents[id].visible === true
   assert.equal(active(resolved, 'trae'), false, 'trae 不该活跃 —— 否则会注册一个空 provider 分组')
 
-  // ② 其余五个平台不受影响
-  for (const id of ['opencode', 'qoder', 'qoder-cn', 'workbuddy', 'workbuddy-intl']) {
+  // ② 其余平台不受影响（商汤小浣熊 2026-10-27 加入，默认可见）
+  for (const id of ['opencode', 'qoder', 'qoder-cn', 'workbuddy', 'workbuddy-intl', 'raccoon']) {
     assert.equal(active(resolved, id), true, `${id} 不该被连累`)
   }
 
@@ -2519,18 +2527,18 @@ test('buddyHeaders：五个身份头 + Bearer 一个都不能少', () => {
   assert.equal(cn['x-product'], 'CodeBuddy')
 })
 
-test('内置适配器：六个平台全部已真实现（不再有骨架）', async () => {
+test('内置适配器：七个平台全部已真实现（不再有骨架）', async () => {
   const { builtinAdapters } = await import('../lib/adapters/index.js')
   const adapters = builtinAdapters()
   const byId = new Map(adapters.map((item) => [item.id, item]))
-  // 2026-10-19 Trae 升级为真实现后，六个平台全部 implemented。
-  for (const id of ['opencode', 'qoder', 'qoder-cn', 'trae', 'workbuddy', 'workbuddy-intl']) {
+  // 2026-10-19 Trae 升级、2026-10-27 加入商汤小浣熊后，七个平台全部 implemented。
+  for (const id of ['opencode', 'qoder', 'qoder-cn', 'trae', 'workbuddy', 'workbuddy-intl', 'raccoon']) {
     assert.equal(byId.get(id)?.implemented, true, `${id} 应当已实现`)
     assert.equal(byId.get(id)?.capabilities.chat, true, `${id} 应当声明支持对话`)
   }
   assert.deepEqual(
     adapters.map((item) => item.id),
-    ['opencode', 'qoder', 'qoder-cn', 'trae', 'workbuddy', 'workbuddy-intl'],
+    ['opencode', 'qoder', 'qoder-cn', 'trae', 'workbuddy', 'workbuddy-intl', 'raccoon'],
   )
   // 骨架工厂仍然存在（新增平台时的起点），只是当前没有平台停在骨架状态。
   assert.deepEqual([...SKELETON_IDS], ['qoder', 'qoder-cn', 'workbuddy', 'workbuddy-intl'])
@@ -2812,14 +2820,14 @@ test('Qoder 登录：设备码响应里的 user_id 必须存成 uid（否则对�
     ok: true,
     status: 200,
     json: async () => ({
-      data: { token: 'dt-opaque-token', refresh_token: 'drt-x', user_id: '019e88b9-1c04-7552-8feb-7b4a137d4c3d', user_name: '张三' },
+      data: { token: 'dt-opaque-token', refresh_token: 'drt-x', user_id: '00000000-0000-4000-8000-000000000001', user_name: '张三' },
     }),
   }))
   const adapter = new QoderAdapter(QODER_CN)
   const start = await adapter.beginLogin(ctx)
   const ready = await adapter.pollLogin(start.state, ctx)
   assert.equal(ready.status, 'ready')
-  assert.equal(ready.credentials.uid, '019e88b9-1c04-7552-8feb-7b4a137d4c3d', '登录响应里的 user_id 要存成 uid')
+  assert.equal(ready.credentials.uid, '00000000-0000-4000-8000-000000000001', '登录响应里的 user_id 要存成 uid')
   assert.equal(ready.credentials.token, 'dt-opaque-token')
   assert.equal(ready.label, '张三', 'user_name 用作账号标签')
 })
@@ -2929,7 +2937,7 @@ test('Qoder 错峰窗口：窗口内折后价、窗口外原价（按 UTC+8 本�
 test('Qoder uid：优先用凭证里存的（设备令牌不是 JWT，解不出来）', async () => {
   const adapter = new QoderAdapter(QODER_CN)
   // 真实形态：设备码登录给的是 `dt-...` 不透明令牌，JWT 解析必然失败
-  const deviceToken = 'dt-4OLYeuvgM5u36ofdBZpJcRBE'
+  const deviceToken = 'dt-EXAMPLE-NOT-A-REAL-TOKEN'
   const withoutUid = { ...qoderRecord(deviceToken) }
   const invalid = await adapter.validateCredentials(withoutUid, {})
   assert.equal(invalid.ok, false, '没有 uid 时不能假装可用')

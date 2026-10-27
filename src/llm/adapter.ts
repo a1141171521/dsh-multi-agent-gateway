@@ -676,6 +676,18 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
     let finishReason: string | undefined
     /** finish 之后最多等到什么时候（毫秒时间戳）。 */
     let drainUntil = 0
+    /**
+     * 本轮的 usage 等待窗口。
+     *
+     * ⚠️ **取值来自适配器，不是全局常量**：各平台发 usage 的时机差三个数量级
+     * （Qoder +17ms vs 小浣熊 +472…3744ms）。全局恒定时必然有一边不对 ——
+     * 见 `AgentCapabilities.usageDrainMs` 的注释。
+     *
+     * ⚠️ 用可选链读：`capabilities` 是 `AgentAdapter` 的**必填**字段，但这个
+     * 函数是给**任何**鸭子类型适配器用的（第三方可以运行期注册）。少读一层
+     * 就是一个 `TypeError` 把整轮对话打断 —— 一个「等待窗口」不值得这个风险。
+     */
+    const usageDrainMs = adapter.capabilities?.usageDrainMs ?? USAGE_DRAIN_MS
     /** usage 是否已经透给 DSH（finish 前透的记 `true`，之后补发时也记）。 */
     let usageYielded = false
     const toolBlocks = new Map<number, { block: number; id: string; name: string; args: string }>()
@@ -780,7 +792,7 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
           // 只在「确实没等到 usage」时记一条 —— 正常收到 usage 的情况不该刷日志。
           if (finishSeen && usage === undefined) {
             log.debug(
-              `finish 后没有收到 usage 帧（最多等了 ${USAGE_DRAIN_MS}ms）`,
+              `finish 后没有收到 usage 帧（最多等了 ${usageDrainMs}ms）`,
               `model=${upstreamModel}（该上游可能不支持 stream_options.include_usage，token 只能留空）`,
             )
           }
@@ -864,7 +876,7 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
              * 并关闭连接，循环自然结束。`USAGE_DRAIN_MS` 只是兜底上限，
              * 防止某个上游发完 finish 却挂着连接不放，把用户的一轮对话拖住。
              */
-            drainUntil = Date.now() + USAGE_DRAIN_MS
+            drainUntil = Date.now() + usageDrainMs
             // 关掉所有开着的块（工具块带上累积的 name/arguments，DSH 侧才拼得回完整调用）。
             // 用户看到的内容到这里就完整了；下面再等只是为采样收 usage。
             yield* closeBlocks()
@@ -1064,11 +1076,23 @@ function imagePlaceholderText(_block: DshImageBlock): string {
  * 采样里 `inputTokens` / `outputTokens` / `tps` 就全空 —— 用户看到的
  * 「输入、输出、速度为 —」正是这么来的。
  *
- * ## 为什么上限是 250ms
+ * ## 为什么默认上限是 250ms，而它现在可以被适配器覆盖
  *
  * 正常上游发完 usage 紧接着就 `[DONE]` 并关闭连接，循环自然结束，**一秒都不等**。
  * 这个上限只兜「发完 finish 却挂着连接不放」的上游；250ms 相对实测的 17ms
  * 有十几倍余量，又短到用户完全感觉不到。
+ *
+ * ## ⚠️ 但 250ms 对小浣熊**不够**（2026-10-27 实测）
+ *
+ * 商汤小浣熊的 usage 帧比 finish 晚 **472 … 3744ms**（8 次采样，均值 ≈ 2.4s）——
+ * 因为它在网关侧要等上游把计费算完才补这一帧。用 250ms 的窗口去等，
+ * 结果就是这一帧**永远收不到**，日志里输入/输出/速度三列恒为 `—`。
+ *
+ * 可全局调到 4s 吗？不行 —— 那会让 Qoder 这类只晚 17ms 的平台，
+ * **每一轮**收尾都多挂最多 4 秒（字都出完了还在转圈）。
+ *
+ * 所以窗口改成**由适配器声明**（`AgentCapabilities.usageDrainMs`）：
+ * 知道自己上游慢的适配器自己说，其余继续用这个 250ms 的默认值。
  */
 const USAGE_DRAIN_MS = 250
 

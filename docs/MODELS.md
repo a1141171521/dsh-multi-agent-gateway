@@ -230,7 +230,7 @@ Qoder 目录里的 `price_factor` 是**采集那一刻的生效价**，会随错
 3. 倍率都是未知时按模型 id 字典序。
 
 分组顺序 = `llm.registerAdapter()` 的注册顺序 = `adapters/index.ts` 里的数组顺序
-（OpenCode → Qoder → Qoder CN → Trae → WorkBuddy → WorkBuddy International）。
+（OpenCode → Qoder → Qoder CN → Trae → WorkBuddy → WorkBuddy International → 商汤小浣熊）。
 DSH 自己会把 `deepseek-account` / `deepseek-official` 排到最前面，其余保持注册顺序。
 
 ## 6.5 只上报我勾选的模型（默认一个都不报）
