@@ -64,6 +64,17 @@ export const QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000
 export const AUTH_COOLDOWN_MS = 10 * 60 * 1000
 
 /**
+ * 风控拦截的冷却下限：**30 分钟**。
+ *
+ * 为什么比鉴权（10 分钟）还长：风控是按**行为特征**判定的，同一个号在被标记后
+ * 立刻回来重试，只会加深「这是个异常客户端」的印象，把临时风控升级成长期封禁。
+ * 给它一段明显的静默期，比抢那几分钟更划算。
+ *
+ * 上限仍受 `Retry-After` 与 {@link RETRY_AFTER_CAP_MS} 约束 —— 上游明说要等多久时听上游的。
+ */
+export const RISK_CONTROL_COOLDOWN_MS = 30 * 60 * 1000
+
+/**
  * 按错误类型算「这个账号该被冷落多久」（毫秒）。
  *
  * ⚠️ **上游给了 `retry-after` 就用它的**，但要**封顶**
@@ -73,13 +84,15 @@ export const AUTH_COOLDOWN_MS = 10 * 60 * 1000
  * 让刚恢复的账号继续被跳过。
  *
  * 各类型的兜底（上游没给 `retry-after` 时）：
- *   - `rate_limit` —— 短冷却（配置的 `penaltySec`），限流通常很快过去；
- *   - `auth`       —— 至少 {@link AUTH_COOLDOWN_MS}（多半要用户去重新登录）；
- *   - `quota`      —— {@link QUOTA_COOLDOWN_MS}（当日额度，等一会儿没用）。
+ *   - `rate_limit`   —— 短冷却（配置的 `penaltySec`），限流通常很快过去；
+ *   - `risk_control` —— 至少 {@link RISK_CONTROL_COOLDOWN_MS}（风控要静默期）；
+ *   - `auth`         —— 至少 {@link AUTH_COOLDOWN_MS}（多半要用户去重新登录）；
+ *   - `quota`        —— {@link QUOTA_COOLDOWN_MS}（当日额度，等一会儿没用）。
  */
 export function penaltyMsFor(kind: ErrorKind, retryAfterMs: number | undefined, penaltySec: number): number {
   const floor = Math.max(0, penaltySec) * 1000
   if (retryAfterMs !== undefined) return Math.max(0, Math.min(retryAfterMs, RETRY_AFTER_CAP_MS))
+  if (kind === 'risk_control') return Math.max(floor, RISK_CONTROL_COOLDOWN_MS)
   if (kind === 'auth') return Math.max(floor, AUTH_COOLDOWN_MS)
   if (kind === 'quota') return Math.max(floor, QUOTA_COOLDOWN_MS)
   return floor
@@ -315,7 +328,12 @@ export class AccountRouter {
       attempts.push({ accountId: next.id, kind: outcome.kind, message: outcome.message, startedAt, elapsedMs })
 
       // 记健康：只有「账号自己的问题」才降权。
-      if (outcome.kind === 'auth' || outcome.kind === 'quota' || outcome.kind === 'rate_limit') {
+      if (
+        outcome.kind === 'auth'
+        || outcome.kind === 'quota'
+        || outcome.kind === 'rate_limit'
+        || outcome.kind === 'risk_control'
+      ) {
         const penaltyMs = penaltyMsFor(outcome.kind, outcome.retryAfterMs, this.gateway.penaltySec)
         this.accounts.markFailure(
           next.id,
@@ -328,6 +346,22 @@ export class AccountRouter {
         if (outcome.kind === 'auth' && this.accounts.health(next.id).failures >= this.gateway.degradeAfterFailures * 3) {
           this.accounts.markInvalid(next.id, failure)
           this.log.error(`账号 ${next.id} 连续鉴权失败，已标记为失效`, outcome.message)
+        }
+        /**
+         * 风控连续触发 → 同样判死，但**门槛更高**（`×2` 而不是 `×3` 次的鉴权口径，
+         * 这里用同一套 `degradeAfterFailures` 基数）。
+         *
+         * 为什么值得判死：一个反复触发风控的号，每次被选中都会污染整个平台的
+         * 出口信誉，而且它自己短时间内也恢复不了。标成 `invalid` 让它在界面上
+         * 明确显示「已失效 · 触发风控」，用户才知道该去重新登录或换号，
+         * 而不是看着它一直被降权、一直被跳过、不知道为什么。
+         */
+        if (
+          outcome.kind === 'risk_control'
+          && this.accounts.health(next.id).failures >= this.gateway.degradeAfterFailures * 2
+        ) {
+          this.accounts.markInvalid(next.id, failure)
+          this.log.error(`账号 ${next.id} 连续触发风控，已标记为失效`, outcome.message)
         }
       }
       this.log.warn(

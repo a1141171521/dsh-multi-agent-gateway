@@ -29,7 +29,7 @@ import {
 import { unwrapQoderEnvelopeStream } from '../lib/vendor/qoder/qoder-envelope.js'
 import { parseSchedule, matches, isDue } from '../lib/core/scheduler.js'
 import { AccountManager } from '../lib/core/accounts.js'
-import { AccountRouter, penaltyMsFor, RETRY_AFTER_CAP_MS, QUOTA_COOLDOWN_MS, AUTH_COOLDOWN_MS } from '../lib/core/router.js'
+import { AccountRouter, penaltyMsFor, RETRY_AFTER_CAP_MS, QUOTA_COOLDOWN_MS, AUTH_COOLDOWN_MS, RISK_CONTROL_COOLDOWN_MS } from '../lib/core/router.js'
 import { formatMultiplier, shouldSwitchAccount, isRetryable, selectExposedModels } from '../lib/core/types.js'
 import {
   vendorOf,
@@ -136,6 +136,159 @@ test('错误分类：不该换号的情况', () => {
   assert.equal(shouldSwitchAccount('server'), false)
   assert.equal(isRetryable('server'), true)
   assert.equal(isRetryable('bad_request'), false)
+})
+
+// ───────────────── 风控：必须换号，但不能白重试（2026-10-27） ─────────────────
+
+/**
+ * 用户原话：「账号如果被风控以后，自动切换其他账号吗？」
+ *
+ * 实测（改之前）八个常见风控文案在 400 上**全部**判成 `bad_request` ⇒
+ * `shouldSwitchAccount` 为假 ⇒ **不换号**，用户就卡在那个号上一直失败。
+ * 而 403 上的风控落到 `auth` ⇒ 换号是对的，但 DSH 会把上游原话整句覆盖成
+ * 「API 密钥无效」，用户跑去重新登录、重贴 token，全是白费。
+ *
+ * 所以风控必须有自己的 kind：既能换号，又能让上游原话透到界面上。
+ */
+test('风控：400 上的风控文案必须判成 risk_control（不能是 bad_request）', () => {
+  // 这些文案在改之前**全部**落到 bad_request ⇒ 不换号。逐条钉住。
+  const texts = [
+    'risk control triggered, please verify',
+    'abnormal request detected',
+    'verification required',
+    'device fingerprint mismatch',
+    'your account has been banned',
+    'account suspended',
+    'suspicious activity',
+    'please complete the captcha',
+    '检测到异常请求，请完成验证',
+    '您的账号已被限制',
+  ]
+  for (const text of texts) {
+    assert.equal(
+      classify(400, { error: text }),
+      'risk_control',
+      `400「${text}」没判成风控 —— 会被当成「请求本身有问题」而**不换号**`,
+    )
+  }
+})
+
+test('风控：403 / 429 / 200 上的风控也要认（不能落进 auth 被 DSH 覆盖文案）', () => {
+  // 403 上的风控若落进 auth，DSH 的 failureMessage() 会把整句覆盖成
+  // 「API 密钥无效」（`code === "AUTH" ? t("message.failure.auth") : message`），
+  // 上游那句「请完成验证」直接消失，把用户引向完全错误的方向。
+  assert.equal(classify(403, { error: 'Request blocked by risk control' }), 'risk_control')
+  assert.equal(classify(403, { error: 'account flagged for abuse' }), 'risk_control')
+  assert.equal(classify(429, { error: 'suspicious traffic detected' }), 'risk_control')
+  assert.equal(classify(200, { error: 'risk control triggered' }), 'risk_control')
+})
+
+test('风控：必须换号，但绝不能在同一账号上重试', () => {
+  assert.equal(shouldSwitchAccount('risk_control'), true, '风控是账号维度的问题，换号有效')
+  // ★ 这条是「不重试」的判据：同号立刻重试只会加深「异常客户端」印象，
+  //   把临时风控升级成长期封禁。
+  assert.equal(isRetryable('risk_control'), false, '风控不该在同一账号上重试')
+})
+
+test('风控：冷却必须比鉴权更长（30 分钟 vs 10 分钟）', () => {
+  const penaltySec = 300 // 默认 5 分钟地板
+  const risk = penaltyMsFor('risk_control', undefined, penaltySec)
+  const auth = penaltyMsFor('auth', undefined, penaltySec)
+  assert.equal(risk, RISK_CONTROL_COOLDOWN_MS)
+  assert.ok(risk > auth, `风控冷却（${risk}）必须比鉴权（${auth}）长`)
+  // 但上游明说要等多久时听上游的（仍受封顶约束）。
+  assert.equal(penaltyMsFor('risk_control', 60_000, penaltySec), 60_000, '上游给了 Retry-After 就用它')
+  assert.equal(
+    penaltyMsFor('risk_control', 999 * 60 * 60 * 1000, penaltySec),
+    RETRY_AFTER_CAP_MS,
+    '畸形超长的 Retry-After 必须被封顶',
+  )
+})
+
+test('风控：不能误伤正常业务报错（否则好号被无谓锁 30 分钟）', () => {
+  // 宁可漏判（落 bad_request，用户手动换号），也不要把正常报错判成风控。
+  const normal = [
+    'invalid parameter: temperature must be <= 2',
+    'model not found',
+    'context length exceeded',
+    'content filtered: contains prohibited words',
+    'The request was rejected because the input was too long',
+  ]
+  for (const text of normal) {
+    assert.notEqual(
+      classify(400, { error: text }),
+      'risk_control',
+      `正常报错「${text}」被误判成风控 —— 会让好号被无谓锁 30 分钟`,
+    )
+  }
+  // Cloudflare 的「Access denied」是按 IP/ASN 封的，**换号无效**，
+  // 保持 auth 不动；判成风控会让用户以为每个号都坏了。
+  assert.equal(classify(403, { error: 'Access denied' }), 'auth')
+})
+
+test('风控：流式路径也要认（两条路径不能漂移）', () => {
+  // 非流式走 classify()，流式走 classifyStreamError() —— 各自独立。
+  // 只修一边的话，风控落在流里仍会被判成 server ⇒ 白重试 5 次 + 账号不降权。
+  const frame = '{"error":{"message":"abnormal request detected"}}'
+  const events = [...translateChunk(frame)]
+  assert.equal(events.length, 1, `流式风控帧应该产出 1 个事件，实际 ${events.length} 个`)
+  assert.equal(events[0].type, 'error')
+  assert.equal(events[0].failure.kind, 'risk_control', '流式风控帧必须判成 risk_control')
+  // 上游原话要留在文案里：那是用户唯一能行动的线索。
+  assert.ok(
+    events[0].failure.message.includes('abnormal request detected'),
+    `文案要带上游原话，实际：${events[0].failure.message}`,
+  )
+})
+
+test('风控：没有 choices 也没有 error 的帧不能被静默吞掉', () => {
+  // 实测：`{"code":"RISK_CONTROL","message":"blocked"}` 带 message 会走网关分支，
+  // 但只要上游换个字段名（去掉 message），整帧就凭空消失 ——
+  // 用户看到「回复是空的」，完全不知道发生了什么。
+  const swallowed = '{"code":"RISK_CONTROL","data":{"blocked":1}}'
+  const events = [...translateChunk(swallowed)]
+  assert.equal(events.length, 1, '风控帧不能被当成空帧丢掉')
+  assert.equal(events[0].type, 'error')
+  assert.equal(events[0].failure.kind, 'risk_control')
+  // 但普通的心跳/元数据帧仍要照旧丢弃，不能把所有认不出的帧都变成错误。
+  assert.deepEqual([...translateChunk('{"ping":1}')], [], '普通元数据帧应继续被丢弃')
+  assert.deepEqual([...translateChunk('{"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}')]
+    .filter((event) => event.type === 'error'), [], '只有 usage 的尾帧不该报错')
+})
+
+test('风控：DSH 的重试策略里不能出现 RISK_CONTROL', async () => {
+  // 走到 DSH 重试这一步说明插件内部已经把所有候选号换完了，
+  // 再让 DSH 重试同一路由就是纯重复撞墙，还会把风控升级成封禁。
+  //
+  // ⚠️ 这里**不能**引用模块级的 `GATEWAY` —— 它定义在文件后半段，
+  // 而本用例在前半段执行，会撞上 TDZ（`Cannot access 'GATEWAY' before initialization`）。
+  const { createLlmAdapter } = await import('../lib/llm/adapter.js')
+  const { AccountRouter } = await import('../lib/core/router.js')
+  const { manager, cleanup } = freshAccounts()
+  try {
+    const router = new AccountRouter(
+      manager,
+      { routing: 'quota-first', degradeAfterFailures: 1, penaltySec: 60, recoverIntervalSec: 600, maxAccountAttempts: 3, maxConcurrentRequests: 2 },
+      silent,
+    )
+    const adapter = createLlmAdapter({
+      agentId: 'qoder-cn',
+      accounts: manager,
+      router,
+      log: silent,
+      displayName: 'Qoder CN',
+      labelWithAgent: true,
+      modelsOf: async () => [],
+    })
+    const policy = adapter.providerRetryPolicy()
+    assert.ok(!policy.retryableCodes.includes('RISK_CONTROL'), 'RISK_CONTROL 不该出现在可重试码里')
+    // 反过来：这些确实该重试，别一起删掉。
+    for (const code of ['RATE_LIMIT', 'SERVER', 'NETWORK']) {
+      assert.ok(policy.retryableCodes.includes(code), `${code} 应该仍然可重试`)
+    }
+  } finally {
+    cleanup()
+  }
 })
 
 test('flattenBody 不吃循环引用', () => {
@@ -2200,6 +2353,69 @@ test('RequestLog：重启后从磁盘恢复', () => {
     assert.equal(page.entries[0].model, 'claude-sonnet-4.5')
     assert.equal(page.entries[0].ok, false)
     assert.equal(page.entries[0].error, 'no first byte')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('RequestLog：`errorKind` 必须穿过 record → list → 落盘 → 重启（不能只在内存里活）', () => {
+  // 为什么单独钉这一条：`errorKind` 是 2026-10-27 新加的字段，界面的「鉴权失效 /
+  // 触发限流 / 触发风控」三种徽标全靠它。它要穿过四道手：
+  //   `record()` 拼对象 → `JsonlLog.append` 序列化 → 重启后 `load()` 读回 → `redactDeep`
+  // 任何一道把它丢了，界面就退回笼统的「失败」—— 而这**不会报错**，只会静默降级。
+  // 单测 `adapter.ts` 只能证明「写进了采样」，证明不了「读得回来」。
+  const dir = mkdtempSync(join(tmpdir(), 'mag-req-ek-'))
+  try {
+    const path = join(dir, 'requests.jsonl')
+    const first = new RequestLog(path)
+    first.record({
+      agentId: 'qoder',
+      agentName: 'Qoder',
+      model: 'dfmodel',
+      accountId: 'qoder:a1',
+      ok: false,
+      durationMs: 900,
+      errorKind: 'risk_control',
+      error: '命中风控',
+    })
+
+    // ① 同一进程内 list 读得到
+    assert.equal(first.list().entries[0].errorKind, 'risk_control')
+
+    // ② 重启（新实例从磁盘 load）之后仍然读得到
+    const second = new RequestLog(path)
+    const entry = second.list().entries[0]
+    assert.equal(entry.errorKind, 'risk_control', '重启后丢了 —— 界面会退回「失败」两个字')
+    assert.equal(entry.accountId, 'qoder:a1', '账号也要一起活下来（同一个字段组的另一半）')
+
+    // ③ 穿过 `redactDeep`（Remote 回浏览器前必过这一道）还在。
+    //    ⚠️ 字段名里没有 token/secret/... 所以不该被脱敏掉；但这条要钉住，
+    //    否则哪天有人把脱敏规则改宽，`errorKind` 会变成 `***`，界面认不出来。
+    const redacted = redactDeep([entry])
+    assert.equal(redacted[0].errorKind, 'risk_control')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('RequestLog：成功记录不写 `errorKind`，读回来也不该凭空多出来', () => {
+  // 「不知道就不写」是这个仓库的既有约定（倍率那组用例同款）。这里钉的是
+  // 反方向：`record()` 里 `...input` 展开不该给缺失的键补一个 undefined 值，
+  // 否则界面的 `FAILURE_TEXT[undefined]` 会拿到 undefined 而不是走 `?? '失败'`。
+  const dir = mkdtempSync(join(tmpdir(), 'mag-req-ek2-'))
+  try {
+    const path = join(dir, 'requests.jsonl')
+    new RequestLog(path).record({
+      agentId: 'opencode',
+      agentName: 'OpenCode',
+      model: 'free-a',
+      accountId: null,
+      ok: true,
+      durationMs: 100,
+    })
+    const entry = new RequestLog(path).list().entries[0]
+    assert.equal(Object.hasOwn(entry, 'errorKind'), false, '成功记录不该带 errorKind')
+    assert.equal(entry.ok, true)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

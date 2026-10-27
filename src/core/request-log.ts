@@ -20,7 +20,7 @@
  */
 
 import { JsonlLog } from './store.js'
-import type { Logger } from './types.js'
+import type { ErrorKind, Logger } from './types.js'
 
 /** 一条请求记录。字段全部是可选的「不知道就不写」，不拿 0 冒充未知。 */
 export interface RequestLogEntry {
@@ -42,7 +42,20 @@ export interface RequestLogEntry {
    * 取不到时留空，界面退回显示 id（绝不编一个名字出来）。
    */
   modelName?: string
-  /** 用的哪个账号；免账号通道写 `null`。 */
+  /**
+   * 用的哪个账号；**没有任何账号参与**时写 `null`。
+   *
+   * ⚠️ 这里的 `null` 有两种来源，必须分得清（2026-10-27 修）：
+   *
+   *   1. **免账号通道**（OpenCode 那类）—— 本来就不需要账号，`null` 是常态；
+   *   2. **请求在选号阶段就失败了** —— 一个候选都没有，根本没轮到某个账号。
+   *
+   * 旧实现还有第三种，而且是最常见的一种：**失败时一律写成 `null`**。
+   * 成因是 `adapter.ts` 只在**成功之后**才把 `outcome.accountId` 赋给
+   * `accountId`，而失败分支在赋值**之前**就 `settle(false)` 了 ——
+   * 于是「429 触发了限流，是哪个号」这个用户最想知道的信息，恰恰在失败时全丢。
+   * 现在失败时从 `outcome.attempts` 的**最后一次尝试**里取，见 `adapter.ts` 的 `settle`。
+   */
   accountId: string | null
   /** 是否成功。 */
   ok: boolean
@@ -58,6 +71,18 @@ export interface RequestLogEntry {
   /** 该模型的倍率（0 = 免费）。 */
   multiplier?: number
   free?: boolean
+  /**
+   * 失败分类（`ErrorKind`）。**只有失败时才有**。
+   *
+   * 为什么要单独记一个 `kind`，而不靠界面去解析 `error` 字符串：界面上要做的
+   * 是「鉴权失效 / 触发限流 / 触发风控 / 额度耗尽」四种**完全不同**的处置
+   * （重新登录 / 等一会儿 / 换号 / 换号或充值），用正则猜上游原话迟早会猜错，
+   * 而 `kind` 在宿主侧是**已经分好的类**（`outcome.failure.kind`），现成的。
+   *
+   * 记录口径与 `ERROR_LABELS` 一致；界面侧用 `client.js` 的 `FAILURE_TEXT`
+   * 翻成一句话（两份必须一起改，`test/client.test.mjs` 有覆盖用例）。
+   */
+  errorKind?: ErrorKind
   /** 失败原因（上游原话，截断到 300 字）。 */
   error?: string
 }

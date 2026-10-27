@@ -1016,6 +1016,55 @@ test('plugin.json 的 contributes 与真实注册保持一致', async () => {
   assert.equal(manifest.client.main, './lib/client.js')
 })
 
+/**
+ * ★ 版本号必须**一处不落**地一起改。
+ *
+ * 2026-10-27 发 `0.2.2` 时发现的真实情况：版本号散在四个地方 ——
+ * `package.json` / `package-lock.json`（两处）/ `plugin.json` /
+ * `src/core/http.ts` 的默认 `user-agent` 字面量。
+ * 发版时改前三个、忘第四个是**常态**，后果是对上游宣称一个不存在的版本。
+ *
+ * 那次已经把 `http.ts` 的字面量改成自读 `package.json`（`pluginVersion()`），
+ * 所以现在只需要钉住**三个文件一致** + **UA 跟着走**。
+ * 这条用例存在的意义：下次谁再手工改版本号，漏一个就红。
+ */
+test('★ 版本号三处一致，且 user-agent 跟着 package.json 走（不再写死）', async () => {
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+  const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'))
+  const manifest = JSON.parse(readFileSync(join(root, 'plugin.json'), 'utf8'))
+
+  assert.equal(lock.version, pkg.version, 'package-lock.json 顶层 version 与 package.json 不一致')
+  assert.equal(
+    lock.packages[''].version,
+    pkg.version,
+    'package-lock.json 的 packages[""].version 与 package.json 不一致',
+  )
+  assert.equal(manifest.version, pkg.version, 'plugin.json 的 version 与 package.json 不一致')
+
+  // 语义版本的三段数字，防止写出 `0.2` 或 `v0.2.2` 这种。
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/, `版本号必须是 x.y.z，实际是「${pkg.version}」`)
+
+  // UA 必须来自 package.json，不能再有写死的版本字面量。
+  const { pluginVersion } = await import('../lib/core/http.js')
+  assert.equal(pluginVersion(), pkg.version, 'user-agent 里的版本必须等于 package.json 的 version')
+
+  // ⚠️ 只扫**非注释行**：`http.ts` 的注释里刻意留着旧字面量当反例说明
+  // （「原先这里是 `'dsh-multi-agent-gateway/0.2.1'`」），那不是代码。
+  const httpSource = readFileSync(join(root, 'src', 'core', 'http.ts'), 'utf8')
+  const codeLines = httpSource
+    .split('\n')
+    .filter((line) => {
+      const trimmed = line.trim()
+      return !trimmed.startsWith('*') && !trimmed.startsWith('//') && !trimmed.startsWith('/*')
+    })
+  const offenders = codeLines.filter((line) => /dsh-multi-agent-gateway\/\d/.test(line))
+  assert.deepEqual(
+    offenders,
+    [],
+    `src/core/http.ts 的**代码**里又出现了写死的版本号（应该用 pluginVersion()）：\n${offenders.join('\n')}`,
+  )
+})
+
 test('样式真的会被注入到页面（没注入 = 界面退化成白板）', () => {
   const appended = []
   const makeDocument = (existing) => ({
@@ -2260,4 +2309,387 @@ test('检查更新：busy（检查中）禁用按钮并说明，不给更新按�
   assert.ok(!card.includes('已是最新'), '检查中不能说「已是最新」')
   panel.dispose()
 })
+
+// ═══════════════════ 多账号：限流要认得出是哪个号、为什么 ═══════════════════
+
+/**
+ * 用户报障原话（2026-10-27）：
+ *   「同一个平台多账号，其中一个被限流了，不能明确知道哪个账号被限流。」
+ *
+ * 根因不是数据缺失 —— `AccountHealth.lastError.kind` 和 `penaltyUntil` **一直都在**
+ * 快照里，是界面从来没读过它们。旧实现只画「降权中（2 次失败）」，
+ * 于是「触发限流」「额度耗尽」「鉴权失效」在屏幕上长得一模一样，
+ * 而这三者的处置办法完全不同。
+ *
+ * 这两条用例钉住：① 每种失败原因都要有一句人话；② 降权徽标必须把原因写出来。
+ */
+test('健康徽标：每种失败原因都有中文文案（与宿主 ERROR_LABELS 同口径）', () => {
+  const kinds = ['none', 'auth', 'rate_limit', 'quota', 'server', 'network', 'bad_request', 'not_found', 'unsupported', 'unknown']
+  for (const kind of kinds) {
+    assert.equal(
+      typeof client.FAILURE_TEXT[kind], 'string',
+      `ErrorKind「${kind}」没有文案 —— 界面上会显示成空白`,
+    )
+    assert.ok(client.FAILURE_TEXT[kind].length > 0, `ErrorKind「${kind}」的文案是空串`)
+  }
+  // 三个最要紧的必须分得开：它们的处置办法完全不同。
+  const texts = ['auth', 'rate_limit', 'quota'].map((kind) => client.FAILURE_TEXT[kind])
+  assert.equal(new Set(texts).size, 3, '鉴权失效 / 触发限流 / 额度耗尽 必须各有一句，不能合并')
+})
+
+test('健康徽标：降权中必须写出原因，不能只说「N 次失败」', () => {
+  const future = Date.now() + 5 * 60_000
+  const view = client.healthView({
+    accountId: 'qoder:a2',
+    state: 'degraded',
+    failures: 2,
+    penaltyUntil: future,
+    weight: 2,
+    lastError: { kind: 'rate_limit', message: 'upstream 429', at: Date.now() - 1000 },
+  })
+  // ★ 这条是报障的正解：徽标里要能直接看到「触发限流」四个字。
+  assert.ok(view.text.includes('触发限流'), `降权徽标必须写明原因，实际是「${view.text}」`)
+  assert.equal(view.tone, 'warn')
+  // 悬停里给完整证据链：上游原话 + 恢复时间。
+  assert.ok(view.hint.includes('upstream 429'), '上游原话要能悬停看到')
+  assert.ok(view.hint.includes('自动恢复'), '要说清什么时候恢复，否则用户只能反复点「测活」猜')
+})
+
+test('健康徽标：冷却已过但失败计数没清 → 说「已恢复」，不能继续画成「降权中」', () => {
+  // `accounts.available()` 只看 penaltyUntil。冷却一过这个号就在正常接请求了，
+  // 这时还画「降权中」会让用户白等 —— 这是同一个报障的另一半。
+  const view = client.healthView({
+    accountId: 'qoder:a2',
+    state: 'degraded',
+    failures: 3,
+    penaltyUntil: Date.now() - 60_000,
+    weight: 3,
+    lastError: { kind: 'rate_limit', message: 'upstream 429', at: Date.now() - 120_000 },
+  })
+  assert.ok(view.text.includes('已恢复'), `冷却结束要说已恢复，实际是「${view.text}」`)
+  assert.ok(!view.text.includes('降权中'), '冷却结束后不该再画「降权中」')
+  // 但原因仍要保留：用户排查时需要知道它刚才为什么被降权。
+  assert.ok(view.text.includes('触发限流') || view.hint.includes('触发限流'), '原因不能被抹掉')
+})
+
+test('账号页：每个账号都有「启用」总开关，与「参与对话」是两个按钮', () => {
+  const agents = [{
+    agentId: 'qoder',
+    name: 'Qoder',
+    visible: true,
+    implemented: true,
+    enabled: true,
+    accounts: [
+      { id: 'qoder:a1', label: '主号', enabled: true, routeChat: true, health: { state: 'ok' }, quota: null },
+      { id: 'qoder:a2', label: '备用', enabled: false, routeChat: true, health: { state: 'ok' }, quota: null },
+    ],
+    modelCount: 0,
+  }]
+  const { panel, html } = dashboardWith({ page: 'accounts', agents })
+
+  // ★ 用户报障：「不知道哪个是启用账户，哪个是把账户不参与选号」。
+  //   旧实现只有「对话 / 签到 / 任务」三个开关，`enabled` 压根没有按钮。
+  for (const id of ['qoder:a1', 'qoder:a2']) {
+    assert.ok(
+      html.includes(`data-act="acc-toggle" data-id="${id}" data-key="enabled"`),
+      `账号 ${id} 缺「启用」总开关（用户分不清哪个按钮是启用账户）`,
+    )
+    assert.ok(
+      html.includes(`data-act="acc-toggle" data-id="${id}" data-key="routeChat"`),
+      `账号 ${id} 缺「参与对话」开关`,
+    )
+  }
+  // 两个开关的文案必须不一样，否则用户还是分不清。
+  assert.ok(html.includes('启用'), '缺「启用」标签')
+  assert.ok(html.includes('参与对话'), '「对话」标签含义太含糊，应写成「参与对话」')
+  // 停用的账号要能一眼看出来（整行压暗 + 单独徽标）。
+  assert.ok(html.includes('data-off="1"'), '停用的账号整行要压暗，长列表里才认得出来')
+  assert.ok(html.includes('已停用'), '停用的账号要有单独徽标')
+  panel.dispose()
+})
+
+test('账号页：停用账号的「启用」开关是关的，正常账号是开的', () => {
+  const agents = [{
+    agentId: 'qoder',
+    name: 'Qoder',
+    visible: true,
+    implemented: true,
+    enabled: true,
+    accounts: [
+      { id: 'qoder:a1', label: '主号', enabled: true, routeChat: true, health: { state: 'ok' }, quota: null },
+      { id: 'qoder:a2', label: '备用', enabled: false, routeChat: true, health: { state: 'ok' }, quota: null },
+    ],
+    modelCount: 0,
+  }]
+  const { panel, html } = dashboardWith({ page: 'accounts', agents })
+
+  const switchOf = (id) => {
+    const at = html.indexOf(`data-act="acc-toggle" data-id="${id}" data-key="enabled"`)
+    assert.ok(at >= 0, `找不到账号 ${id} 的启用开关`)
+    // aria-checked 在属性**前面**（switchHTML 把 attrs 拼在末尾）。
+    const tag = html.slice(Math.max(0, at - 120), at + 40)
+    const match = /aria-checked="(true|false)"/.exec(tag)
+    assert.ok(match !== null, `账号 ${id} 的启用开关没有 aria-checked`)
+    return match[1] === 'true'
+  }
+  assert.equal(switchOf('qoder:a1'), true, 'enabled:true 的账号，启用开关必须是开的')
+  assert.equal(switchOf('qoder:a2'), false, 'enabled:false 的账号，启用开关必须是关的')
+  panel.dispose()
+})
+
+test('平台页签：直接标出「几个号在限流 / 失效 / 停用」，不用挨个点进去找', () => {
+  const future = Date.now() + 5 * 60_000
+  const agents = [
+    {
+      agentId: 'qoder',
+      name: 'Qoder',
+      visible: true,
+      implemented: true,
+      enabled: true,
+      accounts: [
+        { id: 'qoder:a1', label: '主号', enabled: true, health: { state: 'ok' }, quota: null },
+        { id: 'qoder:a2', label: '备用', enabled: true, health: { state: 'degraded', failures: 2, penaltyUntil: future, lastError: { kind: 'rate_limit' } }, quota: null },
+        { id: 'qoder:a3', label: '老号', enabled: false, health: { state: 'ok' }, quota: null },
+      ],
+      modelCount: 0,
+    },
+    {
+      agentId: 'trae',
+      name: 'Trae',
+      visible: true,
+      implemented: true,
+      enabled: true,
+      accounts: [{ id: 'trae:a1', label: '唯一', enabled: true, health: { state: 'ok' }, quota: null }],
+      modelCount: 0,
+    },
+  ]
+  const { panel, html } = dashboardWith({ page: 'accounts', agents })
+
+  // Qoder 那个页签要带异常计数，Trae 那个不该带。
+  const pills = html.slice(0, html.indexOf('</div>', html.indexOf('mag-pills')))
+  assert.ok(/1 限流/.test(pills), `平台页签要标出「1 限流」，实际页签是：${pills}`)
+  assert.ok(/1 停用/.test(pills), '平台页签要标出「1 停用」')
+  assert.ok(!/0 限流/.test(pills), '没有限流的计数不要画出来')
+  panel.dispose()
+})
+
+test('总览「最近失败」：必须带账号列，否则看得到限流却不知道是哪个号', () => {
+  const agents = [{
+    agentId: 'qoder',
+    name: 'Qoder',
+    visible: true,
+    implemented: true,
+    enabled: true,
+    accounts: [
+      { id: 'qoder:a1', label: '主号', enabled: true, health: { state: 'ok' }, quota: null },
+      { id: 'qoder:a2', label: '备用', enabled: true, health: { state: 'ok' }, quota: null },
+    ],
+    modelCount: 0,
+  }]
+  const { panel } = dashboardWith({ page: 'overview', agents })
+  // 日志条目里 `accountId` 一直都有（`RequestLogEntry.accountId`），
+  // 是表格从没画过它 —— 用户报障「不知道哪个账号被限流」的另一半就在这。
+  // ⚠️ 字段名是 `logState`（不是 `log`）：`projection()` 把它投影成 `log`，
+  // 但面板自己的状态叫 `logState`，写错名字会静默拿到空列表、用例假通过。
+  panel.logState = {
+    status: 'ready',
+    entries: [
+      { ts: 1700000000000, agentId: 'qoder', model: 'qfmodel', accountId: 'qoder:a2', ok: false, error: 'upstream 429 rate limited' },
+      { ts: 1700000001000, agentId: 'opencode', model: 'free-x', accountId: null, ok: false, error: 'boom' },
+    ],
+    total: 2,
+    page: 1,
+    pageSize: 20,
+    error: null,
+  }
+  const text = client.DashboardHTML(panel.projection())
+
+  assert.ok(text.includes('<th>账号</th>'), '「最近失败」表必须有「账号」列')
+  // 账号 id 要翻译成标签，不能直接甩 `qoder:a2` 给用户。
+  assert.ok(text.includes('备用'), `失败行要显示账号标签「备用」，实际：${text.slice(0, 600)}`)
+  // 免账号通道（`accountId === null` 且平台是 `FREE_ONLY`）要写「免账号」，
+  // 不能是空白或 "null"。⚠️ 注意这是**真的**免账号通道（opencode），
+  // 「非免账号平台 + null」是另一回事，见下面那条三态用例。
+  assert.ok(text.includes('免账号'), '免账号通道的 accountId 为 null 时要写「免账号」')
+  assert.ok(!text.includes('null'), '不能把 null 直接甩到界面上')
+  panel.dispose()
+})
+
+// ───────── 请求日志「账号 / 结果」两格的三态与分类（2026-10-27） ─────────
+//
+// 用户拿着一张日志截图问「是不是授权过期了」。那张图里 11 行失败，账号列
+// **全部**写着「免账号」，结果列全是「失败」两个字 —— 截图因此什么也证明不了。
+//
+// 两个独立缺陷：
+//   ① 宿主把每条失败都记成 `accountId: null`（已修，见 request-log-sampling 用例）；
+//   ② 界面把 `null` **无条件**翻成「免账号」，并且把原因只放进 `title`。
+//
+// ②的后果比①更难发现：即使宿主记对了，只要界面这么画，用户看到的仍然是
+// 「免账号」；而 `title` 是悬停才有，**截图带不出来**。
+
+test('★ 账号列三态：有 id → 标签；免账号通道 → 免账号；其余 null → 未记录', () => {
+  const labels = new Map([['qoder:a1', '主号']])
+
+  // ① 有 id → 翻成标签
+  assert.equal(
+    client.accountCellHTML({ agentId: 'qoder', accountId: 'qoder:a1' }, labels),
+    '主号',
+  )
+
+  // ② 免账号通道（`FREE_ONLY` 里的平台）→ 这才是真的不需要账号
+  assert.equal(
+    client.accountCellHTML({ agentId: 'opencode', accountId: null }, labels),
+    '免账号',
+    'opencode 是免账号通道，null 是常态',
+  )
+
+  // ③ 非免账号平台 + null → **绝不能**写「免账号」
+  const orphan = client.accountCellHTML({ agentId: 'qoder', accountId: null }, labels)
+  assert.ok(
+    orphan.includes('未记录'),
+    `非免账号平台的 null 是「没记下来」，不是「免账号」。实际：${orphan}`,
+  )
+  assert.ok(!orphan.includes('免账号'), '这一格正是用户误以为「没配账号」的来源')
+})
+
+test('★ 结果列：分类徽标 + 原因内联，截图里也要看得见', () => {
+  // ① 成功 → 绿徽标，不带原因
+  const ok = client.resultCellHTML({ ok: true })
+  assert.ok(ok.includes('成功') && ok.includes('data-tone="ok"'))
+
+  // ② 失败 + 分类 → 徽标用 FAILURE_TEXT 那句话，而不是笼统的「失败」
+  const auth = client.resultCellHTML({ ok: false, errorKind: 'auth', error: 'token expired' })
+  assert.ok(auth.includes('鉴权失效'), `鉴权失败要写「鉴权失效」。实际：${auth}`)
+  assert.ok(!auth.includes('>失败<'), '不能退化成笼统的「失败」')
+  // ③ 原因必须**内联**（截图带不出 title）
+  assert.ok(auth.includes('token expired'), '上游原话要直接写在格子里，不能只放 title')
+
+  // ④ 分类决定色调：鉴权要用户动手 → 红；限流等一会儿 → 黄
+  assert.ok(auth.includes('data-tone="err"'), '鉴权失效是真要动手的，必须红')
+  const limited = client.resultCellHTML({ ok: false, errorKind: 'rate_limit', error: '429' })
+  assert.ok(limited.includes('触发限流'))
+  assert.ok(limited.includes('data-tone="warn"'), '限流等一会儿就好，不该和鉴权一个颜色')
+
+  // ⑤ 老记录没有 errorKind → 退回「失败」，但原因仍然内联
+  const legacy = client.resultCellHTML({ ok: false, error: 'boom' })
+  assert.ok(legacy.includes('失败') && legacy.includes('boom'))
+
+  // ⑥ 超长原话要截断（表格不能被撑爆），但完整内容留在 title 里
+  const long = client.resultCellHTML({ ok: false, errorKind: 'server', error: 'x'.repeat(200) })
+  assert.ok(long.includes('…'), '超长原因要截断')
+  assert.ok(long.includes(`title="${'x'.repeat(200)}"`), '完整原话要留在 title 里')
+})
+
+test('★ 每一种失败分类都有自己的色调，不能全挤成一种', () => {
+  const toneOf = (kind) => {
+    const hit = client.resultCellHTML({ ok: false, errorKind: kind, error: 'x' }).match(/data-tone="(\w+)"/)
+    assert.ok(hit !== null, `${kind} 必须有徽标`)
+    return hit[1]
+  }
+  // 要用户动手的三种（重新登录 / 换号 / 充值）→ 红
+  for (const kind of ['auth', 'quota', 'risk_control']) {
+    assert.equal(toneOf(kind), 'err', `${kind} 的处置办法是「动手」，必须红`)
+  }
+  // 等一会儿 / 上游抖动 → 黄
+  for (const kind of ['rate_limit', 'server', 'network']) {
+    assert.equal(toneOf(kind), 'warn', `${kind} 只要等，不该画成和鉴权一样`)
+  }
+  // 请求本身有问题 → 中性（换号也没用）
+  assert.equal(toneOf('bad_request'), 'idle')
+})
+
+/**
+ * 漂移守卫：`FAILURE_TEXT` 与 `FAILURE_TONE` 必须**同步**。
+ *
+ * 两份表都在客户端，宿主的 `ErrorKind` 加一个新值时，只改一份就会露馅 ——
+ * 症状是「新分类的徽标没有色调」→ 落到 `?? 'err'` 兜底，全部画成红色，
+ * 于是「限流」和「鉴权失效」又长得一样了（这正是本次要修的病）。
+ *
+ * 与 `FAILURE_TEXT` 覆盖 `ERROR_LABELS` 那条用例同构，都是防「两份手抄表漂移」。
+ */
+test('★ FAILURE_TONE 必须覆盖 FAILURE_TEXT 的每一个失败分类', () => {
+  const missing = Object.keys(client.FAILURE_TEXT)
+    // `none` 是「正常」，成功行在 `resultCellHTML` 里提前返回，永远走不到色调表。
+    .filter((kind) => kind !== 'none' && client.FAILURE_TONE[kind] === undefined)
+  assert.deepEqual(
+    missing,
+    [],
+    `这些分类没有色调，会落到 err 兜底、和鉴权失效画成一个颜色：${missing.join(', ')}`,
+  )
+})
+
+/**
+ * ★ **接线**测试：日志页真的调用了那两个新函数吗？
+ *
+ * 上面两条钉的是「函数本身对不对」，这一条钉的是「页面有没有用它」。
+ * 两者缺一不可 —— 真实缺陷的形态往往是：函数写得好好的，但渲染那行
+ * 还在读旧字段（或干脆没改）。那种情况下函数级用例**全绿**，界面照旧是
+ * 「免账号 / 失败」，用户该看不到的仍然看不到。
+ *
+ * 所以这里走完整链路：`dashboardWith` → `panel.projection()` → `DashboardHTML`，
+ * 只在最外层断言最终 HTML。
+ */
+test('★ 接线：日志页与「最近失败」卡都必须用上三态账号 + 分类徽标 + 内联原因', () => {
+  const agents = [{
+    agentId: 'qoder',
+    name: 'Qoder',
+    visible: true,
+    implemented: true,
+    enabled: true,
+    accounts: [{ id: 'qoder:a1', label: '主号', enabled: true, health: { state: 'ok' }, quota: null }],
+    modelCount: 0,
+  }]
+  const entries = [
+    {
+      ts: 1700000000000, agentId: 'qoder', agentName: 'Qoder',
+      model: 'dfmodel', modelName: 'DeepSeek-Flash', accountId: 'qoder:a1',
+      ok: false, errorKind: 'rate_limit',
+      error: '上游排队中（p3 队列），约 30 秒后重试', durationMs: 900,
+    },
+    {
+      ts: 1700000001000, agentId: 'workbuddy-intl', agentName: 'WorkBuddy International',
+      model: 'x', accountId: null, ok: false,
+      error: '连接上游失败：fetch failed', durationMs: 1200,
+    },
+    {
+      ts: 1700000002000, agentId: 'opencode', agentName: 'OpenCode',
+      model: 'free-x', accountId: null, ok: false, error: 'boom', durationMs: 300,
+    },
+  ]
+
+  for (const page of ['logs', 'overview']) {
+    const { panel } = dashboardWith({ page, agents })
+    panel.logState = { status: 'ready', entries, total: 3, page: 1, pageSize: 20, error: null }
+    const html = client.DashboardHTML(panel.projection())
+    const scope = page === 'logs' ? html.slice(html.indexOf('请求日志')) : html.slice(html.indexOf('最近失败'))
+
+    // ① 分类：限流行必须写出「触发限流」，不能只是笼统的「失败」
+    assert.ok(scope.includes('触发限流'), `${page}：限流行要写「触发限流」`)
+    // ② 原因内联（截图带得出）
+    assert.ok(scope.includes('上游排队中'), `${page}：上游原话必须内联，不能只放 title`)
+    // ③ 有 id 的行翻成标签
+    assert.ok(scope.includes('主号'), `${page}：账号 id 要翻成标签`)
+    // ④ 非免账号平台的 null → 未记录
+    assert.ok(scope.includes('未记录'), `${page}：非免账号平台的 null 必须画「未记录」`)
+    // ⑤ 免账号通道的 null → 免账号（这是真的不需要账号）
+    assert.ok(scope.includes('免账号'), `${page}：opencode 那行仍要画「免账号」`)
+    panel.dispose()
+  }
+})
+
+test('★ 接线：空态 colspan 必须与真实列数一致（加列最容易漏改的地方）', () => {
+  // 2026-10-27 给「最近失败」加了一列「结果」，`colspan` 要是没跟着改，
+  // 空态那行会横跨 5 列里的 4 列 —— 表格右边缺一格，看起来像渲染坏了。
+  const { panel } = dashboardWith({ page: 'overview' })
+  panel.logState = { status: 'ready', entries: [], total: 0, page: 1, pageSize: 20, error: null }
+  const html = client.DashboardHTML(panel.projection())
+  const card = html.slice(html.indexOf('最近失败'), html.indexOf('最近失败') + 1200)
+
+  const cols = (card.match(/<th>/g) ?? []).length
+  const span = Number((card.match(/colspan="(\d+)"/) ?? [])[1] ?? 0)
+  assert.ok(cols > 0, '「最近失败」卡必须有表头')
+  assert.equal(span, cols, `空态 colspan(${span}) 必须等于表头列数(${cols})`)
+  panel.dispose()
+})
+
 

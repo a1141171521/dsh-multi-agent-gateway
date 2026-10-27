@@ -13,7 +13,39 @@
 
 import { classify, flattenBody, parseRequestId, parseRetryAfter } from './errors.js'
 import { redactSecret } from './crypto.js'
+import { readFileSync } from 'node:fs'
 import type { ErrorKind, HttpFn, HttpInit, HttpResult, Logger } from './types.js'
+
+/**
+ * 本插件自己的版本号 —— 给默认 `user-agent` 用。
+ *
+ * ⚠️ **必须从 `package.json` 读，不能写死**。原先这里是字面量
+ * `'dsh-multi-agent-gateway/0.2.1'`，于是每次发版都会漏改一处：
+ * 版本号散布在 4 个文件（`package.json` / `package-lock.json` /
+ * `plugin.json` / 这里），发版时改前三个、忘第四个是常态，
+ * 结果是对上游宣称了一个不存在的版本。发 `0.2.2` 时顺手改成自读。
+ *
+ * 路径用 `import.meta.url` 相对定位：`src/core/http.ts` 与 `lib/core/http.js`
+ * 都在根目录下一层，`../../package.json` 两边都对。
+ *
+ * 读不到就退回 `0.0.0` 并**不抛错** —— UA 只是礼貌性标识，
+ * 不能因为读不到文件就让整条 HTTP 链路起不来。
+ */
+let cachedVersion: string | undefined
+export function pluginVersion(): string {
+  if (cachedVersion !== undefined) return cachedVersion
+  try {
+    const raw = readFileSync(new URL('../../package.json', import.meta.url), 'utf8')
+    const parsed: unknown = JSON.parse(raw)
+    const version = typeof parsed === 'object' && parsed !== null
+      ? (parsed as { version?: unknown }).version
+      : undefined
+    cachedVersion = typeof version === 'string' && version !== '' ? version : '0.0.0'
+  } catch {
+    cachedVersion = '0.0.0'
+  }
+  return cachedVersion
+}
 
 /** 把两个 signal 合成一个（Node 20+ 有 `AbortSignal.any`，这里留个兜底）。 */
 function combineSignals(left: AbortSignal | undefined, right: AbortSignal | undefined): AbortSignal | undefined {
@@ -60,7 +92,7 @@ export function createHttp(log: Logger, defaultTimeoutMs = 60000): HttpFn {
     }
 
     const headers: Record<string, string> = { ...(init.headers ?? {}) }
-    if (headers['user-agent'] === undefined) headers['user-agent'] = 'dsh-multi-agent-gateway/0.2.1'
+    if (headers['user-agent'] === undefined) headers['user-agent'] = `dsh-multi-agent-gateway/${pluginVersion()}`
 
     let response: Response
     try {

@@ -590,3 +590,135 @@ test('日志：展示名与 id 不同名时必须两个都在（Qoder 的 key �
     assert.equal(samples[0].modelName, c.name, `${c.id} 的展示名必须是 ${c.name}`)
   }
 })
+
+// ───────────── 失败也要记「哪个账号」+「哪一类失败」（2026-10-27） ─────────────
+//
+// 用户拿着一张请求日志截图问「是不是授权过期了」。那张图里 11 行失败，
+// 账号列**全部**写着「免账号」，看着像「这些平台压根没配账号」。
+//
+// 两个独立缺陷叠在一起：
+//   ① 宿主把**每一条失败**都记成 `accountId: null` —— `adapter.ts` 只在
+//      **成功之后**才赋值 `accountId`，而失败分支在赋值之前就 `settle(false)`；
+//   ② 界面把 `null` 无条件翻成「免账号」，于是「没记录」冒充了「不需要账号」。
+//
+// 顺带补了 `errorKind`：只有上游原话的话，界面没法把「鉴权失效」和「触发限流」
+// 分开画 —— 而这两者的处置办法完全相反（重新登录 vs 等一会儿）。
+//
+// ⚠️ 这里的假 router 特意让 `attempts` **非空**，因为真实 `AccountRouter.execute()`
+// 每次失败都会 push 一条；`attempts: []` 只出现在「一个候选都没轮到」时。
+
+/**
+ * 造一个「路由必然失败」的适配器。
+ *
+ * @param {object} options
+ * @param {Array<{accountId: string, kind: string}>} options.attempts - 假 router 回报的尝试记录。
+ * @param {string} options.kind - 最终失败分类。
+ */
+function failingHarness({ attempts, kind = 'rate_limit', message = '上游原话' }) {
+  const samples = []
+  const backend = {
+    id: 'qoder-cn',
+    name: 'Qoder CN',
+    // 真适配器在失败时通常**一个事件都不发**（401/429 在首帧之前就返回了）。
+    async *requestChatStream() {},
+  }
+  const adapter = createLlmAdapter({
+    agentId: 'qoder-cn',
+    displayName: 'Qoder CN',
+    labelWithAgent: false,
+    accounts: new Proxy({}, { get: () => () => undefined }),
+    router: {
+      async execute() {
+        return {
+          ok: false,
+          attempts: attempts.map((item) => ({
+            accountId: item.accountId,
+            kind: item.kind,
+            startedAt: 0,
+            elapsedMs: 1,
+          })),
+          failure: { kind, message, at: Date.now() },
+        }
+      },
+    },
+    adapterOf: () => backend,
+    contextOf: () => ({ config: {}, log: silent, http: async () => ({}), cache: {}, now: () => Date.now() }),
+    modelsOf: async () => [],
+    exposedModelsOf: async () => [],
+    onRequest: (sample) => samples.push(sample),
+    log: silent,
+  })
+  return { adapter, samples }
+}
+
+test('★ 失败时也要记下「哪个账号」—— 从 attempts 的最后一次取', async () => {
+  const { adapter, samples } = failingHarness({
+    attempts: [
+      { accountId: 'qoder-cn:主号', kind: 'rate_limit' },
+      { accountId: 'qoder-cn:第三个', kind: 'rate_limit' },
+    ],
+  })
+  await drain(adapter)
+
+  assert.equal(samples.length, 1)
+  assert.equal(samples[0].ok, false)
+  assert.equal(
+    samples[0].accountId,
+    'qoder-cn:第三个',
+    '必须记最后尝试的那个号 —— 原先一律记 null，界面就画成「免账号」',
+  )
+})
+
+test('一个候选都没轮到 → accountId 才是真的 null（不能编一个号出来）', async () => {
+  const { adapter, samples } = failingHarness({ attempts: [], kind: 'unsupported', message: '还没有账号' })
+  await drain(adapter)
+
+  assert.equal(samples[0].accountId, null, '没试过任何账号时只能是 null')
+})
+
+test('★ 失败分类（errorKind）必须进采样 —— 界面靠它区分「鉴权失效」与「触发限流」', async () => {
+  for (const kind of ['auth', 'rate_limit', 'quota', 'risk_control', 'network']) {
+    const { adapter, samples } = failingHarness({
+      attempts: [{ accountId: 'qoder-cn:a', kind }],
+      kind,
+      message: `${kind} 的上游原话`,
+    })
+    await drain(adapter)
+    assert.equal(samples[0].errorKind, kind, `${kind} 必须原样写进采样`)
+    assert.equal(samples[0].error, `${kind} 的上游原话`, '原话也要在（errorKind 不能取代它）')
+  }
+})
+
+test('成功时不写 errorKind（不知道就不写，不拿默认值冒充）', async () => {
+  const { adapter, samples } = harness({
+    models: [{ id: 'auto', name: 'Auto', agentId: 'qoder-cn', agentName: 'Qoder CN', multiplier: 0.5 }],
+    events: [
+      { type: 'text', text: '你好' },
+      { type: 'finish', reason: 'stop' },
+    ],
+  })
+  await drain(adapter)
+
+  assert.equal(samples[0].ok, true)
+  assert.equal(
+    Object.hasOwn(samples[0], 'errorKind'),
+    false,
+    '成功记录不该带 errorKind —— 否则界面会给成功行也画一个失败徽标',
+  )
+})
+
+test('流中途报错：账号已选到，必须记下来（正是用户最想知道的那个号）', async () => {
+  const { adapter, samples } = harness({
+    models: [{ id: 'auto', name: 'Auto', agentId: 'qoder-cn', agentName: 'Qoder CN', multiplier: 0.5 }],
+    events: [
+      { type: 'text', text: '开头' },
+      { type: 'error', failure: { kind: 'network', message: '读取上游流失败：terminated', at: Date.now() } },
+    ],
+  })
+  await drain(adapter)
+
+  assert.equal(samples[0].ok, false)
+  assert.equal(samples[0].accountId, 'qoder-cn:test', '路由成功过，账号就是确定的')
+  assert.equal(samples[0].errorKind, 'network', '中途断流的分类也要记')
+})
+

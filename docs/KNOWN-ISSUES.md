@@ -13,6 +13,261 @@
 
 ---
 
+## 🟡 #0q 请求日志把「每条失败」都记成「免账号」，原因只藏在悬停里（2026-10-27）
+
+> 用户原话：「有的用户用插件出现了这个错误，是授权过期了吗？」
+> （附一张请求日志截图：11 行失败，账号列全是「免账号」，结果列全是「失败」）
+
+### 现象
+
+用户拿一张日志截图来问「是不是授权过期」。**这张图无法回答这个问题**，
+而且不是用户截得不好 —— 是界面把该有的信息全抹掉了：
+
+| 该看到 | 实际看到 |
+|---|---|
+| 是哪个号失败了 | 「免账号」 |
+| 是鉴权失效 / 限流 / 风控 / 额度 | 只有「失败」两个字 |
+| 上游原话 | 只在 `title` 里 —— **截图带不出来** |
+
+后果最坏的一层：截图里的「免账号」看起来像「这些平台压根没配账号」，
+于是排查方向被引到「重新登录」上去，而真实原因可能是限流。
+
+### 三个根因
+
+**① 宿主把每条失败都记成 `accountId: null`（真 bug）**
+
+`src/llm/adapter.ts` 里 `accountId` 只在**成功之后**才赋值：
+
+```ts
+let accountId: string | null = null      // 先声明 null
+if (!outcome.ok) { failureMessage = ...; settle(false); return }   // ← 这里就结算了
+accountId = outcome.accountId ?? null    // 成功才走到
+```
+
+`settle()` 读 `accountId` 时失败路径**永远还没走到赋值那行**，于是恒为 `null`。
+本机 654 条真实日志实测：`ok=false` 的 23 条里 22 条 `accountId === null`；
+唯一有值的那条是「路由成功后才断流」（`读取上游流失败：terminated`）——
+它反证了上面的判断：**先成功赋值、后断流**，账号就记下来了。
+
+**② 界面把 `null` 无条件翻成「免账号」**
+
+```js
+const accountText = (id) => (id === null || id === undefined ? '免账号' : ...)
+```
+
+`null` 在这个字段上其实有**两种**含义（免账号通道 / 根本没记），
+被压成一句话。而「免账号」这个措辞会主动误导：它说的是「不需要账号」。
+
+**③ 原因只放进 `title`**
+
+```js
++ `<td title="${esc(entry.error ?? '')}">${badge('失败','err')}</td>`
+```
+
+悬停才可见 = **截图里不存在**。用户能提供的证据通常就是一张截图。
+
+### 已改
+
+| 位置 | 改法 |
+|---|---|
+| `src/core/request-log.ts` | `RequestLogEntry` 新增 `errorKind?: ErrorKind`；`accountId` 注释写明两种 `null` |
+| `src/llm/adapter.ts` | 失败分支 `accountId = outcome.attempts.at(-1)?.accountId ?? null`；新增 `failureKind` 并在 `settle()` 里写 `errorKind`；流中途报错也记 `errorKind` |
+| `client/client.js` | 新增 `accountCellHTML()`（三态）与 `resultCellHTML()`（分类徽标 + 内联原因）；新增 `FAILURE_TONE` 映射；「最近失败」卡也换成这两格，并加「结果」列 |
+| `client/client.js` | 删掉 `overviewHTML` 里那份重复的 `accountText` —— 它是「一律免账号」的第二处来源 |
+| `client/client.js` | CSS 新增 `.mag-fail-cell` / `.mag-fail-why`；表头说明改成「原因直接写在结果格里」 |
+
+三态判定（`accountCellHTML`）：
+
+| 条件 | 显示 | 含义 |
+|---|---|---|
+| 有 id | 账号标签 | 确定是哪个号 |
+| `null` + `FREE_ONLY[agentId]` | 「免账号」 | 真的不需要账号（OpenCode） |
+| 其它 `null` | 「未记录」+ 悬停解释 | 老记录，或请求在选到账号前就失败 |
+
+分类色调（`FAILURE_TONE`）—— 按**用户要做什么**分，不按严重程度分：
+
+| 分类 | 色调 | 用户要做什么 |
+|---|---|---|
+| `auth` / `quota` / `risk_control` | 红 | 重新登录 / 充值 / 换号 |
+| `rate_limit` / `server` / `network` / `unknown` | 黄 | 等一会儿 |
+| `bad_request` / `not_found` / `unsupported` | 中性 | 换号也没用 |
+
+### 验证
+
+- **604 宿主 + 81 客户端**全绿（新增 5 条宿主 + 3 条客户端）。
+- **反向验证**：
+  - 把 `accountId = outcome.attempts.at(-1)…` 改回 `null` → 「失败时也要记下哪个账号」红 1 条；
+  - 从 `settle()` 删掉 `errorKind` → 「失败分类必须进采样」「流中途报错」红 2 条；
+  - 把 `accountCellHTML` 的第三态改回 `'免账号'` → 「账号列三态」红 1 条。
+- **真实日志回放**（把本机 `requests.jsonl` 的失败行喂进新的渲染函数）：
+
+```
+workbuddy-intl  => 账号: 未记录    结果: 失败 | 连接上游失败：fetch failed
+qoder           => 账号: qoder-账号 结果: 触发限流 | 上游排队中（p3 队列），约 30 秒后重试
+opencode        => 账号: 免账号    结果: 失败 | boom
+qoder-cn        => 账号: qoder-cn:主号  结果: 鉴权失效 | 凭证缺少 uid，加密通道无法签名
+```
+
+第二条正是本次要解决的形态：以前它是「免账号 / 失败」，
+现在能直接读出「qoder-账号被限流了，等 30 秒」。
+
+### 还差
+
+1. **老记录补不回来** —— 已经写进 `requests.jsonl` 的失败行仍然是 `accountId: null`。
+   界面显示「未记录」而不是瞎猜，这是有意的。要清掉旧记录用日志页的「清空」。
+2. **`errorKind` 只在本次改动之后才有** —— 老记录退回「失败」两个字。
+3. **没在真机上看过新表格的排版** —— 原因内联后「结果」列变宽，
+   窄屏下会不会把表格挤坏，要真机确认（`max-width:260px` + 省略号是兜底）。
+4. 顺带记一笔：`requests.jsonl` 里 `accountId: null` 的行**不代表**平台没配账号。
+   判断「有没有配账号」要看账号页或 `state.json`，不要从日志推。
+
+---
+
+
+## 🟡 #0p 账号被风控后不会自动换号（2026-10-27）
+
+> 用户原话：「现在这个做的有账号如果被风控以后，自动切换其他账号吗？」
+
+### 现象
+
+会换，但**只覆盖一半**。实测（改之前）：
+
+| 上游返回 | 判定 | 换号 |
+|---|---|---|
+| 429 限流 / 排队 | `rate_limit` | ✅ |
+| 403 风控 | `auth` | ✅（但文案被覆盖，见下） |
+| 401 / 402 / 403 额度 | `auth` / `quota` | ✅ |
+| **400 风控** | `bad_request` | ❌ **不换** |
+
+八个常见 400 风控文案**全部**落到 `bad_request`：
+
+```
+400 "risk control"                  -> bad_request  ❌
+400 "abnormal request"              -> bad_request  ❌
+400 "verification required"         -> bad_request  ❌
+400 "device fingerprint mismatch"   -> bad_request  ❌
+400 "your account has been banned"  -> bad_request  ❌
+400 "account suspended"             -> bad_request  ❌
+400 "suspicious activity"           -> bad_request  ❌
+400 "please complete the captcha"   -> bad_request  ❌
+```
+
+`bad_request` 的语义是「请求本身有问题，换号也一样错」⇒ 直接放弃。但风控恰恰是**账号维度**的问题，换号是对的。
+
+### 三个根因
+
+**① `errors.ts` 的 400 分支没有风控这一类**
+
+只兜了额度 / 鉴权 / 限流三类文案，风控不在其中。
+
+**② 风控不能复用 `auth` —— DSH 会覆盖文案**
+
+DSH 的 `failureMessage()`（`app.asar` 内实测）：
+
+```js
+function failureMessage(message, code, t) {
+  if (code === "QUOTA" || code === "ACCOUNT_QUOTA") return t("message.failure.quota");
+  return code === "AUTH" ? t("message.failure.auth") : message;
+}
+```
+
+只要 kind 报成 `auth`，上游那句「检测到异常请求，请完成验证」会被**整句丢掉**，
+用户永远看到「API 密钥无效」—— 跟密钥一点关系都没有，用户会跑去重新登录、重贴 token。
+
+所以风控必须有**自己的** kind：既能换号，又能让上游原话透到界面上。
+
+**③ 流式路径完全没认风控，还有静默吞帧**
+
+- 流式走 `classifyStreamError()`，与非流式的 `classify()` **各自独立**。风控落在流里仍判 `server` ⇒ 白重试 5 次 + **账号不降权** ⇒ 下次还挑中它。
+- `translateChunk()` 对「既无 `choices` 也无 `error`」的帧直接丢弃。实测：
+
+  ```
+  {"error":{"code":"risk_control",...}}  -> error/server
+  {"code":"RISK_CONTROL","message":"..."}  -> error/server
+  {"code":"RISK_CONTROL","data":{...}}     -> （空，被吞掉）
+  ```
+
+  第三条只要上游换个字段名，整帧就凭空消失，用户看到「回复是空的」。
+
+### 已改
+
+- 新增 `ErrorKind: 'risk_control'`；`shouldSwitchAccount` 纳入它，**`isRetryable` 刻意排除它**（同号重试会把临时风控升级成封禁）。
+- `errors.ts` 新增 `RISK_CONTROL_PATTERNS`（中英双语，含 `flagged for abuse`、`账号已被限制` 等），并导出 `looksLikeRiskControl()` 供流式路径复用同一套表。
+- `classify()` 在 **401 / 403 / 429 / 400 / 2xx** 五个分支都认风控，且一律排在额度之后、auth 与 bad_request 之前。
+- `penaltyMsFor`：风控冷却下限 `RISK_CONTROL_COOLDOWN_MS = 30 分钟`（比鉴权 10 分钟更长）；上游给了 `Retry-After` 仍听上游的，并受 `RETRY_AFTER_CAP_MS` 封顶。
+- `router.ts`：风控计入降权；连续触发达 `degradeAfterFailures × 2` 直接 `markInvalid`，让界面明确显示「已失效 · 触发风控」。
+- `sse.ts`：`classifyStreamError` 新增风控分支；`describeRiskControl()` 把上游原话带进文案；`translateChunk` 补兜底 —— 认不出的帧只要文案像风控就报错，不再静默吞掉。
+- `llm/adapter.ts`：`providerRetryPolicy().retryableCodes` **不含** `RISK_CONTROL`（内部已换完号，再让 DSH 重试是重复撞墙）。
+- `client.js`：`FAILURE_TEXT` 补 `risk_control: '触发风控'`，徽标显示成「降权中 · 触发风控（1 次）」。
+
+### 验证
+
+- 端到端实测：3 个号，主号返回风控 → **自动切到第三个号成功**，主号 `state=degraded / 冷却 30m / lastError=risk_control`。
+- 8 条新用例，**反向验证过**：成对回退 `errors.ts + sse.ts` → 4 条红；回退 `types.ts` → 1 条红。
+- 误伤检查：`invalid parameter` / `model not found` / `context length exceeded` / `content filtered` 全部仍判 `bad_request`，未被误判成风控。
+
+### 有意不认的形态
+
+Cloudflare 的 `Access denied` / `error code: 1020` / `Attention Required!` 保持 `auth` 不动 ——
+那是按 **IP/ASN** 封的，换号**无效**，判成风控会让每个号都被降权 30 分钟，
+误导用户以为号都坏了。这类只能换出口 IP。
+
+### 还差
+
+- 没在真机上确认（要重启 DSH 才能加载新 `lib/`）。
+- 风控文案表是**经验性的**：上游若用完全没见过的措辞，仍会落到 `bad_request`（不换号）。
+  宁可漏判也不误伤 —— 误判会让好号被无谓锁 30 分钟。遇到新的真实文案时往
+  `RISK_CONTROL_PATTERNS` 里补一条即可。
+
+---
+
+## 🟡 #0o 多账号分不清「哪个号被限流」、也分不清「哪个开关是不让它参与选号」（2026-10-27）
+
+> 用户原话：「现在同一个平台多账号，假如有一个账号被限流了，不能明确知道哪个账号被限流。同时不知道账号对应的那些按钮，哪个是启用账户，哪个是把账户不参与选号。」
+
+### 现象
+
+同一平台下挂 3 个号，其中一个被上游限流。界面上：
+
+1. **看不出是哪个号**。账号行只画「降权中（2 次失败）」，「触发限流」「额度耗尽」「鉴权失效」三种原因在屏幕上**长得一模一样** —— 而处置办法完全不同：限流等一会儿就好，额度耗尽要换号或充值，鉴权失效必须重新登录。
+2. **看不出为什么**。`AccountHealth.lastError.kind` 与 `penaltyUntil` **一直都在快照里**，界面从来没读过。
+3. **看不出什么时候恢复**，只能反复点「测活」猜。
+4. **「启用」按钮根本不存在**。账号行只有「对话 / 签到 / 任务」三个开关，`enabled` 没有对应按钮 —— 想「先别用这个号」只能删号，而删号会连带清掉健康与额度缓存，还得重新登录。
+5. **「对话」这个标签太含糊**，看不出它其实是「不参与选号」。
+
+### 根因
+
+不是数据缺失，是**渲染层从来没消费这些字段**。三处漏点：
+
+| 漏点 | 位置 | 后果 |
+|---|---|---|
+| `healthView()` 不读 `lastError` / `penaltyUntil` | `client/client.js` | 降权原因与恢复时间全丢 |
+| 账号行没有 `enabled` 开关 | `accountCard()` | 只能靠删号表达「先别用」 |
+| 「最近失败」表没有账号列 | `overviewHTML()` | 看到「触发限流」却不知道是哪个号 |
+
+第三处尤其隐蔽：`RequestLogEntry.accountId` 一直都有，日志页也画了账号列，**只有总览的「最近失败」表漏了**。
+
+### 已改
+
+- `healthView()` 新增 `FAILURE_TEXT` 映射（与宿主 `ERROR_LABELS` 同口径），徽标直接写原因：`降权中 · 触发限流（2 次）`；悬停给出完整证据链（原因 / 上游原话 / 发生时间 / 恢复时间 / 上次成功）。
+- **冷却已过但失败计数没清** → 说「已恢复」，不再画成「降权中」。`accounts.available()` 只看 `penaltyUntil`，冷却一过这个号就在正常接请求了，继续画「降权中」会让用户白等。
+- 账号行补 `enabled` 总开关，文案改为「启用」；`routeChat` 文案从「对话」改成「参与对话」并加悬停说明。两者层次写进卡片头：总开关 → 只关选号 → 单件事开关。
+- 停用账号整行压暗（`data-off`）+ 单独「已停用」徽标。
+- 平台页签直接标出「N 限流 / N 失效 / N 停用」，不用挨个点进去找。新增 `.mag-tag-warn` 样式。
+- 「最近失败」表补「账号」列，`accountId` 翻译成标签；`null` 显示「免账号」。`accountLabelMap()` 提到模块作用域，与日志页共用同一映射。
+
+### 验证
+
+- 7 条新用例。**已确认它们在旧代码上全红、在新代码上全绿**（`git stash push -- client/client.js` 后重跑，7 条全 `not ok`）。
+- 宿主 591 / 客户端 78 / 冒烟全通过。
+
+### 还差
+
+- 没在真机上确认（要重启 DSH 才能加载新 `lib/`）。
+- `client.js` 里没有周期重绘：冷却到期后徽标**不会自动**从「降权中」变成「已恢复」，要等下一次 `refresh()`（切页 / 点刷新）。当前靠悬停里的绝对时间兜底，够用但不完美。
+
+---
+
 ## 🟡 #0n 压缩对话崩在 `imageRequestPricing is not a function`（2026-10-27）
 
 > 用户原话：「压缩对话时提示 `compact this.adapters.get(...)?.adapter.imageRequestPricing is not a function`」

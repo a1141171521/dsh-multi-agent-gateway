@@ -29,9 +29,13 @@ dsh plugin --profile desktop add github:<你的用户名>/dsh-multi-agent-gatewa
 ### 方式三：从 tarball 装
 
 ```powershell
-npm pack                                     # 产出 dsh-multi-agent-gateway-0.2.1.tgz
-dsh plugin --profile desktop add .\dsh-multi-agent-gateway-0.2.1.tgz
+npm pack                                     # 产出 dsh-multi-agent-gateway-<版本>.tgz
+dsh plugin --profile desktop add .\dsh-multi-agent-gateway-*.tgz
 ```
+
+> 第二行用**通配符**而不是写死版本号：`npm pack` 产出的文件名带着版本，
+> 写死就会随每次发版过期（本文档早先写死 `0.2.1`，到 `0.2.2` 就成了错的）。
+> 目录里有多份 tgz 时通配符会匹配到多个，先删掉旧的再 pack。
 
 ### 其它 profile
 

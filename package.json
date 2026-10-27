@@ -1,6 +1,6 @@
 {
   "name": "dsh-multi-agent-gateway",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "多 Agent 通用 API 反代网关 Provider 插件：统一账号管理 / 自动签到 / 额度拉取 / 活动任务 / 多账号智能路由 / 模型分组与积分倍率，对 DSH 暴露 OpenAI 兼容流式 Completion 接口。",
   "type": "module",
   "main": "lib/index.js",
