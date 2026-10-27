@@ -3623,3 +3623,104 @@ test('排队端到端：跨 chunk 切分的一帧也能识别（SSE 缓冲回归
   assert.equal(f?.kind, 'rate_limit')
   assert.equal(f?.retryAfterMs, 30000)
 })
+
+// ─────────────────────────── 适配器形状：图片计价 ───────────────────────────
+//
+// 坑（2026-10-27 实测）：DSH 0.2.1 给 `LlmAdapter` 加了 `imageRequestPricing()`
+// 与 `imageRequestTarget()`，但宿主是**鸭子类型**——不实现也能注册成功，
+// 只在**真正调用时**抛 `is not a function`。压缩对话就会崩：
+//   compact this.adapters.get(...)?.adapter.imageRequestPricing is not a function
+// 所以这里把「宿主用到的每个方法都在」写成断言，别再靠人肉记。
+
+/** 造一个只验形状的 adapter（不发请求）。 */
+function shapeOnlyAdapter() {
+  const log = { child: () => log, debug() {}, info() {}, warn() {}, error() {} }
+  return createLlmAdapter({
+    agentId: 'opencode',
+    displayName: 'OpenCode',
+    labelWithAgent: true,
+    accounts: new Proxy({}, { get: () => () => undefined }),
+    router: {
+      async execute(_agentId, run) {
+        const account = {
+          id: 'opencode:x',
+          agentId: 'opencode',
+          label: 'x',
+          credentials: {},
+          enabled: true,
+          createdAt: 0,
+          updatedAt: 0,
+        }
+        const outcome = await run(account)
+        if (outcome.ok === true) return { ok: true, accountId: account.id, attempts: [], value: outcome.value }
+        return { ok: false, accountId: account.id, attempts: [], failure: { kind: 'unknown', message: '' } }
+      },
+    },
+    adapterOf: () => ({
+      id: 'opencode',
+      name: 'OpenCode',
+      async *requestChatStream() {
+        yield { type: 'text', content: '' }
+      },
+    }),
+    contextOf: () => ({
+      config: { upstream: {}, requestTimeoutMs: 1000 },
+      log,
+      http: async () => ({ ok: true }),
+      cache: new MemoryCache(),
+      now: () => 0,
+    }),
+    modelsOf: async () => [],
+    log,
+  })
+}
+
+test('适配器形状：宿主 LlmRuntime 会调用的方法一个都不能缺（含图片计价）', () => {
+  const adapter = shapeOnlyAdapter()
+  // 名单来自 dsh-llm/lib/index.js 里所有 `.adapter.xxx(` 调用点。
+  const required = [
+    'providerInfo',
+    'providerRetryPolicy',
+    'imageRequestPricing',
+    'imageRequestTarget',
+    'listModels',
+    'resolveModel',
+    'prepareCall',
+    'stream',
+  ]
+  for (const name of required) {
+    assert.equal(typeof adapter[name], 'function', `adapter 缺 ${name}()，宿主调用时会抛 is not a function`)
+  }
+})
+
+test('图片计价：每次出现都要给一条价，且本网关不收视觉 token', () => {
+  const adapter = shapeOnlyAdapter()
+  const pricing = adapter.imageRequestPricing('multiagent-opencode', 'opencode/auto')
+  assert.equal(typeof pricing?.priceImages, 'function')
+
+  const images = [
+    { type: 'image', attachment: { attachmentId: 'sha256:aaaa', width: 800, height: 600, bytes: 120000 } },
+    { type: 'image', offloaded: true, attachment: { attachmentId: 'sha256:bbbb', width: 1024, height: 768, bytes: 200000 } },
+  ]
+  const prices = pricing.priceImages(images)
+
+  // 宿主的 priceSurface 会断言「价格条数 === 出现次数」，少一条直接抛。
+  assert.equal(prices.length, images.length)
+  for (const price of prices) {
+    // 出站只发文本：`toOpenAiMessages()` 把图片块整块丢掉，上游从没收到过图。
+    assert.equal(price.visualTokens, 0)
+    // 也不写占位文本 —— 写了就是给计量凭空加字。
+    assert.equal(price.text, '')
+  }
+})
+
+test('图片尺寸：本网关不缩放，原样返回归一化后的宽高与字节数', () => {
+  const adapter = shapeOnlyAdapter()
+  const image = { attachmentId: 'sha256:aaaa', width: 800, height: 600, bytes: 120000 }
+  assert.deepEqual(adapter.imageRequestTarget('multiagent-opencode', 'opencode/auto', image), {
+    width: 800,
+    height: 600,
+    maxBytes: 120000,
+  })
+})
+

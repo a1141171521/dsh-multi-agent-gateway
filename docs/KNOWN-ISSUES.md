@@ -13,6 +13,67 @@
 
 ---
 
+## 🟡 #0n 压缩对话崩在 `imageRequestPricing is not a function`（2026-10-27）
+
+> 用户原话：「压缩对话时提示 `compact this.adapters.get(...)?.adapter.imageRequestPricing is not a function`」
+
+### 现象
+
+DSH 0.2.1 下点「压缩对话」（或触发自动压力压缩）直接失败，报错里带着宿主的源码片段：
+
+```
+compact this.adapters.get(...)?.adapter.imageRequestPricing is not a function
+```
+
+### 根因（我们少实现了两个方法）
+
+DSH 0.2.1 给 `LlmAdapter` 加了两个**图片相关**的方法：
+
+| 方法 | 宿主怎么调 | 缺了会怎样 |
+|---|---|---|
+| `imageRequestPricing(provider, model)` | `dsh-token-meter` 的 `measure()` → `_routeImagePricing()` → `this.adapters.get(provider)?.adapter.imageRequestPricing(...)` | 抛 `is not a function` |
+| `imageRequestTarget(provider, model, image)` | `this.registration(provider).adapter.imageRequestTarget(...)`，截图类调用方用 | 抛 `is not a function` |
+
+⚠️ **宿主用的是鸭子类型**：`registerAdapter()` 只校验 `providerInfo()`，其余方法一个都不验。
+所以缺方法**装载期完全不报错**，一路跑到真正调用时才炸 —— 而「真正调用」的第一现场就是
+压缩对话（token meter 要按路由给图片计价）。
+
+⚠️ **这是「结构化实现」的固有代价**：`createLlmAdapter()` 刻意不 `extends LlmAdapter`
+（见 `src/llm/adapter.ts` 头注释），好处是版本漂移不会变成 `ERR_MODULE_NOT_FOUND`，
+代价就是**宿主加方法时我们收不到任何信号**。同类坑 2026-10-20 已经踩过一次
+（`providerRetryPolicy` 那次是静默退回默认值，没崩）。
+
+### 已改
+
+- `src/llm/adapter.ts` 补上 `imageRequestPricing()` 与 `imageRequestTarget()`；
+- `imageRequestPricing` 返回 `{ priceImages(images) }`，**每次出现一条价**（宿主的
+  `priceSurface` 会断言条数严格相等，少一条直接抛），且：
+  - `visualTokens: 0` —— 本网关出站**从不发图**（`toOpenAiMessages()` 只拼 `type === 'text'`，
+    图片块整块丢掉），收视觉费是凭空多算；
+  - `text: ''` —— 出站也不写占位文本，写了就是给计量凭空加几十 token；
+- `imageRequestTarget` 原样返回 DSH 归一化后的宽高与字节数（本网关不缩放，与基类默认一致）；
+- `test/unit.test.mjs` 新增 3 条回归断言：**宿主会调用的 8 个方法一个都不能缺**、
+  图片计价条数与取值、尺寸原样返回。
+
+### 验证
+
+- `node --test`（10 个套件 571 项）+ `test/client.test.mjs`（71 项）+ `test/smoke.mjs` 全绿；
+- 用宿主**真实的** `dsh-token-meter/lib/types/route-pricing.js` 的 `priceSurface()` 跑通，
+  带图节点不再按结构体积收费（结构价 40 → 只剩空文本块固定开销 4）；
+- 复现脚本留在 `.scratch/repro-image-pricing.mjs`、`.scratch/repro-price-surface.mjs`。
+
+### 还差
+
+真机点一次「压缩对话」确认（`lib/` 已重建，插件目录是符号链接指向本仓库，
+重启 DSH 即生效）。
+
+### ⚠️ 一条要一起改的地方（别只改一半）
+
+将来真要让上游看图，必须**两处一起改**：`toOpenAiMessages()` 产出 `image_url` 数组 +
+`imageRequestPricing()` 按上游视觉规则算 token。只改一处 → token 计量与实际请求对不上。
+
+---
+
 ## 🟢 #0k 六个平台的签到 / 额度 / 模型调用按参考实现对齐（2026-10-19）
 
 > 用户原话：「把我们所有平台的实现方案，均参考 dsh-our-free-model 来实现，
