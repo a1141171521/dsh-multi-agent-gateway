@@ -29,16 +29,21 @@ import {
   RaccoonAdapter,
   RACCOON_AUTH_FILE_CANDIDATES,
   RACCOON_BUSINESS_CODES,
+  RACCOON_LOGIN_APP_NAME,
+  RACCOON_LOGIN_EXPIRES_SEC,
   RACCOON_ORIGIN,
   RACCOON_PATHS,
   RACCOON_USER_AGENT,
   RACCOON_GRANT_HEADERS,
+  buildRaccoonAuthorizeUrl,
   classifyRaccoonBody,
   describeRaccoonError,
   jwtExpiresAtMs,
   parseRaccoonBalance,
+  parseRaccoonCallback,
   parseRaccoonCatalog,
   readRaccoonTokenFromAuthFile,
+  startRaccoonLoopback,
   toRaccoonModelMeta,
 } from '../../lib/adapters/raccoon.js'
 import { CANONICAL_REASONING_EFFORTS } from '../../lib/core/reasoning.js'
@@ -901,4 +906,144 @@ test('活动任务：沿用基类的「上游没有这个接口（不是故障�
   assert.equal(result.ok, false)
   assert.equal(result.kind, 'unsupported')
   assert.match(result.message, /不是故障/)
+})
+
+// ───────────────────── 登录：本机回环 + 授权码（2026-10-28 真机验通后补的） ─────────────────────
+
+/** 造一个只有 `exp` 的假 JWT（`jwtExpiresAtMs` 只解 payload，不验签）。 */
+function fakeJwt(expSeconds) {
+  const payload = Buffer.from(JSON.stringify({ exp: expSeconds })).toString('base64url')
+  return `header.${payload}.signature`
+}
+
+test('授权链接：五个参数齐全 —— 少一个 desktop_callback 服务端就只回 state 不回 code', () => {
+  const url = buildRaccoonAuthorizeUrl('http://127.0.0.1:23456/auth/callback', 'a'.repeat(64))
+  const parsed = new URL(url)
+  assert.equal(`${parsed.origin}${parsed.pathname}`, `${RACCOON_ORIGIN}/authorize`)
+  assert.equal(parsed.searchParams.get('login_source'), 'desktop')
+  assert.equal(parsed.searchParams.get('desktop_callback'), 'loopback')
+  assert.equal(parsed.searchParams.get('appname'), RACCOON_LOGIN_APP_NAME)
+  assert.equal(parsed.searchParams.get('state'), 'a'.repeat(64))
+  assert.equal(parsed.searchParams.get('redirect'), 'http://127.0.0.1:23456/auth/callback')
+})
+
+test('回调解析：正常回调给出 code；路径不对 / state 不对一律当作「不是我们的」', () => {
+  const state = 'b'.repeat(64)
+  assert.deepEqual(
+    parseRaccoonCallback(`/auth/callback?code=abc123&state=${state}`, '/auth/callback', state),
+    { code: 'abc123' },
+  )
+  assert.equal(
+    parseRaccoonCallback(`/auth/callback?code=abc&state=${'c'.repeat(64)}`, '/auth/callback', state),
+    null,
+  )
+  assert.equal(parseRaccoonCallback(`/auth/callback?code=abc&state=${state}`, '/other', state), null)
+  // 长度不等时不能让 timingSafeEqual 抛 RangeError —— 必须安静地判成「不是我们的」。
+  assert.equal(parseRaccoonCallback(`/auth/callback?code=abc&state=${state.slice(1)}`, '/auth/callback', state), null)
+})
+
+test('回调解析：有 state 没 code / 上游明确报错 → 说清楚，不装作还在等', () => {
+  const state = 'd'.repeat(64)
+  const noCode = parseRaccoonCallback(`/auth/callback?state=${state}`, '/auth/callback', state)
+  assert.ok(typeof noCode.error === 'string' && noCode.error.includes('code'))
+  const denied = parseRaccoonCallback(
+    `/auth/callback?state=${state}&error=access_denied&error_description=nope`,
+    '/auth/callback',
+    state,
+  )
+  assert.ok(typeof denied.error === 'string' && denied.error.includes('access_denied'))
+})
+
+test('回环接收器：真能收到 code，且只收一次（错 state 直接 404，收完就关）', async () => {
+  const state = 'e'.repeat(64)
+  const receiver = await startRaccoonLoopback({ state, timeoutMs: 5000 })
+  try {
+    assert.match(receiver.redirect, /^http:\/\/127\.0\.0\.1:\d+\/auth\/callback$/)
+    assert.equal(receiver.code, '')
+
+    const wrong = await fetch(`${receiver.redirect}?code=zzz&state=${'0'.repeat(64)}`)
+    assert.equal(wrong.status, 404, 'state 不对必须拒绝')
+    assert.equal(receiver.code, '', '错 state 不能把 code 记下来')
+
+    const good = await fetch(`${receiver.redirect}?code=xyz789&state=${state}`)
+    assert.equal(good.status, 200)
+    assert.equal(receiver.code, 'xyz789')
+  } finally {
+    receiver.close()
+  }
+})
+
+test('beginLogin：给出的是 /authorize 链接，state 里带着可关闭的回环句柄', async () => {
+  const adapter = isolated()
+  const start = await adapter.beginLogin(makeCtx())
+  try {
+    assert.ok(start.authUrl.startsWith(`${RACCOON_ORIGIN}/authorize?`), start.authUrl)
+    assert.ok(start.authUrl.includes('desktop_callback=loopback'))
+    assert.equal(start.expiresInSec, RACCOON_LOGIN_EXPIRES_SEC)
+    assert.match(start.state.loopback.redirect, /^http:\/\/127\.0\.0\.1:\d+\/auth\/callback$/)
+  } finally {
+    start.state.loopback.close()
+  }
+})
+
+test('pollLogin：没收到 code 时是 pending，且提示里带等待秒数（不是干等）', async () => {
+  const adapter = isolated()
+  const start = await adapter.beginLogin(makeCtx())
+  try {
+    const outcome = await adapter.pollLogin({ ...start.state, startedAt: Date.now() - 3000 }, makeCtx())
+    assert.equal(outcome.status, 'pending')
+    assert.match(outcome.message, /授权页/)
+    assert.match(outcome.message, /已等待 \d+ 秒/)
+  } finally {
+    start.state.loopback.close()
+  }
+})
+
+test('pollLogin：收到 code 就去换令牌，成功后返回 ready、带有效期与账号标签', async () => {
+  const adapter = isolated()
+  const token = fakeJwt(1_900_000_000)
+  const httpCalls = []
+  const ctx = makeCtx({
+    http: async (url, init) => {
+      httpCalls.push({ url, body: init?.body })
+      return { ok: true, status: 200, kind: 'none', headers: new Headers(), body: { code: 0, data: { access_token: token, refresh_token: token } }, text: '' }
+    },
+  })
+  const start = await adapter.beginLogin(ctx)
+  try {
+    // 模拟浏览器带着 code 回调（真机验过：code 46 字符、state 64 字符）。
+    const callback = await fetch(`${start.state.loopback.redirect}?code=${'f'.repeat(46)}&state=${start.state.expectedState}`)
+    assert.equal(callback.status, 200)
+
+    const outcome = await adapter.pollLogin(start.state, ctx)
+    assert.equal(outcome.status, 'ready')
+    assert.equal(outcome.credentials.token, token)
+    assert.equal(outcome.credentials.expiresAt, 1_900_000_000_000)
+    // ⚠️ refresh_token 与 access_token 同值（实测），所以**不许**写成 refreshToken 骗人。
+    assert.equal(outcome.credentials.refreshToken, undefined)
+
+    // 换令牌一次 + 拿昵称一次（`labelForToken` 会再问一次 `/user_info`）。
+    const exchange = httpCalls.find((call) => call.url.endsWith('/api/web/auth/v1/login_with_authorization_code'))
+    assert.ok(exchange !== undefined, `没有打换令牌接口：${httpCalls.map((c) => c.url).join(', ')}`)
+    assert.equal(JSON.parse(exchange.body).authorization_code, 'f'.repeat(46))
+    assert.ok(httpCalls.some((call) => call.url.endsWith('/api/web/auth/v1/user_info')))
+  } finally {
+    start.state.loopback.close()
+  }
+})
+
+test('pollLogin：换令牌失败要把上游原因说出来，不能报「成功」', async () => {
+  const adapter = isolated()
+  const ctx = makeCtx({
+    http: async () => ({ ok: false, status: 400, kind: 'auth', headers: new Headers(), body: { code: 200003, message: 'authorization verify failed' }, text: '' }),
+  })
+  const start = await adapter.beginLogin(ctx)
+  try {
+    await fetch(`${start.state.loopback.redirect}?code=bad&state=${start.state.expectedState}`)
+    const outcome = await adapter.pollLogin(start.state, ctx)
+    assert.equal(outcome.status, 'failed')
+    assert.match(outcome.message, /200003|authorization verify failed/)
+  } finally {
+    start.state.loopback.close()
+  }
 })

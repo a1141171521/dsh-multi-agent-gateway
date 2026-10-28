@@ -112,6 +112,8 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs'
+import { createServer } from 'node:http'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -329,10 +331,12 @@ const CAPABILITIES: AgentCapabilities = {
       '`reasoning_effort` 的合法值就是 OpenAI 那 8 个规范名（上游 serde 枚举硬校验），' +
       '所以档位翻译是恒等映射；但**每个模型是否真的多想**差异很大，已按实测标注。',
     login:
-      '不需要手工粘贴：账号没填 token 时本插件会自动读客户端的 `auth.json`。' +
-      '那个 token 是 30 天有效的 IAM JWT 且**没有 refresh token**，过期后重新登录客户端即可（插件会自动读到新值）。',
+      '登录和客户端走同一条路：本机临时回环 + 授权码（`/authorize?desktop_callback=loopback`）。' +
+      '点一下 → 浏览器里登录 → 回来自动建账号，**不装客户端也能用**。' +
+      '没填 token 时仍会回落到读客户端的 `auth.json`。' +
+      '令牌是 30 天有效的 IAM JWT，服务端没有可用的续期（refresh 只会换回同一个令牌），到期重新登录即可。',
     credentials:
-      '可留空（自动从商汤小浣熊客户端读取）；也可以手工粘贴客户端请求头里 `Authorization: Bearer` 后面那串。',
+      '可留空（登录后自动落盘）；也可以手工粘贴客户端请求头里 `Authorization: Bearer` 后面那串。',
   },
 }
 
@@ -389,6 +393,184 @@ export function jwtExpiresAtMs(token: string): number | undefined {
     return Math.round(exp * 1000)
   } catch {
     return undefined
+  }
+}
+
+// ───────────────────── 登录：本机回环 + 授权码（照抄客户端的 OAuth 流程） ─────────────────────
+
+/** 回环回调路径。与客户端 loopback 模式逐字一致（`webLoginLoopback.js`）。 */
+export const RACCOON_LOOPBACK_PATH = '/auth/callback'
+
+/** 授权页上显示的应用名。取自客户端 `shared/client/web-login.js` 的 `appName`。 */
+export const RACCOON_LOGIN_APP_NAME = '商汤小浣熊客户端'
+
+/** 登录会话有效期（秒）。客户端给回环窗口 5 分钟，这里对齐。 */
+export const RACCOON_LOGIN_EXPIRES_SEC = 300
+
+/** 授权码换令牌（web 那套接口，不是 `/api/iam/v1`）。 */
+export const RACCOON_CODE_EXCHANGE_PATH = '/api/web/auth/v1/login_with_authorization_code'
+
+/**
+ * 拼 `/authorize` 链接。
+ *
+ * 五个参数**逐字照抄**客户端 `desktopLoginUrl()` + `startLoopback()`：
+ * `login_source=desktop`、`appname`、`desktop_callback=loopback`、`state`、`redirect`。
+ *
+ * ⚠️ 少了 `desktop_callback=loopback` 会怎样（2026-10-28 实测踩到）：
+ * 服务端按「自定义协议 `office-raccoon://`」那条路处理，回调里**只回 state、不回 code**，
+ * 浏览器停在「缺少 code」。补上之后一次通过。
+ */
+export function buildRaccoonAuthorizeUrl(
+  redirect: string,
+  state: string,
+  appName: string = RACCOON_LOGIN_APP_NAME,
+): string {
+  const params = new URLSearchParams({
+    login_source: 'desktop',
+    appname: appName,
+    desktop_callback: 'loopback',
+    state,
+    redirect,
+  })
+  return `${RACCOON_ORIGIN}/authorize?${params.toString()}`
+}
+
+/**
+ * 解一次回调。
+ *
+ * 返回三种结果，调用方必须分得清：
+ *   - `null`     —— 这不是给我们的请求（路径不对 / state 对不上）；
+ *   - `{ error }` —— 是我们的请求，但上游明确报错或没给 code；
+ *   - `{ code }`  —— 可以拿去换了。
+ *
+ * state 先比长度再 `timingSafeEqual`：长度不等时 `timingSafeEqual` 会抛 `RangeError`，
+ * 直接比就是给自己埋一个崩溃点。
+ */
+export function parseRaccoonCallback(
+  rawUrl: string,
+  path: string,
+  expectedState: string,
+): { code: string } | { error: string } | null {
+  let url: URL
+  try {
+    url = new URL(rawUrl, 'http://127.0.0.1')
+  } catch {
+    return null
+  }
+  if (url.pathname !== path) return null
+  const failure = url.searchParams.get('error') ?? ''
+  if (failure !== '') {
+    const description = url.searchParams.get('error_description') ?? ''
+    return { error: `${failure} ${description}`.trim() }
+  }
+  const state = url.searchParams.get('state') ?? ''
+  if (state.length !== expectedState.length) return null
+  try {
+    if (!timingSafeEqual(Buffer.from(state), Buffer.from(expectedState))) return null
+  } catch {
+    return null
+  }
+  const code = (url.searchParams.get('code') ?? '').trim()
+  if (code === '') return { error: '回调里没有 code（授权没完成或被上游丢掉）' }
+  return { code }
+}
+
+/** 一个只监听 127.0.0.1 的一次性回调接收器。 */
+export interface RaccoonLoopback {
+  /** 浏览器回跳地址，要原样放进 `redirect` 参数。 */
+  readonly redirect: string
+  /** 收到的授权码；空串 = 还没到。**可变**，`pollLogin` 每轮读它。 */
+  code: string
+  /** 回调里带的错误；空串 = 没有。 */
+  error: string
+  /** 关掉监听（幂等，可以反复调）。 */
+  close(): void
+}
+
+/**
+ * 起一个临时回环服务接授权码。
+ *
+ * 三个刻意的约束（都是为了不给自己开洞）：
+ *   1. **只绑 127.0.0.1**，端口交给系统分配（客户端也是 `listen(0)`）——
+ *      固定端口会跟真客户端抢，绑 0.0.0.0 则是把回调暴露给局域网；
+ *   2. **只认 `GET` + 指定路径 + 正确 state**，其余一律 404，不回任何信息；
+ *   3. **一次性**：收到 code 或出错就关，之后再来请求就是连接被拒。
+ */
+export async function startRaccoonLoopback(options: {
+  state: string
+  path?: string
+  timeoutMs?: number
+}): Promise<RaccoonLoopback> {
+  const path = options.path ?? RACCOON_LOOPBACK_PATH
+  const timeoutMs = options.timeoutMs ?? RACCOON_LOGIN_EXPIRES_SEC * 1000
+  const receiver = { code: '', error: '', closed: false }
+  let close: () => void = () => { /* 还没 listen 完就被关的情况由下面兜住 */ }
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  const finish = (): void => {
+    if (receiver.closed) return
+    receiver.closed = true
+    if (timer !== undefined) clearTimeout(timer)
+    close()
+  }
+
+  const server = createServer((request, response) => {
+    const parsed = request.method === 'GET'
+      ? parseRaccoonCallback(request.url ?? '/', path, options.state)
+      : null
+    if (parsed === null) {
+      response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+      response.end('not found')
+      return
+    }
+    const ok = 'code' in parsed
+    if (ok) receiver.code = parsed.code
+    else receiver.error = parsed.error
+    response.writeHead(ok ? 200 : 400, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+    response.end(
+      `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>商汤小浣熊</title>`
+      + `<body style="font:16px/1.7 system-ui;padding:48px;max-width:640px;margin:auto">`
+      + `<h1 style="font-size:20px">${ok ? '登录成功' : '登录失败'}</h1>`
+      + `<p>${ok ? '账号已交给 DSH，可以关闭这个页面。' : '请回到 DSH 重新发起登录。'}</p></body></html>`,
+    )
+    setImmediate(finish)
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      server.removeListener('error', reject)
+      resolve()
+    })
+  })
+
+  const address = server.address()
+  if (address === null || typeof address === 'string') {
+    server.close()
+    throw new Error('本机回环端口分配失败')
+  }
+  close = (): void => {
+    try {
+      server.close()
+      // Node 18.2+：不主动断开的话，浏览器那条 keep-alive 连接会让 close 一直挂着。
+      ;(server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.()
+    } catch {
+      // 已经关了就算了。
+    }
+  }
+  timer = setTimeout(finish, timeoutMs)
+  timer.unref?.()
+  server.unref()
+
+  return {
+    redirect: `http://127.0.0.1:${address.port}${path}`,
+    get code() {
+      return receiver.code
+    },
+    get error() {
+      return receiver.error
+    },
+    close: finish,
   }
 }
 
@@ -732,40 +914,100 @@ export class RaccoonAdapter extends BaseAdapter {
     return undefined
   }
 
-  // ───────────────────── 登录：就是「去客户端登录一次」 ─────────────────────
+  // ───────────────────── 登录：本机回环 + 授权码（与客户端同一条路） ─────────────────────
 
   /**
-   * 发起登录。
+   * 发起登录：起本机回环、给出 `/authorize` 链接。
    *
-   * ## 为什么这里的「登录」是打开网页而不是设备码
+   * ## 为什么改成这条路（推翻上一版的判断）
    *
-   * 本平台**没有公开的 OAuth 设备码端点**（客户端走的是浏览器授权码换 token，
-   * 那一整套依赖它的私有 client_id 与回调服务器，见
-   * `build/electron/main/client/account/webLogin.js`）。硬造一个设备码流程
-   * 就是伪造客户端。
+   * 上一版写的是「本平台没有公开的 OAuth 端点，硬造设备码就是伪造客户端」，
+   * 于是退成「打开 `/login` + 盯客户端写的 `auth.json`」。**那个判断错在把
+   * 「没有设备码」当成「没有可用的授权方式」**：客户端用的是最标准的
+   * **授权码 + 本机回环重定向**（RFC 8252 给原生应用定的那套），`/authorize`、
+   * `state`、`redirect` 全在 URL 上，不需要任何签名或 client_secret，谈不上伪造。
    *
-   * 所以这里走的是**它自己那条路**：让用户在官网登录，登录成功后客户端会把
-   * token 落到 `auth.json`；本插件**读那个文件**（只读，不写）。
-   * 对用户来说就是「点一下 → 浏览器里登录 → 回来账号自动出现」，
-   * 与客户端自己的体验一致，且不需要任何伪造。
+   * 2026-10-28 实测走通：回环收到 46 字符 code → 换出 432 字符 IAM 令牌 →
+   * 令牌打 `/points/v1/balance` 200。**不装客户端也能登录。**
+   *
+   * ## 两个参数少一个就废
+   *
+   * `login_source=desktop` 与 `desktop_callback=loopback`（见
+   * `buildRaccoonAuthorizeUrl`）—— 少 `desktop_callback` 时服务端按自定义协议处理，
+   * 回调只回 state 不回 code，页面停在「缺少 code」。
    */
-  async beginLogin(_ctx: AdapterContext): Promise<LoginStartResult> {
-    return {
-      authUrl: `${RACCOON_ORIGIN}/login`,
-      expiresInSec: 600,
-      state: { startedAt: Date.now() },
+  async beginLogin(ctx: AdapterContext): Promise<LoginStartResult> {
+    const expectedState = randomBytes(32).toString('hex')
+    try {
+      const loopback = await startRaccoonLoopback({ state: expectedState })
+      ctx.log.info('已启动本机回环登录，等待浏览器回调', loopback.redirect)
+      return {
+        authUrl: buildRaccoonAuthorizeUrl(loopback.redirect, expectedState),
+        expiresInSec: RACCOON_LOGIN_EXPIRES_SEC,
+        // 回环句柄塞进 state：宿主只存在内存里，永远不回浏览器。
+        state: { startedAt: Date.now(), expectedState, loopback },
+      }
+    } catch (error) {
+      // 端口被禁 / 沙箱不允许 listen：退回「打开登录页 + 读客户端登录态」。
+      ctx.log.warn(
+        '本机回环起不来，退回「打开登录页 + 读客户端登录态」',
+        error instanceof Error ? error.message : String(error),
+      )
+      return {
+        authUrl: `${RACCOON_ORIGIN}/login`,
+        expiresInSec: 600,
+        state: { startedAt: Date.now() },
+      }
     }
   }
 
   /**
-   * 问一次结果：客户端 `auth.json` 里有没有 token。
+   * 问一次结果。
    *
-   * ⚠️ **不在这里校验 token 是否还有效**（那要多打一次上游）。真正的有效性
-   * 在账号加进来之后的「测活」里验 —— 那时用户已经在看结果，失败原因也能落到
-   * 账号行上。这里只回答「登录态出现了没有」。
+   * 按 state 的形状分两条路：
+   *   - **有 `loopback`**：新流程。收到 code 就换令牌，没到就 pending；
+   *   - **没有**：兜底流程（回环起不来时），读客户端 `auth.json`。
+   *
+   * ⚠️ 这里**不校验令牌是否还有效**（那要多打一次上游）。真正的有效性在账号加进来
+   * 之后的「测活」里验 —— 那时用户已经在看结果，失败原因也能落到账号行上。
    */
   async pollLogin(state: unknown, ctx: AdapterContext): Promise<LoginPollResult> {
-    const startedAt = (state as { startedAt?: unknown } | undefined)?.startedAt
+    const session = (state ?? {}) as { startedAt?: unknown; loopback?: RaccoonLoopback }
+    const loopback = session.loopback
+    if (loopback !== undefined) {
+      if (loopback.error !== '') {
+        const reason = loopback.error
+        loopback.close()
+        return { status: 'failed', message: `授权页返回错误：${reason}` }
+      }
+      if (loopback.code === '') {
+        const waited = typeof session.startedAt === 'number'
+          ? Math.round((Date.now() - session.startedAt) / 1000)
+          : 0
+        return {
+          status: 'pending',
+          message:
+            '已在本机开好回调端口，请在浏览器里打开授权页并登录。' +
+            (waited > 0 ? `（已等待 ${waited} 秒）` : ''),
+        }
+      }
+      const code = loopback.code
+      loopback.close()
+      const exchanged = await this.exchangeAuthorizationCode(code, ctx)
+      if ('error' in exchanged) return { status: 'failed', message: exchanged.error }
+      const expiresAt = jwtExpiresAtMs(exchanged.token)
+      const label = await this.labelForToken(exchanged.token, ctx)
+      const left = expiresAt === undefined ? '' : `，有效期至 ${new Date(expiresAt).toISOString().slice(0, 10)}`
+      ctx.log.info(`授权码登录成功${left}`)
+      return {
+        status: 'ready',
+        message: `登录成功${left}`,
+        credentials: { token: exchanged.token, ...(expiresAt === undefined ? {} : { expiresAt }) },
+        ...(label === undefined ? {} : { label }),
+      }
+    }
+
+    const startedAt = session.startedAt
     const client = readRaccoonClientToken(this.authFileCandidates)
     if (client === undefined) {
       const waited = typeof startedAt === 'number' ? Math.round((Date.now() - startedAt) / 1000) : 0
@@ -787,6 +1029,49 @@ export class RaccoonAdapter extends BaseAdapter {
       credentials: { token: client.token, ...(expiresAt === undefined ? {} : { expiresAt }) },
       ...(label === undefined ? {} : { label }),
     }
+  }
+
+  /**
+   * 授权码换令牌。
+   *
+   * 端点与字段名取自客户端 `accountRequests.js`（`loginWithAuthorizationCode`）：
+   * `POST /api/web/auth/v1/login_with_authorization_code {authorization_code}` →
+   * `{ code: 0, data: { access_token, refresh_token } }`。
+   *
+   * ⚠️ **`refresh_token` 是个摆设**：实测它与 `access_token` 一字不差，拿它去打
+   * `/api/web/auth/v1/refresh` 只会原样换回同一个令牌（`exp` 不变）。
+   * 所以这里**故意不存** refreshToken —— 存了会让人以为能自动续期。
+   */
+  private async exchangeAuthorizationCode(
+    code: string,
+    ctx: AdapterContext,
+  ): Promise<{ token: string } | { error: string }> {
+    const url = absolute(ctx.config.upstream.apiBaseUrl || RACCOON_ORIGIN, RACCOON_CODE_EXCHANGE_PATH)
+    const result = await ctx
+      .http(url, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json',
+          'user-agent': RACCOON_USER_AGENT,
+        },
+        body: JSON.stringify({ authorization_code: code }),
+        timeoutMs: 20_000,
+      })
+      .catch(() => null)
+    if (result === null) return { error: '换取令牌失败：请求没有发出去' }
+    const body = result.body as { code?: unknown; data?: { access_token?: unknown } } | null
+    if (body === null || typeof body !== 'object') {
+      return { error: `换取令牌失败：HTTP ${result.status}` }
+    }
+    if (Number(body.code) !== 0) {
+      return { error: describeRaccoonError(result.body) ?? `换取令牌失败：HTTP ${result.status}` }
+    }
+    const token = body.data?.access_token
+    if (typeof token !== 'string' || token === '') {
+      return { error: '换取令牌失败：响应里没有 access_token' }
+    }
+    return { token }
   }
 
   // ───────────────────── 每日签到（登录积分发放） ─────────────────────

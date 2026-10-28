@@ -278,20 +278,34 @@ tool_calls: [{"index":0,"id":"call_00_...","function":{"name":"get_weather","arg
 
 ---
 
-## 5. 凭证：为什么是「读客户端文件」而不是 OAuth
+## 5. 登录：本机回环 + 授权码（与客户端同一条路）
 
-客户端的登录是**浏览器授权码 + 回调服务器**（
-`build/electron/main/client/account/webLogin.js` / `webLoginLoopback.js`），
-依赖它自己私有的 `client_id` 与回调端口。硬造一套设备码流程就是伪造客户端。
+客户端用的是**标准授权码 + 本机回环重定向**（`build/electron/main/client/account/webLogin.js`
+/ `webLoginLoopback.js`）：`/authorize` 上带 `state` 与 `redirect`，回调打到
+`127.0.0.1:<随机端口>`，再用 code 换 token。这就是 RFC 8252 给原生应用定的那套，
+**不需要 client_secret，谈不上伪造**。
 
-所以本适配器走**它自己那条路**：
+> ⚠️ 本文第一版写的是「没有公开的 OAuth 端点 → 硬造就是伪造客户端 → 只能读 auth.json」。
+> **那个判断是错的**：把「没有设备码」当成了「没有可用授权方式」。2026-10-28 真机验通后改掉。
 
-1. 用户在官网/客户端登录一次；
-2. 客户端把 token 落到 `~/.office-raccoon/agent/config/auth.json`
-   （`{access_token, office_identity}`）；
-3. 插件**只读**那个文件（不写、不改），拿 `access_token` 当 Bearer。
+### 5.1 三步
 
-候选路径（按序）：
+1. 起一个**只绑 `127.0.0.1`** 的临时服务，端口交给系统分配（客户端自己也是 `listen(0)`，所以服务端必须接受任意回环端口）；
+2. 打开
+   `https://xiaohuanxiong.com/authorize?login_source=desktop&appname=商汤小浣熊客户端&desktop_callback=loopback&state=<64 hex>&redirect=http://127.0.0.1:<port>/auth/callback`；
+3. 用户在浏览器登录 → 带 `?code=&state=` 跳回来 → `POST /api/web/auth/v1/login_with_authorization_code {authorization_code}` 换令牌。
+
+**两个参数少一个就废**：`login_source=desktop`、`desktop_callback=loopback`。
+少了后者，服务端按自定义协议 `office-raccoon://` 那条路处理，回调**只回 state 不回 code**，
+浏览器停在「缺少 code」（第一次探针就是这么失败的）。
+
+`state` 必须服务端随机生成、回调时**逐字节比对**（先比长度再 `timingSafeEqual`，
+否则长度不等会让它抛 `RangeError`）。
+
+### 5.2 兜底：仍然认客户端的 auth.json
+
+回环起不来时（端口被禁 / 沙箱不允许 listen）退回老路：打开 `/login`，读客户端写的文件。
+插件**只读**，不写不改。候选路径（按序）：
 
 ```
 $BOX_AGENT_CONFIG_DIR/auth.json
@@ -301,15 +315,26 @@ $BOX_AGENT_HOME/config/auth.json
 ```
 
 出处：`build/electron/main/agent/boxAgentProfilePath.js` 的 `resolveBoxAgentHome`
-+ `boxAgentAuthFile.js` 的 `getBoxAgentAuthPath`。
++ `boxAgentAuthFile.js` 的 `getBoxAgentAuthPath`。客户端写文件时自己会
+`mkdirSync(recursive)` 建目录、写完 `rename`；**插件永远不会创建这个目录**。
 
-### ⚠️ 无法自动续期
+### 5.3 ⚠️ 续期仍然是 30 天
 
-那个 token 是 **IAM JWT，有效期 30 天，且 `auth.json` 里没有 `refresh_token`**
-（客户端自己的 `accountRequests.js` 注释写明「IAM 没有 legacy refresh grant」）。
+令牌是 **IAM JWT，有效期 30 天**。`auth.json` 里没有 `refresh_token`；
+而授权码接口**返回的 `refresh_token` 与 `access_token` 一字不差**（实测：两者都 432 字符、同值），
+拿它打 `/api/web/auth/v1/refresh` 只会原样换回同一个令牌、`exp` 不变。
 
-所以：**过期后只能重新登录客户端**。插件下次读到的自然就是新值 ——
-不需要用户来插件里改任何东西。这一点写进了 `capabilities.notes.login`。
+⇒ **没有可用续期**。到期重新登录一次 —— 现在是一次点击，不是手工贴 token。
+
+### 5.4 实测记录（2026-10-28）
+
+```
+GET /authorize?...desktop_callback=loopback&redirect=http://127.0.0.1:<port>/auth/callback
+  → 登录 → 回环收到 ?code=<46 字符>&state=<64 字符>
+  → POST /api/web/auth/v1/login_with_authorization_code
+     HTTP 200  {"code":0,"data":{"access_token":"<432>","refresh_token":"<432，同值>"}}
+  → GET /api/web/points/v1/balance  HTTP 200
+```
 
 ---
 
