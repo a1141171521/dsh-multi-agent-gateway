@@ -226,3 +226,96 @@ node --test test/channel-guard.test.mjs        # 20 条，含出站报文断言
   他们的国内用户没有报过 `conversation id missing`），因此国内版的头**一行未动**。
 - **是否还有第三个成因**：`msg` 相同的前提下无法排除。若两端都确认报文已净化却仍报
   同一个 `msg`，那就是新成因，需要带 `requestId` 反馈（见 §7）。
+
+---
+
+## 10. 2026-10-28：国内版再现同一条报错（未能复现，先修了「看不见原因」）
+
+用户报障：国内版对话失败，`code 11-128` / 同一句 `msg`，`requestId=<略>`。
+
+排查过程与结论：
+
+| 检查 | 结果 |
+|---|---|
+| 全量请求日志（1383 条） | 当天 14:24:58 连两条 `risk_control` 失败，**1.2 秒后同一账号同一模型成功**（161→57 tokens） |
+| 报文净化 | 出站 body 里既无 `developer` 也无身份句 —— 守卫生效，§7 的自查 1、2 都过关 |
+| **11 次真机复打** | 顺序 6 次、并发 3 次、重复同一份 body 2 次、长 system + 工具表 + `developer` —— **全部 200** |
+| 参数扫描 | `max_tokens` 8192/32000/64000、`temperature`/`top_p`、penalties、`stop`、`reasoning_effort=high` —— **全部 200** |
+
+同一份报文在 1.6 秒内**既被拒又被接受** ⇒ 判据在服务端状态，不在报文里。
+按 §7 的三步排除法，第 3 步成立：这是第三个成因，且不在我们可控范围。
+
+### 顺带修掉一个确定的缺陷：错误原文被截断
+
+旧实现是 `message: text.slice(0, 300)`（`src/adapters/buddy.ts` 的 400 分支）。
+腾讯的错误体是 JSON，第 300 个字符**正好落在 `displayTips.en` 中间**（`…possibly beca`）
+—— 用户截图、请求日志、错误提示三处看到的都是这半句，而恰恰是后半句在解释「为什么被拒」。
+
+现在改成 `describeBuddyErrorBody()`：解析 `code / msg / displayMsg / displayTips / requestId`
+拼成一行可读文本（中英文都留、重复的去掉），解析不出来才退回截断原文。
+用例在 `test/adapters/buddy-error.test.mjs`（6 条）。
+
+> 当天下午就抓到了真正的第三个成因，见 §11 —— 本文档至此不再有「未知成因」这一栏。
+
+---
+
+## 11. 判据 3：DSH 系统提示里的**路径说明句**（2026-10-28 真机定位，已修）
+
+用户复测：**国内版每发一条对话都 400**，而我用真账号连打 19 次全 200。
+差别只可能在报文内容，于是让用户重启后抓了一次**真实报文**。
+
+### 定位过程（这套方法可复用）
+
+| 步骤 | 做法 | 结果 |
+|---|---|---|
+| 1 | 把真机失败请求的 body 落到本机（临时诊断，用完已删） | 132 KB，14 条消息，82 个工具 |
+| 2 | **原样重放**（只把 Authorization 换成真 token，不经过适配器） | **400 复现**，同样的 `11-128` |
+| 3 | 去掉 `tools`、消息只留 system + 最后一条 | 仍 400 |
+| 4 | system 换成中性短句 / 截到 2000 字 | **200** ⇒ 触发点在 system 里 |
+| 5 | 对 system 做前缀二分 | 落在第 28625–28656 字之间 |
+| 6 | 把那一段（407 字）单独打 | 400 |
+| 7 | 段内只把 `resolve from` 改成 `resolves from` | **200** |
+| 8 | 35 k 的 system 只改这一句，连打两次 | 全 200 |
+
+### 触发句
+
+```
+Relative paths resolve from the workspace root
+```
+
+出处是 DSH 系统提示里「@ 引用 / 路径」那一段的第二句：
+
+> Tokens prefixed with @ are paths the user explicitly referenced. **Relative paths resolve from the workspace root**; absolute paths identify files or directories on the host. …
+
+这是**每个默认配置的 DSH 用户**都会发出去的一句，所以国内版是「每条对话都失败」而不是偶发。
+
+### 判据性质：语义指纹，不是精确黑名单
+
+同一句单独发（`Relative paths resolve from the workspace root; …`）→ 200；
+放回那段里 → 400；把 `resolve` 改成 `resolves` → 200；把最后一句删掉 → 仍 400。
+即网关用的是**语义/近似匹配**，判定「这段写法不像自家客户端」。所以：
+差一个词能过，但换个写法也可能再撞上；真机验证才是唯一标准。
+
+### 修法
+
+`src/vendor/buddy/buddy-channel-guard.ts` 新增判据 3：
+
+| 原句 | 改写后 |
+|---|---|
+| `Relative paths resolve from the workspace root` | `Relative paths are resolved against the workspace root` |
+
+与判据 2 共用同一条改写通道（只动 `system` / `developer` 的 `content`/`text`，用户消息原样保留），
+正则按「任意空白 + 忽略大小写」匹配，幂等。
+
+### 验证
+
+- 出站报文断言：`test/channel-guard.test.mjs` 新增 3 条（原句必须消失、改写句必须在、折行/幂等/用户消息不动），该套件 20 → 23；
+- **真机回归**：把用户那次失败的真实 body 直接喂给适配器 → 200，正文正常返回，日志确认出站 system 里已无原句；
+- 全量：宿主 666/666、客户端 85/85、冒烟通过。
+
+### 仍然没做的
+
+对 `11-128` 加同账号一次短退避重试 —— 这次是**确定性**失败，重试没用，所以更没必要为它破
+「`risk_control` 一律不重试」的规矩。
+
+

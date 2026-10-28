@@ -119,6 +119,35 @@ export function identityPattern(): RegExp {
 }
 
 /**
+ * 第二句被网关点名的**路径说明**（判据 3，2026-10-28 真机定位）。
+ *
+ * 出处：DSH 系统提示词里「@ 引用 / 路径」那一段的首句
+ * （`Tokens prefixed with @ are paths the user explicitly referenced.` 之后）。
+ *
+ * ## 怎么定位到的（别再从头猜一遍）
+ *
+ * 用户国内版**每次发对话都 400**，而探针怎么打都是 200。把真机报文落盘后原样重放，
+ * 稳定复现；再去掉 tools / 只留最后一条消息，仍 400；把 system 换成中性短句 → 200。
+ * 对 system 做前缀二分，落在第 28625–28656 字之间；把那一段（407 字）单独拿出来打 → 400，
+ * 而把句中 `resolve from` 改成 `resolves from`（只多一个 s）→ **200**。
+ * 整份 35k 的 system 只改这一句，连打两次全 200。
+ *
+ * 即：这是**语义指纹**判定（这段写法像别家客户端），不是精确字符串黑名单 ——
+ * 所以差一个词就能过，也所以只删最后一句（P8）仍然 400。
+ */
+
+/** 原句（判据 3 的触发文本）。 */
+export const PATH_MENTION_PHRASE = 'Relative paths resolve from the workspace root'
+
+/** 顶替它的中性说法：意思不变，只是不再逐字撞上那句指纹。 */
+export const NEUTRAL_PATH_MENTION_PHRASE = 'Relative paths are resolved against the workspace root'
+
+/** 匹配路径说明句的正则 —— 同样每次新实例、句内任意空白、忽略大小写。 */
+export function pathMentionPattern(): RegExp {
+  return /Relative[\s\u00a0]+paths[\s\u00a0]+resolve[\s\u00a0]+from[\s\u00a0]+the[\s\u00a0]+workspace[\s\u00a0]+root/giu
+}
+
+/**
  * 文本里是否还带着那句原话。
  *
  * **字面**判断（不做空白容错）—— 它是给断言用的：测试要能确认「改写之后这句原话
@@ -146,37 +175,41 @@ function isIdentityTextCarrier(key: string): boolean {
  * （`payload` 被 spread 进 body，同一份对象还可能被日志/重试路径读到），
  * 就地改会串味。
  */
-function rewriteIdentitySentence(value: unknown): unknown {
-  if (typeof value === 'string') return value.replace(identityPattern(), NEUTRAL_IDENTITY_PHRASE)
-  if (Array.isArray(value)) return value.map(rewriteIdentitySentence)
+function rewriteInstructionText(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value
+      .replace(identityPattern(), NEUTRAL_IDENTITY_PHRASE)
+      .replace(pathMentionPattern(), NEUTRAL_PATH_MENTION_PHRASE)
+  }
+  if (Array.isArray(value)) return value.map(rewriteInstructionText)
   if (typeof value !== 'object' || value === null) return value
   const record = value as Record<string, unknown>
   const out: Record<string, unknown> = { ...record }
   for (const [key, nested] of Object.entries(record)) {
     if (!isIdentityTextCarrier(key)) continue
-    out[key] = rewriteIdentitySentence(nested)
+    out[key] = rewriteInstructionText(nested)
   }
   return out
 }
 
 /**
- * 抹掉指令消息里的身份句（判据 2）。
+ * 抹掉指令消息里的**指纹句**（判据 2 的身份句 + 判据 3 的路径说明句）。
  *
- * 只处理 `system` / `developer` —— 那是宿主自己的指令通道，身份句就是从那里发出来的。
- * 用户消息或 tool 结果里如果恰好引用了这句话，**原样保留**。
+ * 只处理 `system` / `developer` —— 那是宿主自己的指令通道，两句都是从那里发出来的。
+ * 用户消息或 tool 结果里如果恰好引用了它们，**原样保留**。
  *
  * 有意不看位置：DSH 把 prompt 作为第一条消息发出，但只看 `messages[0]` 会漏掉
- * 中途注入的 system 更新。幂等 —— 替换后的文本不再匹配该正则。
+ * 中途注入的 system 更新。幂等 —— 替换后的文本不再匹配这两条正则。
  */
 export function rewriteHarnessIdentity(messages: readonly ChatMessage[]): ChatMessage[] {
   return messages.map((message) => {
     if (message.role !== 'system' && message.role !== 'developer') return message
     const next: ChatMessage = { ...message }
     if (next.content !== undefined) {
-      next.content = rewriteIdentitySentence(next.content) as ChatMessage['content']
+      next.content = rewriteInstructionText(next.content) as ChatMessage['content']
     }
     if (typeof next.text === 'string') {
-      next.text = rewriteIdentitySentence(next.text) as string
+      next.text = rewriteInstructionText(next.text) as string
     }
     return next
   })

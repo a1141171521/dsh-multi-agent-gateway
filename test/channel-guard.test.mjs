@@ -34,6 +34,8 @@ import { BuddyAdapter, BUDDY_CN, BUDDY_INTL } from '../lib/adapters/buddy.js'
 import {
   HARNESS_IDENTITY_PHRASE,
   NEUTRAL_IDENTITY_PHRASE,
+  NEUTRAL_PATH_MENTION_PHRASE,
+  PATH_MENTION_PHRASE,
   carriesHarnessIdentity,
   guardChatMessages,
   rewriteHarnessIdentity,
@@ -271,4 +273,33 @@ test('国际版：首条是 user 时仍然补最小 system（另一条独立判�
   assert.equal(body.messages[0].role, 'system')
   assert.equal(body.messages[0].content, 'You are a helpful assistant.')
   assert.equal(body.messages[1].content, 'hi')
+})
+
+// ── 判据 3：路径说明句（2026-10-28 真机定位，见 docs/WORKBUDDY-CHANNEL-CHECK.md §11） ──
+
+test('国内版：系统提示里的路径说明句必须被改写（否则每次对话都 400）', async () => {
+  const adapter = new BuddyAdapter(BUDDY_CN)
+  const { ctx, calls } = chatCtx()
+  const system = [
+    'Tokens prefixed with @ are paths the user explicitly referenced.',
+    `${PATH_MENTION_PHRASE}; absolute paths identify files or directories on the host.`,
+  ].join(' ')
+  await drainChat(adapter, ctx, [{ role: 'system', content: system }, { role: 'user', content: 'hi' }], account('workbuddy'))
+
+  const sent = sentBody(calls).messages[0].content
+  assert.ok(!sent.includes(PATH_MENTION_PHRASE), `原句还在：${sent}`)
+  assert.ok(sent.includes(NEUTRAL_PATH_MENTION_PHRASE), '改写后的句子要出现')
+})
+
+test('路径说明句：折行 / 大小写变体也命中，且改写幂等', () => {
+  const folded = 'Relative   paths\nresolve from the workspace root'
+  const once = rewriteHarnessIdentity([{ role: 'system', content: folded }])
+  assert.equal(once[0].content, NEUTRAL_PATH_MENTION_PHRASE)
+  const twice = rewriteHarnessIdentity(once)
+  assert.equal(twice[0].content, once[0].content)
+})
+
+test('路径说明句：用户消息里出现时原样保留（只动指令通道）', () => {
+  const out = rewriteHarnessIdentity([{ role: 'user', content: PATH_MENTION_PHRASE }])
+  assert.equal(out[0].content, PATH_MENTION_PHRASE)
 })
