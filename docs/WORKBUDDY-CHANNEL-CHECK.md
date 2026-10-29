@@ -319,3 +319,89 @@ Relative paths resolve from the workspace root
 「`risk_control` 一律不重试」的规矩。
 
 
+
+
+## 12. 判据 2 扩表：12 条指纹，以及「本机被 purge 过」的验证盲区（2026-10-29）
+
+GitHub issue #1（`@ai376894926`）报：v0.3.2 装上后国内版**仍然每条都 400**，并指出
+守卫只清了 4 句里的 2 句。核实结论：**报告成立**，而且比报告写的更严重 —— 我们此前
+所有「真机通过」的复验，验的都是**少了三条指纹的 prompt**。
+
+### 12.1 原版 DSH 的 system 里到底有哪几条
+
+四条来源，四类指纹，共 12 条（都从 npm 上 `@deepseek-ai/*@0.2.1-rc.2` 的包里逐字核对过）：
+
+| # | 指纹 | 出处 | 备注 |
+|---|---|---|---|
+| 1 | `You are an AI agent powered by DeepSeek Harness.` | `dsh-system-prompt/lib/index.js:231` | 默认 `includeHarnessIdentity: true` |
+| 2 | `You are a coding agent powered by the <model> model.` | `dsh-web-app/cordis.patch.yml:20` 的 `personaPrefix`；`presets/{standard,ptc,cordis}.patch.yml` 的 `prefix:` | 模型名是变量 |
+| 3 | `You are interacting with the user through the DeepSeek Harness Web GUI …` | `dsh-harness-dev-context/lib/index.js:29` | 仅 Web 界面 |
+| 4–12 | `@` 路径段的 9 句（`Tokens prefixed with @ …` / `Relative paths resolve from …` / … / `@"..." quotes a path containing spaces.`） | `dsh-file-reference/lib/index.js:54` | 407 字，整段才触发（§11） |
+
+四类在 **rc.2 / rc.3 / rc.4 / 0.2.2-alpha.2 四个版本里全都有**，不是某个特殊构建。
+
+### 12.2 为什么我们以前看不见第 2、3 条（重要，别再被骗第二次）
+
+`dsh-purge` 在本机打了四条提示词补丁，正好把前三条洗掉：
+
+| 补丁 | 效果 |
+|---|---|
+| `#25 HARNESS_IDENTITY_STRIP` | `includeHarnessIdentity` 默认改 `false`、文本清空 |
+| `#26 MINIMAL_PERSONA_PURGE` | `cordis.patch.yml` 的 `personaPrefix` 改 `""` |
+| `#32 WEB_SURFACE_IDENTITY_NEUTRAL` | `DeepSeek Harness Web GUI` → `a local web GUI` |
+| `#43 WEB_PRESET_IDENTITY_STRIP` | `presets/*.patch.yml` 的 `prefix:` 行删掉 |
+
+于是本机发出去的 system 只剩 `@` 路径段那一条 —— v0.3.2 的「真机回归 200」是真的，
+但它只证明了「第 12 条被清掉之后能过」，**证明不了另外 11 条**。
+
+> **规矩**：凡是要验证「指纹有没有清干净」，样例必须取自 **npm 上原版包的文本**，
+> 或者用户的真实报文。本机「发一条没报错」永远不能当证据 —— 本机不是干净环境。
+
+### 12.3 真机 A/B（2026-10-29，国内版账号，同一份原版 system）
+
+只改 `system` 里的第 2、3 句，其余字节不动：
+
+| 用例 | 出站内容 | 结果 |
+|---|---|---|
+| A | 原样（v0.3.2 守卫只清 #1、#12） | **400 / `11-128`** ×2（532 ms / 344 ms） |
+| B | 只把 #2、#3 换成中性说法 | **200** ×2，正文 `OK` |
+| A′ | 原样，但走 **v0.3.3 的新守卫** | **200** ×2，正文 `OK` |
+
+A 与 B 是同一份 body 的两次发送，唯一变量就是那两句 —— 这是 issue 结论的直接证据。
+A′ 是同一条路径改完之后复测。
+
+### 12.4 判据的真实形态：归一化后的**子串**匹配，位置无关
+
+| 观察到的事实 | 说明 |
+|---|---|
+| 2026-10-21：同一句夹在长 prompt 中间 → 200 | 当时是 prefix 规则（只看开头） |
+| 2026-10-28：第 28 625 字的路径句单独触发 400 | 已经变成位置无关 |
+| 2026-10-29：U+200B 打断每个词边界仍然 400 | 会先 normalise 掉不可见字符 |
+
+**零宽字符方案（`dsh-connect-workbuddy@5.12.3` 的 `breakIdentityClauses`）已经失效**，
+5.13.1 自己也在注释里改口成「真改写措辞才是 200」。所以本仓库只做整句改写。
+
+### 12.5 修法
+
+`src/vendor/buddy/buddy-channel-guard.ts` 把两条正则换成一张 **12 条**的改写表
+（`CHANNEL_GATE_REWRITES`），并：
+
+- **扫描角色扩到 `assistant`**：网关连历史一起扫，一条中毒的 assistant 消息会让
+  **之后每一轮**都挂（对方插件的 issue #98 就是这个）。用户消息 / tool 结果仍然不碰。
+- **`request-log.ts` 的错误上限 300 → 2000**：`describeBuddyErrorBody()` 压成的一行约
+  330 字，300 正好切掉结尾的 `requestId=`（issue #1 的附带问题）。
+- 暴露 `carriesChannelFingerprint(text)`：返回**还剩哪几条**（规则名），断言失败时不用猜。
+
+### 12.6 验证
+
+- `test/channel-guard.test.mjs` 23 → **33** 条：原版 rc.2 文本 12 条全清、模型名变量、
+  Web GUI 后半段不动、路径段 9 句逐条、assistant 历史、用户消息不动、幂等、出站报文两条；
+- 全量：宿主 **677/677**、客户端 **85/85**、冒烟通过；
+- 真机：§12.3 的 A′（200 ×2）。
+
+### 12.7 仍然没做的
+
+- **自愈重试**：`11-128` 时用中性 system 重发一次。能兜住「上游又加了新指纹」，
+  但会丢掉整段系统提示、改变模型行为，暂时不做 —— 先靠 12 条名单 + 单测。
+- 上游名单是快照，**下次再出现 400 时先看 `carriesChannelFingerprint` 的结果**，
+  别再从零二分。

@@ -32,10 +32,17 @@ import test from 'node:test'
 
 import { BuddyAdapter, BUDDY_CN, BUDDY_INTL } from '../lib/adapters/buddy.js'
 import {
+  CHANNEL_GATE_REWRITES,
+  CODING_AGENT_PHRASE,
+  FILE_REFERENCE_PHRASES,
   HARNESS_IDENTITY_PHRASE,
+  NEUTRAL_CODING_AGENT_PHRASE,
   NEUTRAL_IDENTITY_PHRASE,
   NEUTRAL_PATH_MENTION_PHRASE,
+  NEUTRAL_WEB_SURFACE_PHRASE,
   PATH_MENTION_PHRASE,
+  WEB_SURFACE_PHRASE,
+  carriesChannelFingerprint,
   carriesHarnessIdentity,
   guardChatMessages,
   rewriteHarnessIdentity,
@@ -302,4 +309,105 @@ test('路径说明句：折行 / 大小写变体也命中，且改写幂等', ()
 test('路径说明句：用户消息里出现时原样保留（只动指令通道）', () => {
   const out = rewriteHarnessIdentity([{ role: 'user', content: PATH_MENTION_PHRASE }])
   assert.equal(out[0].content, PATH_MENTION_PHRASE)
+})
+
+// ─────────── 判据 2 扩表：issue #1（2026-10-29 真机 A/B 确认） ───────────
+//
+// 背景见 docs/WORKBUDDY-CHANNEL-CHECK.md §12。三个要点：
+//   1. 原版 DSH（rc.2 / rc.3 / rc.4 / 0.2.2-alpha）的 system 里**一定**带这份 12 条指纹；
+//   2. 本机被 dsh-purge 洗掉了前三条，所以「本机发一条没报错」不能当证据 ——
+//      下面用的是 npm 上原版包的**逐字文本**；
+//   3. 上游按「归一化后的子串」匹配，位置无关，零宽字符会被 normalise 掉。
+
+/** 原版 DSH 0.2.1-rc.2 的 system 骨架：身份句 + persona + 路径段 + Web 界面句。 */
+const STOCK_SYSTEM = [
+  'You are an AI agent powered by DeepSeek Harness.',
+  '',
+  'You are a coding agent powered by the workbuddy/hy4-preview model.',
+  '',
+  'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @"..." quotes a path containing spaces.',
+  '',
+  'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to "this page", they mean this GUI.',
+].join('\n')
+
+test('原版 DSH 的 12 条指纹：过守卫后一条不剩', () => {
+  assert.equal(carriesChannelFingerprint(STOCK_SYSTEM).length, 12, '样例本身要带满 12 条')
+  const out = guardChatMessages([{ role: 'system', content: STOCK_SYSTEM }])
+  const left = carriesChannelFingerprint(String(out[0].content))
+  assert.deepEqual(left, [], `还有指纹没清：${left.join(', ')}`)
+})
+
+test('persona 句里的模型名是变量：改写后原样保留', () => {
+  for (const model of ['workbuddy/hy4-preview', 'qmodel_38max', 'deepseek-v4.1-flash']) {
+    const text = `You are a coding agent powered by the ${model} model.`
+    const out = rewriteHarnessIdentity([{ role: 'system', content: text }])
+    assert.equal(String(out[0].content), `${NEUTRAL_CODING_AGENT_PHRASE}${model} model.`)
+  }
+})
+
+test('Web GUI 句只换前半句，后半段原文不动', () => {
+  const tail = ' whose URL the runtime context names. When the user refers to "this page", they mean this GUI.'
+  const out = rewriteHarnessIdentity([{ role: 'system', content: WEB_SURFACE_PHRASE + tail }])
+  assert.equal(String(out[0].content), NEUTRAL_WEB_SURFACE_PHRASE + tail)
+})
+
+test('@ 路径段 9 句逐条都被改写', () => {
+  for (const phrase of FILE_REFERENCE_PHRASES) {
+    const out = rewriteHarnessIdentity([{ role: 'system', content: `前缀 ${phrase} 后缀` }])
+    const text = String(out[0].content)
+    assert.equal(text.includes(phrase), false, `没改写：${phrase}`)
+    assert.ok(text.startsWith('前缀 ') && text.endsWith(' 后缀'), '句子之外的内容被动了')
+  }
+})
+
+test('assistant 历史里的指纹句也改写（一条中毒历史会让之后每轮都挂）', () => {
+  const out = rewriteHarnessIdentity([
+    { role: 'assistant', content: 'You are a coding agent powered by the workbuddy/hy4-preview model.' },
+  ])
+  assert.equal(String(out[0].content), 'You are a coding agent running on the workbuddy/hy4-preview model.')
+})
+
+test('用户消息里的 persona / Web GUI 句原样保留', () => {
+  const messages = [
+    { role: 'user', content: `${CODING_AGENT_PHRASE}foo model.` },
+    { role: 'user', content: WEB_SURFACE_PHRASE },
+  ]
+  assert.deepEqual(rewriteHarnessIdentity(messages), messages)
+})
+
+test('整份原版 system 改写两遍结果一致（幂等）', () => {
+  const once = guardChatMessages([{ role: 'system', content: STOCK_SYSTEM }])
+  const twice = guardChatMessages(once)
+  assert.equal(String(twice[0].content), String(once[0].content))
+})
+
+test('出站报文（国内版）：原版 system 的 12 条指纹一条不剩', async () => {
+  const adapter = new BuddyAdapter(BUDDY_CN)
+  const { ctx, calls } = chatCtx()
+  await drainChat(adapter, ctx, [
+    { role: 'system', content: STOCK_SYSTEM },
+    { role: 'user', content: 'hi' },
+  ], account('workbuddy'))
+
+  assert.deepEqual(carriesChannelFingerprint(JSON.stringify(sentBody(calls))), [])
+})
+
+test('出站报文（国内版）：assistant 历史里的 persona 句也被清', async () => {
+  const adapter = new BuddyAdapter(BUDDY_CN)
+  const { ctx, calls } = chatCtx()
+  await drainChat(adapter, ctx, [
+    { role: 'system', content: 'You are a helpful assistant.' },
+    { role: 'user', content: 'a' },
+    { role: 'assistant', content: 'You are a coding agent powered by the workbuddy/hy4-preview model.' },
+    { role: 'user', content: 'b' },
+  ], account('workbuddy'))
+
+  const body = sentBody(calls)
+  assert.equal(body.messages[2].content, 'You are a coding agent running on the workbuddy/hy4-preview model.')
+  assert.deepEqual(carriesChannelFingerprint(JSON.stringify(body)), [])
+})
+
+test('改写表本身：12 条、名字唯一', () => {
+  assert.equal(CHANNEL_GATE_REWRITES.length, 12)
+  assert.equal(new Set(CHANNEL_GATE_REWRITES.map((rule) => rule.name)).size, 12)
 })

@@ -1243,9 +1243,11 @@ if (reasoningEffortsForDeclared(declared).length > 0) { out.reasoning = … }
 Lead 一开始就把「首条必须是 system」当成**已排除**（因为修头前测它也是 400），
 是修完头之后再测才发现它其实**也是真的**。
 
-> ⚠️ 内容指纹那条**我们不需要处理**：DSH 的提示词不含该句，实测 DSH 真实
-> system（完整 `prompt-inject.md`）返回 200。**不要顺手把剥离逻辑搬进来** ——
-> 那是给上游加一条没人验证过的改写。
+> ⚠️ 内容指纹那条**我们当时判断错了**（2026-10-29 更正）：本机的 `dsh-system-prompt` 被
+> `dsh-purge` 改过（`includeHarnessIdentity` 默认 `false`、身份句清空），所以「DSH 真实
+> system 返回 200」是在**少了三条指纹**的 prompt 上测出来的。原版 DSH 的 system 带 **12 条**
+> 指纹，国内版必挂 —— 见 `docs/WORKBUDDY-CHANNEL-CHECK.md` §12 与 GitHub issue #1。
+> **这段不要再当成「不需要处理」的依据。**
 
 **为什么必须是那三个头**：文本里写着 *"not sent from an official channel"*，
 是**渠道校验**（请求头身份），不是内容审核。

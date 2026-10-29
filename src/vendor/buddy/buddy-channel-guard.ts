@@ -1,5 +1,5 @@
 /**
- * WorkBuddy / CodeBuddy 网关「渠道校验」（`code 11-128`）的两道判据。
+ * WorkBuddy / CodeBuddy 网关「渠道校验」（`code 11-128`）的改写表。
  *
  * ## 一个错误码，两个互不相干的成因
  *
@@ -17,7 +17,7 @@
  * | # | 判据 | 我们怎么处理 |
  * |---|---|---|
  * | 1 | 指令消息的 `role` 是 `developer` | {@link withInstructionRoles} → 改写成 `system` |
- * | 2 | 指令消息**以 DSH 的身份句开头** | {@link rewriteHarnessIdentity} → 换中性说法 |
+ * | 2 | 指令消息里出现 DSH 的**指纹句** | {@link rewriteHarnessIdentity} → 换中性说法 |
  *
  * ⚠️ **不能只看 code 判断原因**，也不能只修一条就以为修好了 —— 修掉一条之后，
  * 另一条的报错文案**一字不差**，看起来像「没生效」。
@@ -41,45 +41,41 @@
  * 同日对**国内版**端点（`copilot.tencent.com`）复测，同样 `developer` + 身份句 → 400 /
  * 同一句 `msg`（`.scratch/buddy-cn-live-check.mjs` 的 X 行）。
  *
- * ## 判据 2：DSH 身份句（**国内版独有**）
+ * ## 判据 2：指纹句（**国内版独有**）
  *
- * `dsh-xdpool` 在 **2026-10-21 于国内版 chat 端**逐条实测（`src/upstream.ts`
- * 的 `HARNESS_IDENTITY_PHRASE` 注释），同样 `11-128` / 同一句 `msg`：
+ * 网关会扫**每一条** `system` / `assistant` 消息，命中一份「别家 agent 的提示词」
+ * 名单就拒，code 与 `displayTips` 与判据 1 完全一样。名单是上游的快照，我们只能按
+ * 实测到的条目改写 —— 见 {@link CHANNEL_GATE_REWRITES} 的 12 条。
  *
- * | system 消息 | 结果 |
+ * ### 判定的形态变过两次，别再按旧模型写代码
+ *
+ * | 时间 | 当时测到的规则 | 证据 |
  * |---|---|---|
- * | 不带 system | 200 |
- * | `You are an AI agent powered by DeepSeek Harness.` | **400 / `11-128`** |
- * | 同上但去掉句末句号 | **400 / `11-128`** |
- * | `You are an AI agent.` + 该句 | 200 |
- * | 该句 + 工具前言 + `<available_skills>` | **400 / `11-128`** |
- * | 该句夹在长 prompt **中间一行** | 200 |
+ * | 2026-10-21 | **只看开头**（prefix match）：同一句夹在长 prompt 中间 → 200 | `dsh-xdpool` 逐条实测 |
+ * | 2026-10-28 | **位置无关**：第 28625 字的 `Relative paths resolve…` 单独就能触发 | 本仓库 §11 的前缀二分 |
+ * | 2026-10-29 | **先归一化再匹配**：U+200B 打断每一个词边界仍然 400 | `dsh-connect-workbuddy@5.13.1` 两组独立探针 |
  *
- * 也就是说国内版网关拦的是这句话**作为指令消息的开头**出现 —— 而这恰好是
- * `@deepseek-ai/dsh-system-prompt` 的 `harness:identity` 段的形态：它是
- * `order: -1000` 的第一方固定开场白，**默认开启**（`includeHarnessIdentity`
- * 默认 `true`），所以**每一个默认配置的 DSH 用户**发出去的 system prompt 都以它开头。
+ * 所以：**零宽字符那套不能用**（网关会 normalise 掉不可见字符），只能真改写措辞。
+ * 这也解释了为什么「整句替换」比「插不可见字符」更耐打。
  *
- * ✅ 这一行我们在 2026-10-25 用真实 CodeBuddy 账号自己复现了（同样
- * `copilot.tencent.com`、`system` 里带身份句 → 400 / 同一句 `msg`）。同一份 body
- * 打**国际版**是 200 —— 所以判据 2 是**国内版独有**的，见上方 §判据 1 的 B 行。
- * 「国际版测过了」不能当成「国内版也没问题」。
+ * ## 为什么以前只清两句：本机的验证环境被 dsh-purge 洗过（重要）
  *
- * 本机之所以长期没踩到：本机的 `dsh-system-prompt/lib/index.js` 被改过
- * （`includeHarnessIdentity` 默认值被改成 `false`，原件留在同目录的
- * `index.js.dshpurge.bak`）。**别人的机器是默认值** —— 这正是「已经有用户反馈」
- * 而我们在本机复现不出来的原因。
+ * `dsh-purge` 的 `#25 HARNESS_IDENTITY_STRIP` / `#26 MINIMAL_PERSONA_PURGE` /
+ * `#32 WEB_SURFACE_IDENTITY_NEUTRAL` / `#43 WEB_PRESET_IDENTITY_STRIP` 会把前三条
+ * 指纹从**本机**的 DSH 里删掉。结果是：我们自己的机器发出去的 system 只剩 @ 路径段
+ * 那一段，于是 v0.3.2 的「真机复验」验的是一份**少了三处指纹的 prompt**。
+ * 用户的机器没有 purge —— **凡是验证「指纹清干净了没有」，必须用 npm 上原版包的文本，
+ * 不能拿本机那句「反正没报错」当证据。**
  *
- * ## 为什么不干脆让用户关掉 `includeHarnessIdentity`
+ * ## 只动指令消息与 assistant 历史，不动用户的话
  *
- * 那是**宿主 profile 的开关**，插件管不到别人的部署（用户装了插件就得先去改配置，
- * 等于把修复责任推给用户）。改在出站 body 里，装上就生效；用户自己在宿主侧关掉后，
- * 这里自然退化成 no-op（幂等）。
+ * 判据 1、2 只处理 `system` / `developer` / `assistant`：
+ *   - `system` / `developer` 是宿主自己的指令通道；
+ *   - `assistant` 是**历史回显**：模型把提示词抄进回复、会话恢复、压缩产物都会留下
+ *     指纹句，而网关连 `assistant` 一起扫 —— 一条中毒的历史会让**之后每一轮**都挂
+ *     （`dsh-connect-workbuddy` 的 issue #98 就是这个）。
  *
- * ## 只动指令消息，不动用户的话
- *
- * 两道判据都只处理 `system` / `developer` 角色：身份句是从那条通道发出来的。
- * 用户消息、工具调用参数里如果**恰好引用**了这句话，原样保留 —— 我们没有理由
+ * 用户消息、工具调用参数里如果**恰好引用**了这些句子，原样保留 —— 我们没有理由
  * 改用户打的字，而且改工具参数会直接把一次调用改坏。
  */
 
@@ -103,6 +99,157 @@ export const HARNESS_IDENTITY_PHRASE = 'You are an AI agent powered by DeepSeek 
 export const NEUTRAL_IDENTITY_PHRASE = 'You are an AI agent running inside this harness.'
 
 /**
+ * 第二类指纹：**部署 persona**（2026-10-29 由 issue #1 定位并真机确认）。
+ *
+ * 出处：`@deepseek-ai/dsh-web-app` 的 `cordis.patch.yml` 里
+ * `personaPrefix: >- You are a coding agent powered by the {{model}} model.`，
+ * 以及 `presets/{standard,ptc,cordis}.patch.yml` 里同样的 `prefix:` 行 ——
+ * **原版 DSH 的每一个 preset 都带这一句**，rc.2 / rc.3 / rc.4 / 0.2.2-alpha.2 全都有。
+ *
+ * 模型名是变量（`workbuddy/hy4-preview`、`qmodel_38max`、`deepseek-v4.1-flash` …），
+ * 所以正则只锚到 `powered by the` 之后、`model.` 之前，改写时把模型名原样留下。
+ */
+export const CODING_AGENT_PHRASE = 'You are a coding agent powered by the '
+
+/** 第二类指纹的中性说法（模型名由正则的捕获组带过来）。 */
+export const NEUTRAL_CODING_AGENT_PHRASE = 'You are a coding agent running on the '
+
+/**
+ * 第三类指纹：**Web 界面的自我描述**。
+ *
+ * 出处：`@deepseek-ai/dsh-harness-dev-context` 的 `WEB_SURFACE_PROMPT`
+ * （`lib/index.js:29`）。只在 Web GUI 里出现，所以只在 Web 部署上踩得到。
+ */
+export const WEB_SURFACE_PHRASE = 'You are interacting with the user through the DeepSeek Harness Web GUI'
+
+/** 第三类指纹的中性说法：只换掉「你正通过…交互」这个从句，后半段原文不动。 */
+export const NEUTRAL_WEB_SURFACE_PHRASE = 'You are working with the user inside the DeepSeek Harness Web GUI'
+
+/**
+ * 第四类指纹：`@` 路径说明段（`@deepseek-ai/dsh-file-reference` 的
+ * `FILE_REFERENCE_PROMPT`，407 字，见 §11）。
+ *
+ * 2026-10-28 的定位结论是「整段一起才触发」：单句发 200、整段发 400。
+ * 只改其中一句就能破掉整段的匹配 —— 但**逐句都改**才抗版本漂移：DSH 改一个词、
+ * 段内顺序变一下，只靠一句改写的方案会静默失效。
+ */
+export const FILE_REFERENCE_PHRASES = [
+  'Tokens prefixed with @ are paths the user explicitly referenced.',
+  'Relative paths resolve from the workspace root',
+  'absolute paths identify files or directories on the host.',
+  'A trailing slash marks a directory:',
+  'list it when its contents matter.',
+  'Anything else is a file:',
+  'use the read tool when its contents are needed,',
+  'and do not claim to have inspected it before reading.',
+  '@"..." quotes a path containing spaces.',
+] as const
+
+/** 路径段里被单独点名的那一句（对外保留这个别名，历史用例在用）。 */
+export const PATH_MENTION_PHRASE = FILE_REFERENCE_PHRASES[1]
+
+/** 顶替它的中性说法：意思不变，只是不再逐字撞上那句指纹。 */
+export const NEUTRAL_PATH_MENTION_PHRASE = 'Relative paths are resolved against the workspace root'
+
+/**
+ * 一条改写规则。
+ *
+ * `source` 存的是**正则源码字符串**而不是 `RegExp` 实例：带 `g` 标志的正则有
+ * `lastIndex` 状态，共享实例会在连续调用之间给出错误答案。每次用
+ * {@link patternOf} 现造一个。
+ */
+export interface ChannelGateRewrite {
+  readonly name: string
+  readonly source: string
+  readonly to: string
+}
+
+/** 句内空白按「任意空白」处理：`\s` 已含换行/NBSP，这里显式写出 NBSP 便于阅读。 */
+const WS = '[\\s\\u00a0]+'
+
+/**
+ * 网关点名的 12 条指纹与它们的替代说法。
+ *
+ * 顺序即应用顺序：三条身份句在前（它们可能相邻），路径段 9 句按原文顺序。
+ * 每条替换都**幂等** —— 替换后的文本不再匹配自己这条正则，也不匹配表里其它条。
+ */
+export const CHANNEL_GATE_REWRITES: readonly ChannelGateRewrite[] = [
+  {
+    name: 'harness-identity',
+    source: `You${WS}are${WS}an${WS}AI${WS}agent${WS}powered${WS}by${WS}DeepSeek${WS}Harness\\.?`,
+    to: NEUTRAL_IDENTITY_PHRASE,
+  },
+  {
+    name: 'coding-agent-persona',
+    // 模型名是变量，用捕获组原样带回；`[^\n]` 限定不跨行，避免吞掉后面整段。
+    source: `You${WS}are${WS}a${WS}coding${WS}agent${WS}powered${WS}by${WS}the${WS}([^\\n]{1,120}?)${WS}model\\.?`,
+    to: `${NEUTRAL_CODING_AGENT_PHRASE}$1 model.`,
+  },
+  {
+    name: 'web-surface',
+    source: `You${WS}are${WS}interacting${WS}with${WS}the${WS}user${WS}through${WS}the${WS}DeepSeek${WS}Harness${WS}Web${WS}GUI`,
+    to: NEUTRAL_WEB_SURFACE_PHRASE,
+  },
+  {
+    name: 'file-ref-at-token',
+    source: `Tokens${WS}prefixed${WS}with${WS}@${WS}are${WS}paths${WS}the${WS}user${WS}explicitly${WS}referenced\\.`,
+    to: 'Paths that begin with @ are the ones the user explicitly referenced.',
+  },
+  {
+    name: 'file-ref-relative',
+    source: `Relative${WS}paths${WS}resolve${WS}from${WS}the${WS}workspace${WS}root`,
+    to: NEUTRAL_PATH_MENTION_PHRASE,
+  },
+  {
+    name: 'file-ref-absolute',
+    source: `absolute${WS}paths${WS}identify${WS}files${WS}or${WS}directories${WS}on${WS}the${WS}host\\.`,
+    to: 'absolute paths point at files or directories on the host.',
+  },
+  {
+    name: 'file-ref-trailing-slash',
+    source: `A${WS}trailing${WS}slash${WS}marks${WS}a${WS}directory:`,
+    to: 'A trailing slash indicates a directory:',
+  },
+  {
+    name: 'file-ref-list-contents',
+    source: `list${WS}it${WS}when${WS}its${WS}contents${WS}matter\\.`,
+    to: 'list it whenever its contents matter.',
+  },
+  {
+    name: 'file-ref-else-file',
+    source: `Anything${WS}else${WS}is${WS}a${WS}file:`,
+    to: 'Everything else is a file:',
+  },
+  {
+    name: 'file-ref-read-tool',
+    source: `use${WS}the${WS}read${WS}tool${WS}when${WS}its${WS}contents${WS}are${WS}needed,`,
+    to: 'use the read tool whenever you need its contents,',
+  },
+  {
+    name: 'file-ref-claim',
+    source: `and${WS}do${WS}not${WS}claim${WS}to${WS}have${WS}inspected${WS}it${WS}before${WS}reading\\.`,
+    to: 'and never claim to have inspected it before reading it.',
+  },
+  {
+    name: 'file-ref-quote',
+    source: `@"\\.\\.\\."${WS}quotes${WS}a${WS}path${WS}containing${WS}spaces\\.`,
+    to: 'A path containing spaces is quoted with @"...".',
+  },
+]
+
+/** 现造一个忽略大小写、全局匹配的正则（避免共享实例的 `lastIndex` 状态）。 */
+function patternOf(source: string): RegExp {
+  return new RegExp(source, 'giu')
+}
+
+/** 按名字取一条规则的正则；名字不存在时抛错，避免拼错名字静默变成 no-op。 */
+function patternByName(name: string): RegExp {
+  const rule = CHANNEL_GATE_REWRITES.find((item) => item.name === name)
+  if (rule === undefined) throw new Error(`未知的网关指纹：${name}`)
+  return patternOf(rule.source)
+}
+
+/**
  * 匹配身份句的正则 —— **每次返回一个新实例**。
  *
  * 两个理由：
@@ -114,47 +261,42 @@ export const NEUTRAL_IDENTITY_PHRASE = 'You are an AI agent running inside this 
  *      顺带忽略大小写，成本为零。
  */
 export function identityPattern(): RegExp {
-  // eslint-disable-next-line no-control-regex -- \u00a0 是 NBSP，不是控制字符
-  return /You[\s\u00a0]+are[\s\u00a0]+an[\s\u00a0]+AI[\s\u00a0]+agent[\s\u00a0]+powered[\s\u00a0]+by[\s\u00a0]+DeepSeek[\s\u00a0]+Harness\.?/giu
+  return patternByName('harness-identity')
 }
 
-/**
- * 第二句被网关点名的**路径说明**（判据 3，2026-10-28 真机定位）。
- *
- * 出处：DSH 系统提示词里「@ 引用 / 路径」那一段的首句
- * （`Tokens prefixed with @ are paths the user explicitly referenced.` 之后）。
- *
- * ## 怎么定位到的（别再从头猜一遍）
- *
- * 用户国内版**每次发对话都 400**，而探针怎么打都是 200。把真机报文落盘后原样重放，
- * 稳定复现；再去掉 tools / 只留最后一条消息，仍 400；把 system 换成中性短句 → 200。
- * 对 system 做前缀二分，落在第 28625–28656 字之间；把那一段（407 字）单独拿出来打 → 400，
- * 而把句中 `resolve from` 改成 `resolves from`（只多一个 s）→ **200**。
- * 整份 35k 的 system 只改这一句，连打两次全 200。
- *
- * 即：这是**语义指纹**判定（这段写法像别家客户端），不是精确字符串黑名单 ——
- * 所以差一个词就能过，也所以只删最后一句（P8）仍然 400。
- */
+/** 匹配 `coding agent powered by the <model> model.` 的正则（模型名是变量）。 */
+export function codingAgentPattern(): RegExp {
+  return patternByName('coding-agent-persona')
+}
 
-/** 原句（判据 3 的触发文本）。 */
-export const PATH_MENTION_PHRASE = 'Relative paths resolve from the workspace root'
-
-/** 顶替它的中性说法：意思不变，只是不再逐字撞上那句指纹。 */
-export const NEUTRAL_PATH_MENTION_PHRASE = 'Relative paths are resolved against the workspace root'
+/** 匹配 Web GUI 自我描述句的正则。 */
+export function webSurfacePattern(): RegExp {
+  return patternByName('web-surface')
+}
 
 /** 匹配路径说明句的正则 —— 同样每次新实例、句内任意空白、忽略大小写。 */
 export function pathMentionPattern(): RegExp {
-  return /Relative[\s\u00a0]+paths[\s\u00a0]+resolve[\s\u00a0]+from[\s\u00a0]+the[\s\u00a0]+workspace[\s\u00a0]+root/giu
+  return patternByName('file-ref-relative')
 }
 
 /**
  * 文本里是否还带着那句原话。
  *
  * **字面**判断（不做空白容错）—— 它是给断言用的：测试要能确认「改写之后这句原话
- * 真的不在报文里了」。改写本身走 {@link identityPattern}，两者刻意不同。
+ * 真的不在报文里了」。改写本身走 {@link CHANNEL_GATE_REWRITES}，两者刻意不同。
  */
 export function carriesHarnessIdentity(text: string): boolean {
   return text.includes(HARNESS_IDENTITY_PHRASE)
+}
+
+/**
+ * 文本里还剩哪几条指纹（测试与诊断用）。
+ *
+ * 返回**规则名**而不是布尔：断言失败时能直接看出漏了哪一条，不用再猜。
+ * 空数组 = 12 条全清。
+ */
+export function carriesChannelFingerprint(text: string): string[] {
+  return CHANNEL_GATE_REWRITES.filter((rule) => patternOf(rule.source).test(text)).map((rule) => rule.name)
 }
 
 /**
@@ -169,7 +311,7 @@ function isIdentityTextCarrier(key: string): boolean {
 }
 
 /**
- * 递归替换一段文本里的身份句（字符串 / 数组 / 文本分段对象三种形态都走）。
+ * 递归替换一段文本里的全部指纹（字符串 / 数组 / 文本分段对象三种形态都走）。
  *
  * **纯函数**：返回副本，不改入参。调用方的 message 可能被别处共享
  * （`payload` 被 spread 进 body，同一份对象还可能被日志/重试路径读到），
@@ -177,9 +319,7 @@ function isIdentityTextCarrier(key: string): boolean {
  */
 function rewriteInstructionText(value: unknown): unknown {
   if (typeof value === 'string') {
-    return value
-      .replace(identityPattern(), NEUTRAL_IDENTITY_PHRASE)
-      .replace(pathMentionPattern(), NEUTRAL_PATH_MENTION_PHRASE)
+    return CHANNEL_GATE_REWRITES.reduce((text, rule) => text.replace(patternOf(rule.source), rule.to), value)
   }
   if (Array.isArray(value)) return value.map(rewriteInstructionText)
   if (typeof value !== 'object' || value === null) return value
@@ -192,18 +332,27 @@ function rewriteInstructionText(value: unknown): unknown {
   return out
 }
 
+/** 会被网关扫内容的那几种角色。 */
+function isScannedRole(role: string): boolean {
+  return role === 'system' || role === 'developer' || role === 'assistant'
+}
+
 /**
- * 抹掉指令消息里的**指纹句**（判据 2 的身份句 + 判据 3 的路径说明句）。
+ * 抹掉消息里的**指纹句**（判据 2：三条身份句 + 路径段 9 句）。
  *
- * 只处理 `system` / `developer` —— 那是宿主自己的指令通道，两句都是从那里发出来的。
+ * 处理 `system` / `developer` / `assistant`：
+ *   - 前两者是宿主自己的指令通道；
+ *   - `assistant` 是历史回显 —— 网关连它一起扫，一条中毒的历史会让之后每一轮都挂。
+ *
  * 用户消息或 tool 结果里如果恰好引用了它们，**原样保留**。
  *
  * 有意不看位置：DSH 把 prompt 作为第一条消息发出，但只看 `messages[0]` 会漏掉
- * 中途注入的 system 更新。幂等 —— 替换后的文本不再匹配这两条正则。
+ * 中途注入的 system 更新；判据本身也已经是位置无关的（见文件头的时间线）。
+ * 幂等 —— 替换后的文本不再匹配任何一条正则。
  */
 export function rewriteHarnessIdentity(messages: readonly ChatMessage[]): ChatMessage[] {
   return messages.map((message) => {
-    if (message.role !== 'system' && message.role !== 'developer') return message
+    if (!isScannedRole(message.role)) return message
     const next: ChatMessage = { ...message }
     if (next.content !== undefined) {
       next.content = rewriteInstructionText(next.content) as ChatMessage['content']
@@ -218,7 +367,7 @@ export function rewriteHarnessIdentity(messages: readonly ChatMessage[]): ChatMe
 /**
  * 把 `developer` 角色改写成 `system`（判据 1）。
  *
- * 腾讯网关不认 `developer`（国际版实测 400，见文件头 A/B 的 D/E 两行）。DSH 在
+ * 腾讯网关不认 `developer`（国际版实测 400，见文件头 A/B 的 D/E 行）。DSH 在
  * 长对话里会注入这类消息（工具增删、重复工具提醒、上下文更新），所以**短对话正常、
  * 一旦对话变长就 400** —— 这是本判据最容易误判成「偶发」的地方。
  *
@@ -236,7 +385,7 @@ export function withInstructionRoles(messages: readonly ChatMessage[]): ChatMess
  * 仍要被第二道判据覆盖到。反过来（先改文本再换角色）也能工作，但那样「是否覆盖到
  * 全部指令消息」要依赖两次遍历的一致假设，不如按依赖顺序排。
  *
- * 幂等：两次调用结果相同（第二次没有 `developer` 可换，也没有身份句可改）。
+ * 幂等：两次调用结果相同（第二次没有 `developer` 可换，也没有指纹句可改）。
  */
 export function guardChatMessages(messages: readonly ChatMessage[]): ChatMessage[] {
   return rewriteHarnessIdentity(withInstructionRoles(messages))

@@ -2406,6 +2406,37 @@ test('RequestLog：`errorKind` 必须穿过 record → list → 落盘 → 重�
   }
 })
 
+test('RequestLog：错误原文不再被 300 字截断（issue #1 的附带问题）', () => {
+  // 适配器已经把上游错误压成一行（`describeBuddyErrorBody()`），完整长度约 330 字；
+  // 旧的 `slice(0, 300)` 正好切在 `displayTips.en` 中间，把结尾的 `requestId=` 切掉 ——
+  // 用户从「日志」页复制出来的原文因此是残缺的，报障时少一半线索。
+  const dir = mkdtempSync(join(tmpdir(), 'mag-req-err-'))
+  try {
+    const path = join(dir, 'requests.jsonl')
+    const requestId = '（requestId=aaaaaaaa-0000-4000-8000-000000000000）'
+    const message = `11-128 · Illegal API invocation from an unapproved channel｜${'这次调用没通过渠道校验，可能不是官方客户端发出的。'.repeat(12)}${requestId}`
+    assert.ok(message.length > 300, `样例要长过旧上限，实际 ${message.length}`)
+
+    const first = new RequestLog(path)
+    first.record({
+      agentId: 'workbuddy',
+      agentName: 'WorkBuddy',
+      model: 'hy4-preview',
+      accountId: 'workbuddy:a1',
+      ok: false,
+      durationMs: 446,
+      errorKind: 'risk_control',
+      error: message,
+    })
+
+    assert.equal(first.list().entries[0].error, message, '内存里就被截断了')
+    const entry = new RequestLog(path).list().entries[0]
+    assert.equal(entry.error, message, '落盘 / 重启这一路也要完整')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('RequestLog：成功记录不写 `errorKind`，读回来也不该凭空多出来', () => {
   // 「不知道就不写」是这个仓库的既有约定（倍率那组用例同款）。这里钉的是
   // 反方向：`record()` 里 `...input` 展开不该给缺失的键补一个 undefined 值，
