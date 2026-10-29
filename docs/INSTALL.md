@@ -20,6 +20,11 @@ dsh plugin --profile desktop add D:\AI\DeepseekPlugin\dsh-multi-agent-gateway
 2. 读它的 `dsh.bundle.patch`（= `cordis.patch.yml`）并把这一层叠进组合树；
 3. 把它加进 `dsh.profile.bundles` 列表（默认启用）。
 
+> **不需要在这个目录里跑 `npm install`**（0.3.4 起）。`pnpm add <路径>` 走的是
+> `link:`，**只建符号链接、不装依赖**；所以宿主半边的运行期依赖已经全部 vendor 到
+> `vendor/`（见 `vendor/README.md`）。0.3.3 及更早版本会因为这个原因报
+> `Cannot find package '@deepseek-ai/schemastery'`。
+
 ### 方式二：从 git 仓库装
 
 ```powershell
@@ -162,3 +167,5 @@ dsh plugin --profile desktop remove dsh-multi-agent-gateway
 | 保存配置报「保存失败」 | 宿主只接受声明了 `volatile` 的字段，且**一次 mutate 里有一个非法 op 就整批拒**。界面会把改过的路径列出来，照着核对 |
 | 加载器报 `duplicate loader entry id` | profile patch 里手工 insert 了同名 id。删掉那条手工 insert（bundle patch 已经加过了） |
 | 加载器报 `DUPLICATE_ADAPTER` | 另一个插件/配置已经占了 `multiagent-opencode` 这个 provider 路由。检查是否有两份本插件 |
+| 启用时报 `Cannot find package '@deepseek-ai/schemastery'` | **0.3.3 及更早**的本地目录安装（`pnpm link` 不装依赖）。升级到 **0.3.4**（依赖已 vendor，解压即用）；临时应急：在该插件目录跑一次 `npm install` |
+| 启用时报其它 `Cannot find package '@deepseek-ai/xxx'` | 同上，说明装的是旧版本；0.3.4 起宿主半边零运行时依赖 |

@@ -3979,3 +3979,23 @@ test('图片尺寸：本网关不缩放，原样返回归一化后的宽高与�
   })
 })
 
+
+// ── 分发形态：本地目录安装必须能直接加载（2026-10-29，用户报 ERR_MODULE_NOT_FOUND） ──
+
+test('宿主半边零运行时依赖：schemastery 走 vendor，不是 npm 依赖', () => {
+  // `dsh plugin add <本地目录>` 走 pnpm link：只建符号链接、不装依赖。
+  // 只要宿主半边还 import 任何 npm 包，别人解压到 D:\tools\... 就会在加载阶段炸。
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.equal(
+    pkg.dependencies?.['@deepseek-ai/schemastery'],
+    undefined,
+    '又把 schemastery 加回 npm 依赖了 —— 本地目录安装会 ERR_MODULE_NOT_FOUND',
+  )
+  assert.ok(pkg.files.includes('vendor'), 'vendor/ 必须在 npm pack 的文件清单里')
+
+  const source = readFileSync(new URL('../lib/config.js', import.meta.url), 'utf8')
+  assert.match(source, /import Schema from '\.\.\/vendor\/schemastery\/index\.js'/)
+
+  const vendored = readFileSync(new URL('../vendor/schemastery/index.js', import.meta.url), 'utf8')
+  assert.match(vendored, /from "\.\.\/cosmokit\/index\.js"/, 'vendor 里指向 cosmokit 的 import 被改坏了')
+})
