@@ -110,6 +110,33 @@ export interface DshImageRequestPricing {
   priceImages(images: readonly DshImageBlock[]): DshImagePrice[]
 }
 
+/**
+ * 宿主附件服务里「一次请求版图片」的返回（`readImageRequest()`）。
+ *
+ * 只声明用得到的字段：`data` 是**已经按 target 压过**的编码字节，
+ * `mediaType` 是压缩后的真实 MIME（可能从 png 变成 jpeg）。
+ */
+export interface DshImageVersion {
+  data: Uint8Array
+  mediaType: string
+  width?: number
+  height?: number
+}
+
+/**
+ * 宿主的附件服务（`ctx.get('attachments')`）。
+ *
+ * **只声明一个方法**：本插件不存附件、不列附件，只在发请求前把 `ImageBlock`
+ * 里的 `attachmentId` 换成真正的字节。少声明就不会因为宿主加方法而被动崩掉。
+ */
+export interface DshAttachmentStore {
+  readImageRequest(
+    ref: DshImageRef,
+    target: DshImageRequestTarget,
+    signal?: AbortSignal,
+  ): Promise<DshImageVersion | undefined>
+}
+
 /** `LlmResolvedModelInfo`。 */
 export interface DshResolvedModelInfo extends DshModelInfo {
   context?: { contextWindow: number }
@@ -180,6 +207,14 @@ export interface LlmAdapterDeps {
    * 刻意做成可选：没有这个回调时适配器行为一个字节都不变。
    */
   onRequest?(sample: Omit<RequestLogEntry, 'ts'>): void
+  /**
+   * 取宿主的**附件服务**（`ctx.get('attachments')`）。
+   *
+   * 可选：拿不到时图片块按老行为丢弃（只发文本），插件其余功能一个字节都不变。
+   * 做成**取值函数**而不是直接传服务实例 —— 注册路由时附件服务可能还没挂好，
+   * 而且宿主重启/热重载后实例会换。
+   */
+  resolveAttachments?(): DshAttachmentStore | undefined
   log: AdapterContext['log']
 }
 
@@ -455,10 +490,47 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
       }
     }
 
-    // DSH 的 messages → OpenAI 兼容 messages。
+    // ── 图片：把 `ImageBlock` 换成真正的 data URI ──────────────────────────
+    //
+    // 只对**声明了视觉能力**的模型解析：没声明的模型即使收到图片块也发不出去
+    // （上游会 400），继续按纯文本发，行为与 0.3.4 一致。
+    //
+    // 附件服务可能还没挂（headless / 精简 profile），拿不到就退化成只发文本 ——
+    // 图片发不出去是降级，不该让整轮对话失败。
+    const supportsVision =
+      Array.isArray(modelMeta?.inputModalities) && modelMeta.inputModalities.includes('image')
+    const attachments = deps.resolveAttachments?.()
+    // 丢图时留一条能查的日志：用户报「模型看不见图」时，先看这里说没说为什么。
+    const imageCount = countImageBlocks(options)
+    if (imageCount > 0) {
+      if (!supportsVision) {
+        deps.log.debug(`模型 ${upstreamModel} 没声明视觉能力，${imageCount} 张图片按纯文本发送`)
+      } else if (attachments === undefined) {
+        deps.log.warn(`宿主没有提供附件服务（attachments），${imageCount} 张图片按纯文本发送`)
+      }
+    }
+    const imageResolver: DshImageResolver | undefined =
+      supportsVision && attachments !== undefined
+        ? async (ref) => {
+            try {
+              const version = await attachments.readImageRequest(ref, requestImageTarget(ref), signal)
+              if (version === undefined || version.data === undefined) return undefined
+              const base64 = Buffer.from(version.data).toString('base64')
+              return `data:${version.mediaType ?? 'image/png'};base64,${base64}`
+            } catch (error) {
+              deps.log.warn(
+                '读取图片失败，本轮这张图按纯文本发送',
+                error instanceof Error ? error.message : String(error),
+              )
+              return undefined
+            }
+          }
+        : undefined
+
+    // DSH 的 messages → OpenAI 兼容 messages（图片在这里被换成 data URI）。
     const payload = {
       model: upstreamModel,
-      messages: toOpenAiMessages(options),
+      messages: await toOpenAiMessages(options, imageResolver),
       stream: true,
       ...(options.temperature === undefined ? {} : { temperature: options.temperature }),
       ...(options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens }),
@@ -990,14 +1062,12 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
     /**
      * 本路由的图片计价。
      *
-     * ⚠️ **视觉 token 恒为 0，这是实情不是偷懒**：`toOpenAiMessages()` 只把
-     * `type === 'text'` 的块拼进 `content`，图片块**整块丢掉**（`image_url`
-     * 在本仓库里只出现在 Qoder 的入站解析，出站从不构造）。也就是说上游
-     * 从来没有真的收到过图，收视觉费是凭空多算。
-     *
-     * 真要让上游看图，得先让 `toOpenAiMessages()` 产出 `image_url` 数组，
-     * 那时这里才该按上游的视觉规则算 token —— 两处必须一起改，否则 token
-     * 计量与实际请求又对不上。
+     * ⚠️ **视觉 token 恒报 0 —— 这是产品决定，不是「没发图」**。
+     * 0.3.5 起 `toOpenAiMessages()` 已经会把图片块转成 `image_url` 真的发给上游
+     * （历史原因：0.3.4 及以前只拼 `text` 块，图片整块丢掉，所以当时报 0 是实情）。
+     * 现在仍报 0，是「成本显示不把视觉 token 计进倍率」的口径：网关的倍率表按
+     * 文本 token 计，混进视觉单价会让同一模型在不同图上的价格跳动。
+     * 真要改口径，改这里一处即可 —— 但必须与倍率表一起改，否则显示与账单对不上。
      *
      * 返回 `undefined` 是允许的（宿主会退回自己的固定估算），但**不能不给
      * 这个方法**：`ctx.llm.imageRequestPricing()` 直接
@@ -1012,12 +1082,15 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
     /**
      * 这张图在**发给上游的请求里**的尺寸与字节上限。
      *
-     * 本网关不缩放图片，所以原样返回 DSH 归一化后的尺寸 —— 与基类默认实现
-     * 一致。同样必须存在：宿主 `imageRequestTarget()` 走的是
-     * `this.registration(provider).adapter.imageRequestTarget(...)`，缺了照样抛。
+     * 宿主拿这个值去 `readImageRequest(ref, target)`：**它决定实际发出去的字节**，
+     * 所以这里是全链路唯一该做压缩的地方。取上线常见的一套：
+     * 长边 1568 px（视觉模型的原生输入量级，再大只是白烧 token）、单张 1 MiB
+     * （base64 后约 1.33 MiB，低于主流网关的请求体上限）。
+     *
+     * 小图**不放大**：`scale` 只在超过长边时小于 1。
      */
     imageRequestTarget(_provider, _model, image) {
-      return { width: image.width, height: image.height, maxBytes: image.bytes }
+      return requestImageTarget(image)
     },
     providerRetryPolicy() {
       // 交给 DSH 自己的重试执行器：限流/上游故障值得重试；鉴权与额度错误
@@ -1047,17 +1120,134 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
 /**
  * 一次图片出现在**本网关发给上游的请求里**实际占的文本。
  *
- * 本网关出站只发文本（图片块在 `toOpenAiMessages()` 里被丢掉），所以每次
- * 出现的真实成本就是空串 —— 计价比价时它不该额外加字。
+ * 计价口径：视觉 token 恒报 0（产品决定，见 `imageRequestPricing()`），这里返回
+ * 空串，代表「这次出现在模型请求里不额外占文本 token」。图片本身走
+ * `image_url` 的 base64，不占文本位置。
  *
  * 为什么不复刻宿主的 `textOnlyImageText()`（那段 `[image omitted because…]`）：
  * 宿主只在**它自己序列化**时写那句占位；本网关的序列化器不写，写了就是给
  * token 计量凭空加几十个 token。计量要贴实际请求，不贴宿主的默认假设。
  *
- * 保留 `block` 参数是为了签名与宿主一致，将来真发图时在这里改一处即可。
+ * 保留 `block` 参数是为了签名与宿主一致。
  */
 function imagePlaceholderText(_block: DshImageBlock): string {
   return ''
+}
+
+/**
+ * 图片长边上限（像素）。
+ *
+ * 取 1568：主流视觉模型的原生输入量级（长边再大只是被上游缩回去，白烧 token
+ * 和上传带宽）。小图不放大 —— `scale` 只在超过长边时小于 1。
+ */
+const MAX_REQUEST_IMAGE_EDGE = 1568
+
+/**
+ * 单张图片字节上限：1 MiB。
+ *
+ * base64 编码后约 1.33 MiB，加上提示词与工具表仍在主流网关的请求体上限内；
+ * 再大就容易在反代层被直接截断（而且视觉模型本来也不会用到那部分细节）。
+ */
+const MAX_REQUEST_IMAGE_BYTES = 1024 * 1024
+
+/** `GenerateOptions.messages` 里有多少个图片块（只给日志用，不算字节）。 */
+function countImageBlocks(options: DshGenerateOptions): number {
+  let count = 0
+  for (const message of options.messages) {
+    if (!Array.isArray(message.content)) continue
+    for (const block of message.content) {
+      if ((block as { type?: unknown })?.type === 'image') count += 1
+    }
+  }
+  return count
+}
+
+/**
+ * 一张图在**发给上游的请求里**应有的尺寸与字节上限。
+ *
+ * 宿主拿这个值去 `readImageRequest(ref, target)` 真的会按它压缩，所以这里是
+ * 全链路唯一该做尺寸决策的地方（`imageRequestTarget()` 与解析图片时共用）。
+ */
+export function requestImageTarget(image: DshImageRef): DshImageRequestTarget {
+  const width = Number.isFinite(image.width) && image.width > 0 ? image.width : 1
+  const height = Number.isFinite(image.height) && image.height > 0 ? image.height : 1
+  const longEdge = Math.max(width, height)
+  const scale = longEdge > MAX_REQUEST_IMAGE_EDGE ? MAX_REQUEST_IMAGE_EDGE / longEdge : 1
+  const bytes = Number.isFinite(image.bytes) && image.bytes > 0 ? image.bytes : MAX_REQUEST_IMAGE_BYTES
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+    maxBytes: Math.min(Math.round(bytes), MAX_REQUEST_IMAGE_BYTES),
+  }
+}
+
+/** 把一张图片块换成 data URI 的回调；返回 `undefined` 表示这张图发不出去（降级成文本）。 */
+export type DshImageResolver = (ref: DshImageRef) => Promise<string | undefined>
+
+/**
+ * DSH 的 `GenerateOptions.messages` → OpenAI 兼容 messages。
+ *
+ * 图片块（`{type:'image', attachment}`）在给了 `resolveImage` 时转成
+ * `{type:'image_url', image_url:{url:'data:<mime>;base64,…'}}`。
+ * 以下三种情况**跳过该图**（等价于 0.3.4 及以前的行为，只发文本）：
+ *
+ *   1. 没给 `resolveImage`（宿主没有附件服务，或模型没声明视觉能力）；
+ *   2. `offloaded: true`（DSH 已经把它换成占位文本，不该再发）；
+ *   3. 解析失败（附件读不到 / 已过期）。
+ *
+ * 纯文本消息仍然产出**字符串** `content`：上游对字符串的兼容性最好，改成数组
+ * 只会让那些不认多模态的老接口 400。
+ */
+export async function toOpenAiMessages(
+  options: DshGenerateOptions,
+  resolveImage?: DshImageResolver,
+): Promise<Array<Record<string, unknown>>> {
+  const out: Array<Record<string, unknown>> = []
+  if (typeof options.system === 'string' && options.system !== '') {
+    out.push({ role: 'system', content: options.system })
+  }
+  for (const message of options.messages) {
+    // 已经是 OpenAI 形状的（DSH 的请求消息本来就是 provider 中立的块数组，
+    // 这里做一次扁平化；能直接用的就原样透传）。
+    if (typeof message.content === 'string') {
+      out.push({ role: normalizeRole(message.role), content: message.content, ...carryExtra(message) })
+      continue
+    }
+    const blocks = Array.isArray(message.content) ? (message.content as Array<Record<string, unknown>>) : []
+    const parts: Array<Record<string, unknown>> = []
+    let hasImage = false
+    for (const block of blocks) {
+      if (block?.type === 'text' && typeof block.text === 'string') {
+        parts.push({ type: 'text', text: String(block.text) })
+        continue
+      }
+      if (block?.type !== 'image' || resolveImage === undefined || block.offloaded === true) continue
+      const ref = block.attachment as DshImageRef | undefined
+      if (ref === undefined || typeof ref !== 'object') continue
+      const url = await resolveImage(ref)
+      if (url === undefined) continue
+      parts.push({ type: 'image_url', image_url: { url } })
+      hasImage = true
+    }
+    // 没有图 ⇒ 保持字符串形态（老行为）；有图 ⇒ 保序的块数组。
+    const content = hasImage
+      ? parts
+      : parts.filter((part) => part.type === 'text').map((part) => String(part.text)).join('')
+    const entry: Record<string, unknown> = { role: normalizeRole(message.role), content }
+    const toolCalls = blocks.filter((block) => block?.type === 'tool-call')
+    if (toolCalls.length > 0) {
+      entry.tool_calls = toolCalls.map((block) => ({
+        id: block.id,
+        type: 'function',
+        function: { name: block.name, arguments: block.arguments },
+      }))
+    }
+    if (typeof message.toolCallId === 'string') {
+      entry.tool_call_id = message.toolCallId
+    }
+    out.push(entry)
+  }
+  return out
 }
 
 /**
@@ -1095,41 +1285,6 @@ function imagePlaceholderText(_block: DshImageBlock): string {
  * 知道自己上游慢的适配器自己说，其余继续用这个 250ms 的默认值。
  */
 const USAGE_DRAIN_MS = 250
-
-/** DSH 的 `GenerateOptions.messages` → OpenAI 兼容 messages。 */
-export function toOpenAiMessages(options: DshGenerateOptions): Array<Record<string, unknown>> {
-  const out: Array<Record<string, unknown>> = []
-  if (typeof options.system === 'string' && options.system !== '') {
-    out.push({ role: 'system', content: options.system })
-  }
-  for (const message of options.messages) {
-    // 已经是 OpenAI 形状的（DSH 的请求消息本来就是 provider 中立的块数组，
-    // 这里做一次扁平化；能直接用的就原样透传）。
-    if (typeof message.content === 'string') {
-      out.push({ role: normalizeRole(message.role), content: message.content, ...carryExtra(message) })
-      continue
-    }
-    const blocks = Array.isArray(message.content) ? (message.content as Array<Record<string, unknown>>) : []
-    const text = blocks
-      .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-      .map((block) => String(block.text))
-      .join('')
-    const entry: Record<string, unknown> = { role: normalizeRole(message.role), content: text }
-    const toolCalls = blocks.filter((block) => block?.type === 'tool-call')
-    if (toolCalls.length > 0) {
-      entry.tool_calls = toolCalls.map((block) => ({
-        id: block.id,
-        type: 'function',
-        function: { name: block.name, arguments: block.arguments },
-      }))
-    }
-    if (typeof message.toolCallId === 'string') {
-      entry.tool_call_id = message.toolCallId
-    }
-    out.push(entry)
-  }
-  return out
-}
 
 /** DSH 的 role → OpenAI role（`developer` 归一到 `system`）。 */
 function normalizeRole(role: string): string {

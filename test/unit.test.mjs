@@ -1513,8 +1513,8 @@ test('模型 id 编解码可逆', () => {
   assert.deepEqual(decodeModelId(encoded), { agentId: 'opencode', upstreamId: 'deepseek/v4.1' })
 })
 
-test('DSH 消息 → OpenAI 消息', () => {
-  const messages = toOpenAiMessages({
+test('DSH 消息 → OpenAI 消息', async () => {
+  const messages = await toOpenAiMessages({
     provider: 'p',
     model: 'm',
     system: 'sys',
@@ -3959,24 +3959,112 @@ test('图片计价：每次出现都要给一条价，且本网关不收视觉 t
   ]
   const prices = pricing.priceImages(images)
 
-  // 宿主的 priceSurface 会断言「价格条数 === 出现次数」，少一条直接抛。
+  // 计价口径是**产品决定**：0.3.5 起图片真的会发出去（`toOpenAiMessages()` 产出
+  // `image_url`），但倍率表只按文本 token 计，视觉 token 仍报 0。
+  // 宿主 priceSurface 会断言「价格条数 === 出现次数」，少一条直接抛。
   assert.equal(prices.length, images.length)
   for (const price of prices) {
-    // 出站只发文本：`toOpenAiMessages()` 把图片块整块丢掉，上游从没收到过图。
     assert.equal(price.visualTokens, 0)
-    // 也不写占位文本 —— 写了就是给计量凭空加字。
+    // 图片走 `image_url`，不占文本位；写占位句只会给计量凭空加字。
     assert.equal(price.text, '')
   }
 })
 
-test('图片尺寸：本网关不缩放，原样返回归一化后的宽高与字节数', () => {
+test('图片尺寸：长边压到 1568、单张压到 1 MiB，小图不放大', () => {
   const adapter = shapeOnlyAdapter()
-  const image = { attachmentId: 'sha256:aaaa', width: 800, height: 600, bytes: 120000 }
-  assert.deepEqual(adapter.imageRequestTarget('multiagent-opencode', 'opencode/auto', image), {
+  const small = { attachmentId: 'sha256:aaaa', width: 800, height: 600, bytes: 120000 }
+  assert.deepEqual(adapter.imageRequestTarget('multiagent-opencode', 'opencode/auto', small), {
     width: 800,
     height: 600,
     maxBytes: 120000,
   })
+
+  // 3136×1568 → 长边 1568（等比缩一半）；5 MiB → 1 MiB
+  const huge = { attachmentId: 'sha256:bbbb', width: 3136, height: 1568, bytes: 5 * 1024 * 1024 }
+  assert.deepEqual(adapter.imageRequestTarget('multiagent-opencode', 'opencode/auto', huge), {
+    width: 1568,
+    height: 784,
+    maxBytes: 1024 * 1024,
+  })
+})
+
+test('图片块：有解析器时转成 image_url data URI，文字与顺序都保留', async () => {
+  const seen = []
+  const messages = await toOpenAiMessages(
+    {
+      provider: 'p',
+      model: 'm',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '第一段' },
+            { type: 'image', attachment: { attachmentId: 'sha256:aa', mediaType: 'image/png', width: 100, height: 50, bytes: 1000 } },
+            { type: 'text', text: '第二段' },
+          ],
+        },
+      ],
+    },
+    async (ref) => {
+      seen.push(ref.attachmentId)
+      return 'data:image/png;base64,AAAA'
+    },
+  )
+
+  assert.deepEqual(seen, ['sha256:aa'])
+  const content = messages[0].content
+  assert.ok(Array.isArray(content), '有图时 content 必须是块数组')
+  assert.deepEqual(content.map((part) => part.type), ['text', 'image_url', 'text'])
+  assert.equal(content[1].image_url.url, 'data:image/png;base64,AAAA')
+  assert.equal(content[0].text, '第一段')
+  assert.equal(content[2].text, '第二段')
+})
+
+test('图片块：没有解析器 / offloaded / 解析失败都退回纯文本', async () => {
+  const options = {
+    provider: 'p',
+    model: 'm',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '看这张' },
+          { type: 'image', attachment: { attachmentId: 'sha256:aa', mediaType: 'image/png', width: 10, height: 10, bytes: 10 } },
+        ],
+      },
+    ],
+  }
+
+  const noResolver = await toOpenAiMessages(options)
+  assert.equal(noResolver[0].content, '看这张')
+
+  const offloadedOptions = {
+    ...options,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '看这张' },
+          { type: 'image', offloaded: true, attachment: { attachmentId: 'sha256:aa', mediaType: 'image/png', width: 10, height: 10, bytes: 10 } },
+        ],
+      },
+    ],
+  }
+  const offloaded = await toOpenAiMessages(offloadedOptions, async () => 'data:image/png;base64,AAAA')
+  assert.equal(offloaded[0].content, '看这张')
+
+  const failed = await toOpenAiMessages(options, async () => undefined)
+  assert.equal(failed[0].content, '看这张')
+})
+
+test('纯文本消息仍然产出字符串 content（老接口不吃块数组）', async () => {
+  const messages = await toOpenAiMessages({
+    provider: 'p',
+    model: 'm',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })
+  assert.equal(typeof messages[0].content, 'string')
+  assert.equal(messages[0].content, 'hi')
 })
 
 

@@ -13,6 +13,41 @@
 
 ---
 
+## 🟢 #0u 图片从来没发给上游：`toOpenAiMessages()` 只拼文本块（2026-10-29）
+
+### 现象
+
+用户反馈小浣熊 `DeepSeek-V4.1-Flash-1017`（`sn-deepseek-v4-1-flash-1017`）「不能识别图片」，
+怀疑插件没把图片发过去。
+
+### 根因
+
+`src/llm/adapter.ts` 的 `toOpenAiMessages()` 只把 `type === 'text'` 的块拼进 `content`，
+`ImageBlock` **整块丢掉**。七家平台共用这一个出口 ⇒ 不是小浣熊一家，是**全部**。
+当时没有任何 provider 真的发图，所以连 `imageRequestPricing()` 都按「视觉 token 恒 0」写死。
+
+### 证据
+
+- 宿主的类型声明就是 `ImageBlock { type:'image'; attachment: ImageAttachmentRef }` —— 它**确实**把图交给了插件；
+- 单测复现：输入 `[text, image]` → 出站只剩 text，`image_url` / `attachmentId` 都不在；
+- 上游能力：直接给 `sn-deepseek-v4-1-flash-1017` 发 240×120 红底 + 黄色圆形的 PNG，
+  思维链准确说出「背景红色、前景黄色圆形」⇒ **模型与上游接口都没问题，问题在中间这一层**。
+
+### 已改（0.3.5）
+
+- `toOpenAiMessages()` 改 async，接 `resolveImage`：`ImageBlock` → `{type:'image_url', image_url:{url:'data:<mime>;base64,…'}}`；
+- `src/index.ts` 用 `ctx.get('attachments')` 接宿主附件服务（`readImageRequest()`）；
+- 只在模型 `inputModalities` 含 `image` 时解析；`offloaded` / 解析失败 / 没有附件服务 → **退回纯文本**（老行为）；
+- 压缩：长边 1568 px、单张 1 MiB（`requestImageTarget()`），小图不放大；
+- 计价仍报 0（产品决定：倍率表只按文本 token 计），注释已改，别按「没发图」理解。
+
+### 验证
+
+- 单测：文本 + 图保序、无解析器 / offloaded / 失败降级、纯文本仍是字符串、尺寸上限；
+- 真机：`toOpenAiMessages` 产出的 messages 直接打小浣熊 → 200，思维链正确描述红底黄圆。
+
+---
+
 ## 🟢 #0t 元数据请求带着插件名与版本号出门，比官方客户端更醒目（2026-10-27）
 
 ### 现象
