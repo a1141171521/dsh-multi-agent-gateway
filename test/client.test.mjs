@@ -2115,6 +2115,79 @@ test('请求日志：模型列显示选择器里的名字，目录 key 放进 ti
   panel.dispose()
 })
 
+// ───────── 请求日志的缓存列：命中率要看得见，且「没命中」≠「没数据」─────────
+//
+// 背景：前缀缓存按会话复用，命中就是省钱，但以前**根本没数据** ——
+// `cacheReadTokens` 从 usage 里解析出来了却没落盘。2026-10-30 落盘后，
+// 界面上得能直接读出「这一轮命中多少」，否则用户还是只能猜。
+test('请求日志：缓存列显示命中率，0% 与「没有数据」必须分开', () => {
+  const { panel } = dashboardWith({ page: 'logs' })
+  const projection = panel.projection()
+  const state = {
+    ...projection,
+    shell: { ...projection.shell, page: 'logs' },
+    log: {
+      status: 'ready',
+      error: null,
+      total: 3,
+      page: 1,
+      pageSize: 20,
+      entries: [
+        // ① 命中：量级取自 2026-10-30 国内版真机（3392 / 3511）
+        {
+          ts: 1792477000000,
+          agentId: 'workbuddy',
+          agentName: 'WorkBuddy',
+          model: 'hy4-preview',
+          modelName: 'Hy4 preview',
+          accountId: 'workbuddy:a',
+          ok: true,
+          durationMs: 11_000,
+          inputTokens: 3511,
+          outputTokens: 20,
+          cacheReadTokens: 3392,
+        },
+        // ② 真没命中：字段在、读数是 0 ⇒ 必须画成 0.0%，不能跟「没数据」混为一谈
+        {
+          ts: 1792477001000,
+          agentId: 'workbuddy',
+          agentName: 'WorkBuddy',
+          model: 'hy4-preview',
+          accountId: 'workbuddy:a',
+          ok: true,
+          durationMs: 9000,
+          inputTokens: 1200,
+          outputTokens: 8,
+          cacheReadTokens: 0,
+        },
+        // ③ 这次落盘之前的老记录：没有 cacheReadTokens ⇒ 「—」
+        {
+          ts: 1792477002000,
+          agentId: 'workbuddy',
+          agentName: 'WorkBuddy',
+          model: 'hy4-preview',
+          accountId: 'workbuddy:a',
+          ok: true,
+          durationMs: 8000,
+          inputTokens: 900,
+          outputTokens: 5,
+        },
+      ],
+    },
+  }
+  const html = client.DashboardHTML(state)
+
+  assert.ok(html.includes('<th class="num">缓存</th>'), '日志表要有「缓存」列')
+  assert.ok(html.includes('96.6%'), '3392 / 3511 应显示成 96.6%')
+  assert.ok(html.includes('0.0%'), '读数是 0 要显示 0.0%，不能显示成「—」')
+  assert.ok(
+    html.includes('缓存读 3.4K / 输入 3.5K'),
+    '原始数字要留在 title 里 —— 百分比看不出量级',
+  )
+  assert.ok(!html.includes('NaN'), '老记录没有字段时不能算出 NaN')
+  panel.dispose()
+})
+
 // ───────────────── 检查更新：四态与「失败不能说成最新」 ─────────────────
 //
 // 用户报障原话：「昨天的版本发布到 git 后，检查更新仍是最新版本，说明检查更新未生效」。

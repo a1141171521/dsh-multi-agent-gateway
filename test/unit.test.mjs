@@ -12,7 +12,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { classify, flattenBody, parseRetryAfter, failureOf } from '../lib/core/errors.js'
+import { classify, flattenBody, isAbortError, parseResetAtFromBody, parseRetryAfter, failureOf } from '../lib/core/errors.js'
 import { utc8DateString, utc8Hour, hasQoderCampaignRefreshedToday } from '../lib/core/time.js'
 import { checkInKey, taskKey } from '../lib/core/tasks.js'
 import { redactSecret, redactDeep, CredentialVault } from '../lib/core/crypto.js'
@@ -4086,4 +4086,106 @@ test('宿主半边零运行时依赖：schemastery 走 vendor，不是 npm 依�
 
   const vendored = readFileSync(new URL('../vendor/schemastery/index.js', import.meta.url), 'utf8')
   assert.match(vendored, /from "\.\.\/cosmokit\/index\.js"/, 'vendor 里指向 cosmokit 的 import 被改坏了')
+})
+// ── 渠道校验 11-128：必须单独成类，不能算风控（issue #5，2026-10-30） ──
+
+test('11-128 归类为 channel_reject：不换号、不降权、不冷却', () => {
+  const body = {
+    code: '11-128',
+    msg: 'Illegal API invocation from an unapproved channel',
+    requestId: 'aaaaaaaa-0000-4000-8000-000000000000',
+    displayMsg: { zh: '请求被拦截，请重新发送', en: 'Request blocked. Please send it again' },
+  }
+  assert.equal(classify(400, body), 'channel_reject')
+  // 它跟账号无关：换号只会白烧请求，所以绝不能进换号集合。
+  assert.equal(shouldSwitchAccount('channel_reject'), false)
+  assert.equal(isRetryable('channel_reject'), false)
+})
+
+test('11-128 的连字符不是 ASCII 也要认（原始报文里出现过 U+2011）', () => {
+  const raw = '{"code":11\u2011128,"msg":"Illegal API invocation from an unapproved channel"}'
+  assert.equal(classify(400, raw), 'channel_reject')
+})
+
+test('11-128 优先于风控：报文里的「请求被拦截」不能被判成 risk_control', () => {
+  // 这正是 issue #5 的毁号路径：risk_control ⇒ 换号 + 30 分钟冷却 + 4 次判死。
+  const body = { code: '11-128', msg: 'Illegal API invocation from an unapproved channel', displayMsg: { zh: '请求被拦截，请重新发送' } }
+  assert.equal(classify(400, body), 'channel_reject')
+  assert.notEqual(classify(400, body), 'risk_control')
+})
+
+test('6004 软限流：400 也归 rate_limit（不依赖「限流」关键词）', () => {
+  const body = { code: 6004, msg: '当前请求较多，将在 2026-09-30 02:30:30 UTC+8 重置' }
+  assert.equal(classify(400, body), 'rate_limit')
+})
+
+// ── 报文里的重置时刻（issue #6） ──
+
+test('parseResetAtFromBody：按报文声明的 UTC+8 换算，不按本机时区', () => {
+  const now = Date.parse('2026-09-30T00:00:00Z')
+  const ms = parseResetAtFromBody('…将在 2026-09-30 02:30:30 UTC+8 重置…', now)
+  // 02:30:30+08:00 == 2026-09-29T18:30:30Z；距 now = -5.5h ⇒ 已过期按 0
+  assert.equal(ms, 0)
+
+  const later = parseResetAtFromBody('…将在 2026-10-01 02:30:30 UTC+8 重置…', now)
+  // 2026-10-01 02:30:30+08:00 == 2026-09-30T18:30:30Z ⇒ 距 now = 18.5h
+  assert.equal(later, ((18 * 60 + 30) * 60 + 30) * 1000)
+
+  const utc = parseResetAtFromBody('reset at 2026-09-30T18:30:30Z', now)
+  assert.equal(utc, ((18 * 60 + 30) * 60 + 30) * 1000)
+})
+
+test('parseResetAtFromBody：没有时区声明就返回 undefined（不猜）', () => {
+  assert.equal(parseResetAtFromBody('将在 2026-09-30 02:30:30 重置', Date.now()), undefined)
+})
+
+test('parseResetAtFromBody：相对时长也认（限流器实测报文，issue #6 补）', () => {
+  const now = 1_000_000
+  // 2026-10-30 真机抓到的原话：小浣熊限流器不给时间戳，只写「多久后重试」。
+  assert.equal(
+    parseResetAtFromBody('[200103] limiter_request_error：request exceed max time, retry after:0s', now),
+    1_000,
+  )
+  assert.equal(parseResetAtFromBody('retry after:12s', now), 12_000)
+  assert.equal(parseResetAtFromBody('retry-after: 250ms', now), 1_000)
+  assert.equal(parseResetAtFromBody('请 15 秒后重试', now), 15_000)
+  // 裸数字没有单位 ⇒ 可能是秒也可能是毫秒，不猜。
+  assert.equal(parseResetAtFromBody('retry after: 30', now), undefined)
+})
+
+test('isAbortError：signal / AbortError / ABORT_ERR 都认，普通错误不认', () => {
+  const controller = new AbortController()
+  controller.abort()
+  assert.equal(isAbortError(new Error('x'), controller.signal), true)
+  assert.equal(isAbortError(Object.assign(new Error('x'), { name: 'AbortError' })), true)
+  assert.equal(isAbortError(Object.assign(new Error('x'), { code: 'ABORT_ERR' })), true)
+  assert.equal(isAbortError(new Error('ECONNRESET')), false)
+})
+
+test('取消：execute 立刻返回 aborted，不发起任何尝试', async () => {
+  const { manager, cleanup } = freshAccounts()
+  try {
+    const router = new AccountRouter(
+      manager,
+      { routing: 'quota-first', degradeAfterFailures: 1, penaltySec: 60, recoverIntervalSec: 600, maxAccountAttempts: 3, maxConcurrentRequests: 2 },
+      silent,
+    )
+    const controller = new AbortController()
+    controller.abort()
+    let ran = 0
+    const outcome = await router.execute(
+      'qoder',
+      async () => {
+        ran += 1
+        return { ok: true, value: 1 }
+      },
+      { signal: controller.signal },
+    )
+    assert.equal(outcome.ok, false)
+    assert.equal(outcome.failure.kind, 'aborted')
+    assert.equal(ran, 0, '取消后不该再发起任何尝试')
+    assert.equal(outcome.attempts.length, 0, '取消不该记成账号失败')
+  } finally {
+    cleanup()
+  }
 })

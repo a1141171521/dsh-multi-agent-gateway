@@ -105,6 +105,14 @@ export interface RouteOptions {
   switchOnUpstream?: boolean
   /** 已经排除的账号（外层重试时用）。 */
   exclude?: string[]
+  /**
+   * 调用方的取消信号（用户在界面上点「停止」）。
+   *
+   * 每轮换号前都检查一次：已取消就直接返回 `aborted`，**不再试下一个账号、
+   * 不再 sleep、不记账号失败**。取消是用户意图，不是上游故障 —— 把它当成
+   * `network` 会让「停止」变成「再试 3 个账号 + 多等 1~2 秒」。
+   */
+  signal?: AbortSignal
 }
 
 export class AccountRouter {
@@ -282,6 +290,14 @@ export class AccountRouter {
     let lastFailure: FailureInfo | undefined
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      // 用户点了「停止」：**立刻**收工 —— 不选下一个号、不 sleep、不记失败。
+      if (options.signal?.aborted === true) {
+        return {
+          ok: false,
+          failure: failureOf('aborted', '已取消（用户停止）', { now: this.now() }),
+          attempts,
+        }
+      }
       const { usable, penalized } = this.candidates(agentId, excluded)
       // 先用可用的；一个都没有时才退到降权账号（"总比没有强"）。
       const next = usable[0] ?? penalized[0]
@@ -379,10 +395,8 @@ export class AccountRouter {
       // 同一个号在限流/网络抖动时值得再等一会儿（含 Retry-After 退避）。
       if (isRetryable(outcome.kind) && outcome.kind !== 'rate_limit') {
         // 上游故障/网络：给下一个账号一点喘息，避免把上游打得更死。
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, Math.min(1000, 100 + attempts.length * 250))
-          timer.unref?.()
-        })
+        // ⚠️ 这段等待必须能被取消打断：否则用户点了「停止」还要干等 1 秒。
+        await waitFor(Math.min(1000, 100 + attempts.length * 250), options.signal)
       }
     }
     return {
@@ -435,4 +449,25 @@ export class AccountRouter {
     }
     return results
   }
+}
+
+
+/**
+ * 等一会儿，但随时可被取消打断。
+ *
+ * 用途只有一个：换号之间的退避。用户点「停止」后最不该发生的事就是
+ * 「再等 1 秒然后去打下一个账号」——所以这里挂了 abort 监听，一取消立刻 resolve。
+ */
+function waitFor(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true || ms <= 0) return Promise.resolve()
+  return new Promise<void>((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    timer.unref?.()
+    signal?.addEventListener('abort', done, { once: true })
+  })
 }

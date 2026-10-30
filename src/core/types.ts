@@ -20,8 +20,11 @@
  * - `server`      上游 5xx：可重试，账号不降权
  * - `network`     传输层失败（DNS/连接/超时）：可重试，账号不降权
  * - `bad_request` 请求本身有问题（400/422）：**绝不能换号重试**，换号也错
+ * - `channel_reject` 渠道校验拒绝（11-128）：**内容/指纹问题，与账号无关** ——
+ *   不换号、不降权、不冷却、不计失败（换了号也是同一份消息，只会白烧请求）
  * - `not_found`   端点不存在（404）：常用于能力探测，不是故障
  * - `unsupported` 上游明确不支持该能力：不是故障，但要在 UI 里说清楚
+ * - `aborted`     用户主动取消：不是故障，不计失败、不换号、不重试
  * - `unknown`     认不出来：当作可重试，但记一条日志
  */
 export type ErrorKind =
@@ -33,8 +36,10 @@ export type ErrorKind =
   | 'server'
   | 'network'
   | 'bad_request'
+  | 'channel_reject'
   | 'not_found'
   | 'unsupported'
+  | 'aborted'
   | 'unknown'
 
 /** 该错误是否值得**换一个账号**再试一次。 */
@@ -561,6 +566,15 @@ export interface AgentAdapter {
   getQuota(record: AccountRecord, ctx: AdapterContext): Promise<QuotaSnapshot>
   /** 模型元数据（含积分倍率）。 */
   getModelMetaList(record: AccountRecord, ctx: AdapterContext): Promise<ModelMeta[]>
+
+  /**
+   * 上一次 `getModelMetaList()` 的数据来源（可选）。
+   *
+   * `'fallback'` = 内置表（上游目录没拉到）。运行时据此**不拿它覆盖落盘缓存** ——
+   * 一份缺 reasoning / 上下文的内置表盖掉真实目录，会把「偶发网络失败」变成
+   * 「能力声明永久丢失」，直到下次成功拉取为止。
+   */
+  modelListSource?(): 'live' | 'fallback'
 
   // ── 活动任务 ──
   /** 拉取当前账号可参与的活动任务。 */

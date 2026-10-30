@@ -846,6 +846,20 @@ test('对话：429 + retry-after 必须透出 retryAfterMs（裸 fetch 绕开了
   assert.equal(error.failure.retryAfterMs, 120_000)
 })
 
+test('对话：429 没有 retry-after 头时，从报文里的「retry after:12s」算出 retryAfterMs', async () => {
+  const adapter = isolated()
+  const ctx = makeCtx({
+    fetch: async () => new Response(
+      JSON.stringify({ code: '200103', msg: 'limiter_request_error：request exceed max time, retry after:12s' }),
+      { status: 429, headers: { 'content-type': 'application/json' } },
+    ),
+  })
+  const events = await drain(adapter, ctx, { model: 'm', messages: [{ role: 'user', content: 'hi' }] })
+  const error = events.find((event) => event.type === 'error')
+  assert.equal(error.failure.kind, 'rate_limit')
+  assert.equal(error.failure.retryAfterMs, 12_000)
+})
+
 test('对话：没有 token 时直接报 auth，一个字节都不发出去', async () => {
   const adapter = isolated()
   let called = false

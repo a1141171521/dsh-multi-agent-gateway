@@ -593,6 +593,8 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
           },
         }
       },
+      // 取消信号透传进路由：用户点「停止」后不再换号、不再退避等待。
+      { signal },
     )
 
     // ── 采样：把这一轮的耗时 / 首字 / token / 倍率记下来（成功失败都记） ──
@@ -660,6 +662,8 @@ export function createLlmAdapter(deps: LlmAdapterDeps): {
         ...(usage?.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
         ...(usage?.outputTokens === undefined ? {} : { outputTokens: usage.outputTokens }),
         ...(usage?.reasoningTokens === undefined ? {} : { reasoningTokens: usage.reasoningTokens }),
+        ...(usage?.cacheReadTokens === undefined ? {} : { cacheReadTokens: usage.cacheReadTokens }),
+        ...(usage?.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: usage.cacheWriteTokens }),
         ...(hasMultiplier ? { multiplier } : {}),
         ...(hasMultiplier || free ? { free } : {}),
         ...(failureKind === undefined ? {} : { errorKind: failureKind }),

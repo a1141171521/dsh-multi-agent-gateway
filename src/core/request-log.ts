@@ -68,6 +68,16 @@ export interface RequestLogEntry {
   inputTokens?: number
   outputTokens?: number
   reasoningTokens?: number
+  /**
+   * 前缀缓存命中的输入 token。
+   *
+   * 为什么要记：国内版曾经因为少发三个会话头，**每轮都按全新会话全量计费**，
+   * 而日志里连这个字段都没有 —— 用户只能凭感觉说「最近好贵」，查不出来。
+   * 现在跟 `inputTokens` 一起落盘，命中率 = `cacheReadTokens / inputTokens`。
+   */
+  cacheReadTokens?: number
+  /** 写入前缀缓存的 token（首轮冷启动时才有）。 */
+  cacheWriteTokens?: number
   /** 该模型的倍率（0 = 免费）。 */
   multiplier?: number
   free?: boolean

@@ -13,6 +13,78 @@
 
 ---
 
+## 🟢 #0v GitHub issue #2–#7 批量修复（2026-10-30）
+
+同一作者连着开了 6 个 issue，逐条核对后 **5 个是真 bug、1 个是复核报告**。本次一并修掉。
+
+| Issue | 结论 | 修法 |
+|---|---|---|
+| #2 国内版前缀缓存 0% | ✅ 成立 | CN 补会话三件套 + 请求日志记 cacheRead/Write |
+| #3 11-128 复核 | ✅ 报告属实，不是 bug | 只补「相邻句对」回归用例 |
+| #4 回退表丢 reasoning | ✅ 成立 | 内置表补实测档位 + 回退不覆盖落盘缓存 + 日志升到 warn |
+| #5 11-128 被归成 risk_control | ✅ 成立，最危险 | 新增 `channel_reject`：不换号、不记账、不冷却 |
+| #6 不解析 Retry-After / 重置时刻 / requestId | ✅ 成立 | 头 + 体两条都读，6004 归 `rate_limit` |
+| #7 `router.execute` 没有 AbortSignal | ✅ 成立 | signal 贯穿 + `aborted` 独立 kind |
+
+### #2 会话三件套（前缀缓存 key）
+
+`BUDDY_CN` 原先 `requiresConversationHeaders: false` 且无 `chatIdentity`，`buddyChatHeaders()`
+在 596 行提前返回、没把 session 传下去 ⇒ 三个头一个都不发 ⇒ 每轮都是全新会话。
+实测（issue 作者 + 本机复核）：三头齐发后同一前缀命中率 **0% → 95.5%**，费用差约 17 倍。
+
+2026-10-30 本机独立复现（换到能直连 CN 的网络）：`hy4-preview` 同前缀 4 轮 `prompt=3511`，
+前 3 轮 `cacheRead=3392`（≈96.6%），第 4 轮 0 —— 上游缓存**按节点 / TTL 生效，不是每轮必中**。
+
+新增 `sendConversationHeaders` 产品开关（**与国际版那三个渠道校验头不是一回事**），
+CN 打开；`buddyChatHeaders()` 提前返回时把 `{sessionId, messageId, rootRequestId}` 传进
+`buddyHeaders()`。顺带把 `cacheReadTokens` / `cacheWriteTokens` 记进请求日志 ——
+原先 `Usage` 解析出来了却没落盘，用户报「缓存没命中」时根本没有数据可查。
+
+### #4 回退表也要带档位
+
+`FALLBACK_MODELS` 补上**实测过的** `efforts`（CN `hy4-preview: ["high"]`；INTL 的
+`hy4-preview` / `hy3` / `deepseek-v4.1-flash*`），回退映射把它映射成 `reasoningEfforts`。
+没测过的模型留空，不照同族猜。
+
+另加 `AgentAdapter.modelListSource()`：`'fallback'` 时运行时**不用它覆盖落盘缓存**，
+有缓存就先用缓存 —— 否则一次网络抖动就会把 21 条真实目录（带档位）换成 11 条内置表。
+
+### #5 `channel_reject`
+
+`errors.ts` 的 `/请求被拦截/` 会把 11-128 判成 `risk_control` ⇒ 换号 + 30 分钟冷却 +
+`failures >= degradeAfterFailures*2` 判死。新增判据（文案 + 业务码，连字符用字符类兼容
+U+2010–U+2015 与全角），命中即 `channel_reject`，排在所有状态码分支之前：
+
+- `shouldSwitchAccount` / `isRetryable` 都不含它；
+- 路由层不 `markFailure`、不冷却、不换号，直接返回。
+
+### #6 退避与 requestId
+
+`buddy.ts` 错误分支补 `retryAfterMs`（头优先，读不到再用新加的
+`parseResetAtFromBody()` 解析报文里的「将在 … UTC+8 重置」，**按报文声明的时区换算**）
+与 `requestId`（头优先，再取 body）。`classify()` 增加 `code: 6004` → `rate_limit`，
+不再依赖「限流/频繁」关键词。
+
+2026-10-30 真机补丁：限流器还会把恢复时间写成**相对时长** —— 实测小浣熊
+`[200103] limiter_request_error：request exceed max time, retry after:0s`。
+`parseResetAtFromBody()` 现在也认 `retry after:12s` / `250ms` / `15 秒后重试`；
+`0s` **抬到 1 秒**（否则 `penaltyMsFor` 算出 0 冷却 ⇒ 下一轮立刻又选中同一账号，变热循环）；
+`raccoon.ts` 补上「头里没有就读报文」这条兜底（它走裸 fetch，原先只读头）。
+
+### #7 取消信号
+
+`RouteOptions` 新增 `signal`，`execute()` 每轮开头检查、退避等待可被打断；
+`AbortError` 在 Buddy / SSE 两处都归成 `aborted`（不再混进 `network`）。
+取消不记账、不换号、不冷却。
+
+### 验证
+
+- 宿主 **698/698**、客户端 **86/86**、冒烟通过；
+- 新增用例：11-128 归类与连字符变体、6004、`parseResetAtFromBody`（UTC+8 / Z / 无时区 / 相对时长）、
+  `isAbortError`、`execute` 取消不发起尝试、CN 会话三件套与稳定性、回退表 reasoning、
+  429 头/体两种退避、相邻句对。
+
+---
 ## 🟢 #0u 图片从来没发给上游：`toOpenAiMessages()` 只拼文本块（2026-10-29）
 
 ### 现象

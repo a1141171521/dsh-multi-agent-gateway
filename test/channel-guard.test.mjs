@@ -411,3 +411,25 @@ test('改写表本身：12 条、名字唯一', () => {
   assert.equal(CHANNEL_GATE_REWRITES.length, 12)
   assert.equal(new Set(CHANNEL_GATE_REWRITES.map((rule) => rule.name)).size, 12)
 })
+// ── issue #3：判定粒度是「相邻两句共现」，回归必须覆盖句对而不是只测单句 ──
+
+test('相邻句对：@ 段前两句一起出现时，两句都被改写、指纹清零', () => {
+  const pair = [
+    'Tokens prefixed with @ are paths the user explicitly referenced.',
+    'Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.',
+  ].join('\n')
+  const out = String(guardChatMessages([{ role: 'system', content: pair }])[0].content)
+  assert.deepEqual(carriesChannelFingerprint(out), [], `还有指纹：${out}`)
+  assert.ok(out.includes('Paths that begin with @'), '首句没有被改写')
+  assert.ok(out.includes('absolute paths point at'), '次句没有被改写')
+})
+
+test('相邻句对：Web GUI 段前两句一起出现时，指纹清零', () => {
+  const pair = [
+    'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.',
+    'When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.',
+  ].join('\n')
+  const out = String(guardChatMessages([{ role: 'system', content: pair }])[0].content)
+  assert.deepEqual(carriesChannelFingerprint(out), [], `还有指纹：${out}`)
+  assert.ok(out.includes('working with the user inside the DeepSeek Harness Web GUI'), '首句没有被改写')
+})

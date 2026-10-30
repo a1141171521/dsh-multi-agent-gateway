@@ -20,7 +20,7 @@ import {
   parseQueueError,
   queueDelayMs,
 } from './queue.js'
-import { looksLikeRiskControl, parseRetryAfter } from './errors.js'
+import { isAbortError, looksLikeRiskControl, parseRetryAfter } from './errors.js'
 
 /** SSE 增量解码器。喂字节片段，吐完整事件的数据字段。 */
 export class SseDecoder {
@@ -566,6 +566,11 @@ export async function* iterateSse(
     // 上游没给 finish_reason 也要补一个，否则 DSH 侧看不到终止。
     if (!sawFinish) yield { type: 'finish', reason: 'stop' }
   } catch (error) {
+    // 用户取消 ≠ 网络故障：单独的 kind，路由层不换号、不记账。
+    if (isAbortError(error, signal)) {
+      yield { type: 'error', failure: { kind: 'aborted', message: '已取消', at: Date.now() } }
+      return
+    }
     const message = error instanceof Error ? error.message : String(error)
     yield { type: 'error', failure: { kind: 'network', message: `读取上游流失败：${message}`, at: Date.now() } }
   } finally {

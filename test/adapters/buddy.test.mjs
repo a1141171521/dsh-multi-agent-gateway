@@ -1368,16 +1368,35 @@ test('★ 国际版对话请求带齐三个 conversation 头', async () => {
   }
 })
 
-test('★ 国内版对话请求**不带** conversation 头（照参考实现只加国际版）', async () => {
+test('★ 国内版对话请求带会话三件套（前缀缓存 key），但不发国际版的 message-id', async () => {
+  // 2026-10-30 实测：不带这三个头，国内版前缀缓存命中率恒为 0%（每轮全量计费）；
+  // 三头齐发后同一前缀命中率 95.5%，费用差约 17 倍。只发 `x-conversation-id` 一个仍 0%。
   const { ctx, calls } = chatCtx()
   await drainChat(CN, ctx, [{ role: 'user', content: 'hi' }])
 
   const headers = calls[0].headers
-  assert.equal(headers['x-conversation-id'], undefined)
+  assert.equal(typeof headers['x-conversation-id'], 'string')
+  assert.ok(headers['x-conversation-id'].length > 0, 'x-conversation-id 不能是空串')
+  assert.equal(typeof headers['x-conversation-request-id'], 'string')
+  assert.equal(headers['x-conversation-request-id'], headers['x-root-request-id'], '两条 root 必须同值')
+  // 国际版那套 CLI 形态的头不要照搬（国内版没有抓包依据）
   assert.equal(headers['x-conversation-message-id'], undefined)
-  assert.equal(headers['x-conversation-request-id'], undefined)
+  assert.equal(headers['x-request-id'], undefined)
   // 身份头仍然照发（这些两个产品都要）
   assert.equal(headers['x-product-code'], 'codebuddy')
+})
+
+test('★ 国内版会话 id 按账号稳定（缓存 key 不能每轮换）', async () => {
+  const { ctx, calls } = chatCtx()
+  const rec = account()
+  await drainChat(CN, ctx, [{ role: 'user', content: 'a' }], rec)
+  await drainChat(CN, ctx, [{ role: 'user', content: 'b' }], rec)
+  assert.equal(calls[0].headers['x-conversation-id'], calls[1].headers['x-conversation-id'], '同账号必须一致')
+  assert.equal(calls[0].headers['x-root-request-id'], calls[1].headers['x-root-request-id'], 'root 也要稳定')
+
+  const { ctx: ctx2, calls: calls2 } = chatCtx()
+  await drainChat(CN, ctx2, [{ role: 'user', content: 'c' }], { ...account({ token: 'another-token' }), id: 'workbuddy:fixture-2' })
+  assert.notEqual(calls[0].headers['x-conversation-id'], calls2[0].headers['x-conversation-id'], '不同账号必须不同')
 })
 
 test('★ conversation 头名与参考实现逐字一致（大小写不敏感地比）', async () => {
@@ -2178,4 +2197,65 @@ test('★ wire：档位判定不改变其它请求字段', async () => {
   assert.equal(body.stream, true)
   assert.deepEqual(body.stream_options, { include_usage: true })
   assert.equal(body.messages[0].role, 'system', '补 system 的守卫仍在')
+})
+
+// ── issue #4：回退内置表也要带 reasoning 声明 ──
+
+test('★ /v3/config 拉取失败回退内置表时，模型仍带 reasoning 声明（issue #4）', async () => {
+  const { ctx } = chatCtx()
+  ctx.fetch = async () => {
+    throw new Error('network down')
+  }
+  const list = await CN.getModelMetaList(account(), ctx)
+  const hy = list.find((item) => item.id === 'hy4-preview')
+  assert.ok(hy !== undefined, '回退表里必须有 hy4-preview')
+  // 没有这一条，DSH 核心层会把「没声明」当成「不支持」，用户配了 effort 就整轮抛错。
+  assert.deepEqual(hy.reasoningEfforts, ['high'])
+  assert.equal(hy.defaultReasoningEffort, 'high')
+  assert.equal(CN.modelListSource(), 'fallback')
+})
+
+test('★ /v3/config 拉取成功时不把来源标成 fallback', async () => {
+  const { ctx } = chatCtx()
+  ctx.fetch = async () =>
+    new Response(
+      JSON.stringify({ data: { models: [{ id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 1_000_000 }] } }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )
+  await CN.getModelMetaList(account(), ctx)
+  assert.equal(CN.modelListSource(), 'live')
+})
+
+// ── issue #6：429 的退避与 requestId ──
+
+test('★ 429 带 Retry-After 时直接用头里的值', async () => {
+  const { ctx } = chatCtx()
+  ctx.fetch = async () =>
+    new Response(JSON.stringify({ code: 6004, msg: 'too many requests' }), {
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '3600' },
+    })
+  const events = await drainChat(CN, ctx, [{ role: 'user', content: 'hi' }])
+  const failure = events.find((event) => event.type === 'error')?.failure
+  assert.ok(failure !== undefined)
+  assert.equal(failure.kind, 'rate_limit')
+  assert.equal(failure.retryAfterMs, 3_600_000)
+})
+
+test('★ 429 不带 Retry-After 时从报文读重置时刻 + requestId（issue #6）', async () => {
+  const { ctx } = chatCtx()
+  const body = JSON.stringify({
+    code: 6004,
+    msg: '当前请求较多，将在 2027-01-01 00:00:00 UTC+8 重置',
+    requestId: 'req-fixture-1',
+  })
+  ctx.fetch = async () => new Response(body, { status: 429, headers: { 'content-type': 'application/json' } })
+  const events = await drainChat(CN, ctx, [{ role: 'user', content: 'hi' }])
+  const failure = events.find((event) => event.type === 'error')?.failure
+  assert.ok(failure !== undefined)
+  assert.equal(failure.kind, 'rate_limit')
+  assert.equal(failure.requestId, 'req-fixture-1')
+  assert.ok(typeof failure.retryAfterMs === 'number' && failure.retryAfterMs > 0, '必须解析出退避时长')
+  const expected = Date.parse('2027-01-01T00:00:00+08:00') - Date.now()
+  assert.ok(Math.abs(failure.retryAfterMs - expected) < 5000, `退避偏差过大：${failure.retryAfterMs} vs ${expected}`)
 })

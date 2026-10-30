@@ -120,7 +120,7 @@ import { join } from 'node:path'
 import { BaseAdapter } from './base.js'
 import { missingCredentialReason } from './messages.js'
 import { mergeHeaders } from '../core/http.js'
-import { parseRetryAfter } from '../core/errors.js'
+import { parseResetAtFromBody, parseRetryAfter } from '../core/errors.js'
 import { iterateSse } from '../core/sse.js'
 import { CANONICAL_REASONING_EFFORTS } from '../core/reasoning.js'
 import type { LoginPollResult, LoginStartResult } from '../core/login.js'
@@ -1311,7 +1311,10 @@ export class RaccoonAdapter extends BaseAdapter {
       }
       const kind = classifyRaccoonBody(parsed) ?? this.detectError(response.status, parsed, response.headers)
       // 与 OpenCode 同一条坑：这里走裸 fetch，绕开了 core/http.ts 的 parseRetryAfter。
-      const retryAfterMs = parseRetryAfter(response.headers, Date.now())
+      // 头里没有就再看报文：小浣熊限流器会把恢复时间写在正文里
+      // （`[200103] limiter_request_error：request exceed max time, retry after:0s`）。
+      const now = Date.now()
+      const retryAfterMs = parseRetryAfter(response.headers, now) ?? parseResetAtFromBody(parsed, now)
       yield {
         type: 'error',
         failure: {

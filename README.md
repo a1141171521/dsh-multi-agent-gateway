@@ -175,6 +175,7 @@ dsh plugin --profile desktop add D:\AI\DeepseekPlugin\dsh-multi-agent-gateway
 | [`docs/EXTENDING.md`](docs/EXTENDING.md) | **新增一个 Agent 适配器要写什么**（含完整模板） |
 | [`docs/ERROR-HANDLING.md`](docs/ERROR-HANDLING.md) | 账号降级、重试规则、任务失败与熔断 |
 | [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md) | **已知问题 / 待修清单**（含验证步骤与排查顺序） |
+| [`docs/RELEASE-CHECKLIST.md`](docs/RELEASE-CHECKLIST.md) | **发布前自检清单**（每版必过：门禁 / 观测面 / 兜底 / 错误语义 / 真机负载） |
 | [`docs/NEXT-PHASE.md`](docs/NEXT-PHASE.md) | 后续计划与暂缓项（含网关功能的前置条件） |
 
 ## 架构（分层模块化）
@@ -217,7 +218,7 @@ token / 备份泄露」。它**不是硬件密钥库** —— 能读该目录的
 
 ```powershell
 node scripts/build.mjs      # TypeScript → lib/（零依赖，用 Node 自带的类型擦除）
-npm test                    # 宿主测试 681 + 客户端契约 85 + 冒烟
+npm test                    # 宿主测试 698 + 客户端契约 86 + 冒烟
 node test/live-opencode.mjs # 真机管线：打真实 OpenCode 目录核倍率（需要联网，只读公开接口）
 ```
 
@@ -229,8 +230,8 @@ node test/live-opencode.mjs # 真机管线：打真实 OpenCode 目录核倍率�
 | 验证 | 结果 |
 |---|---|
 | `node scripts/build.mjs` | 58 个 TS 文件 → `lib/`，零不可擦除语法 |
-| 宿主测试（`npm test`） | **681/681** 通过（核心 + 七个适配器 + 推理档位 + 签到记账 + 额度刷新 + 日志采样 + 错误分类 + 网关指纹守卫） |
-| 客户端契约测试 | **85/85** 通过（端点、描述符、volatile 路径、真 `apply(ctx)`、**无参端点零参数**、真渲染 ModelList、登录弹框五态、请求日志三态账号与失败分类） |
+| 宿主测试（`npm test`） | **698/698** 通过（核心 + 七个适配器 + 推理档位 + 签到记账 + 额度刷新 + 日志采样 + 错误分类 + 网关指纹守卫） |
+| 客户端契约测试 | **86/86** 通过（端点、描述符、volatile 路径、真 `apply(ctx)`、**无参端点零参数**、真渲染 ModelList、登录弹框五态、请求日志三态账号与失败分类、缓存命中率列） |
 | 假宿主冒烟 | 通过（provider 路由 / 5 个工具 / **模型上报策略真的改变选择器内容** / 密文落盘） |
 | **真机免费层**（`npm run test:free`，联网） | **空凭证账号 → 200 → 正文「收到」+ 思维链 + usage，全程零 key** |
 | 真机管线（`npm run test:live`，联网） | 真实模型目录 + 倍率；设备码登录实测发起成功、未授权正确返回 `pending` |
