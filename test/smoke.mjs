@@ -108,7 +108,22 @@ if (opencode !== undefined) {
   if (info.name !== 'OpenCode') problems.push(`分组标题不对：${info.name}`)
 }
 
-if (tools.length !== 5) problems.push(`工具数量不对：${tools.length}（期望 5）`)
+// 工具表：钉「哪几个必须在」而不是钉数量 —— 数量断言在加工具时只会逼着改数字，
+// 漏注册照样绿；名字断言才是真的在验「工具确实装上了」。
+const REQUIRED_TOOLS = [
+  'multiagent_accounts',
+  'multiagent_quota',
+  'multiagent_checkin',
+  'multiagent_tasks',
+  'multiagent_routing',
+  'generate_image',
+]
+const toolNames = tools.map((tool) => tool.name)
+for (const required of REQUIRED_TOOLS) {
+  if (!toolNames.includes(required)) {
+    problems.push(`缺少工具：${required}（实际注册：${toolNames.join(', ') || '无'}）`)
+  }
+}
 
 // 定时计划
 const jobs = handle.runtime.snapshotSchedule()

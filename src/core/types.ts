@@ -756,6 +756,29 @@ export interface ResolvedGatewayConfig {
   maxConcurrentRequests: number
 }
 
+/**
+ * 图片生成（`imageGen` 段）的运行期配置。
+ *
+ * 与「多账号路由」完全无关：生图不挑账号，所以它不进 `ResolvedAgentConfig`，
+ * 只挂在顶层。`apiKeySource` 是诊断字段（配置 / 环境变量 / `.env`），
+ * 用来回答「为什么还是 401」。
+ */
+export interface ResolvedImageGenConfig {
+  enabled: boolean
+  baseUrl: string
+  apiKey: string
+  apiKeySource: 'config' | 'env' | 'env-file' | 'none'
+  model: string
+  size: string
+  /** 落盘目录；空串 = 运行时用 `<dataDir>/images`。 */
+  outputDir: string
+  timeoutMs: number
+  /** 显式指定的 `.env` 路径（空串 = 走默认候选列表）。 */
+  envFile: string
+  /** 数据目录（拼默认落盘目录用）。 */
+  dataDir: string
+}
+
 /** 解析后的整插件配置（`config.ts` 的 `resolveConfig()` 产物）。 */
 export interface ResolvedConfig {
   enabled: boolean
@@ -763,4 +786,5 @@ export interface ResolvedConfig {
   verbose: boolean
   gateway: ResolvedGatewayConfig
   agents: Record<string, ResolvedAgentConfig>
+  imageGen: ResolvedImageGenConfig
 }

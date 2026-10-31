@@ -1,7 +1,7 @@
 {
   "id": "dsh-multi-agent-gateway",
   "name": "Free Token",
-  "version": "0.3.7",
+  "version": "0.4.0",
   "main": "./lib/index.js",
   "type": "provider",
   "description": "统一多 Agent 账号管理、自动签到、额度拉取、活动任务与多账号智能路由；对 DSH 模型选择器按 Agent 分组上报模型并标注积分倍率。",
@@ -67,7 +67,8 @@
       "multiagent_quota",
       "multiagent_checkin",
       "multiagent_tasks",
-      "multiagent_routing"
+      "multiagent_routing",
+      "generate_image"
     ],
     "skills": []
   },
