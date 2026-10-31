@@ -315,13 +315,13 @@ export function apply(ctx: ApplyContext, config: PluginConfig = {}): PluginHandl
   const tools = optionalService<{ register(definition: Record<string, unknown>): () => void }>(ctx, 'tools')
   if (tools !== undefined) {
     try {
-      // 记一下装了几个：工具表未来还会加（生图就是后加的），写死「5 个」迟早说谎。
-      const toolDisposers = registerTools({
-        runtime,
-        register: (definition) => tools.register(definition),
-      })
-      disposers.push(...toolDisposers)
-      dshLogger?.info?.(`[${name}] 已注册 ${toolDisposers.length} 个工具`)
+      disposers.push(
+        ...registerTools({
+          runtime,
+          register: (definition) => tools.register(definition),
+        }),
+      )
+      dshLogger?.info?.(`[${name}] 已注册 5 个工具`)
     } catch (error) {
       dshLogger?.error?.(`[${name}] 注册工具失败：${error instanceof Error ? error.message : String(error)}`)
     }
